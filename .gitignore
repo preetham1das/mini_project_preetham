@@ -13,24 +13,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Generated model and analysis artifacts
-*.pth
-outputs/training_history.csv
-outputs/training_curves.png
-outputs/evaluation_metrics.json
-outputs/evaluation_report.txt
-outputs/val_evaluation_visuals.png
-outputs/test_predictions_summary.png
-outputs/deforestation_change_map.png
-outputs/deforestation_change_report.txt
-outputs/predictions/
-
-# Stage 2 specific artifacts
-data/
-outputs/temporal/
-outputs/temporal_training_curves.png
-outputs/temporal_training_history.csv
-
-outputs/sample_pair.png
-outputs/temporal_test_report.txt
-outputs/temporal_test_results.json
+# Generated / temporary files
+# (Keep project outputs and models tracked if you want them pushed)

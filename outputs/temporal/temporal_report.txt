@@ -1,0 +1,22 @@
+TEMPORAL DEFORESTATION DETECTION REPORT
+=======================================
+Pair ID: test/test_000001
+
+T1 Predicted Forest: 99.95% (65504 px)
+T2 Predicted Forest: 97.29% (63757 px)
+Predicted Deforestation (Loss): 2.71% (1774 px)
+Predicted Forest Gain: 0.04% (27 px)
+Predicted Stable Forest: 97.24% (63730 px)
+Predicted Stable Non-Forest: 0.01% (5 px)
+Ground-Truth Deforestation: 7.85% (5145 px)
+
+Deforestation Evaluation Metrics:
+- Iou: 0.0023
+- Dice: 0.0046
+- Precision: 0.0090
+- Recall: 0.0031
+- Accuracy: 0.8949
+- Tp: 16
+- Fp: 1758
+- Fn: 5129
+- Tn: 58633

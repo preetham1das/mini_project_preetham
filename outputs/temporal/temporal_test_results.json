@@ -1,0 +1,15 @@
+{
+    "global_iou": 0.2982689747003995,
+    "global_dice": 0.4594871794871795,
+    "global_precision": 0.4131277783032252,
+    "global_recall": 0.5175662065288228,
+    "global_accuracy": 0.9429792924360796,
+    "tp": 52416,
+    "fp": 74460,
+    "fn": 48858,
+    "tn": 1986954,
+    "total_predicted_deforestation_pixels": 126876,
+    "total_ground_truth_deforestation_pixels": 101274,
+    "predicted_deforestation_pct": 5.866588245738636,
+    "ground_truth_deforestation_pct": 4.682783647017046
+}
