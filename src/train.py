@@ -1,3 +1,4 @@
+import random
 import sys
 import time
 from pathlib import Path
@@ -14,13 +15,19 @@ if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
 try:
-    from src.model import UNet
-    from src.dataset import get_dataloaders
-    from src.metrics import CombinedBCEDiceLoss, calculate_metrics, THRESHOLD
+    from src.model import CHECKPOINT_PATH, UNet
+    from src.dataset import IMAGE_SIZE, SEED, get_dataloaders
+    from src.metrics import CombinedBCEDiceLoss, calculate_confusion_counts, metrics_from_counts, THRESHOLD
 except ModuleNotFoundError:
-    from model import UNet
-    from dataset import get_dataloaders
-    from metrics import CombinedBCEDiceLoss, calculate_metrics, THRESHOLD
+    from model import CHECKPOINT_PATH, UNet
+    from dataset import IMAGE_SIZE, SEED, get_dataloaders
+    from metrics import CombinedBCEDiceLoss, calculate_confusion_counts, metrics_from_counts, THRESHOLD
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def train_model(
@@ -30,24 +37,35 @@ def train_model(
     epochs=12,
     learning_rate=1e-3,
     init_features=32,
-    threshold=THRESHOLD
+    threshold=THRESHOLD,
+    image_size=IMAGE_SIZE,
+    seed=SEED,
+    checkpoint_path=CHECKPOINT_PATH,
+    early_stopping_patience=5
 ):
     print("=" * 60)
     print("AI-BASED FOREST COVER SEGMENTATION - U-NET TRAINING (CPU)")
     print("=" * 60)
 
+    set_seed(seed)
     device = torch.device("cpu")
     print(f"Target Device        : {device}")
     print(f"Batch Size           : {batch_size}")
     print(f"Epochs               : {epochs}")
     print(f"Learning Rate        : {learning_rate}")
     print(f"Prediction Threshold : {threshold}")
+    print(f"Training Image Size  : {image_size}x{image_size}")
+    print(f"Random Seed          : {seed}")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     # 1. Load Data
-    train_loader, val_loader, _ = get_dataloaders(dataset_root=dataset_root, batch_size=batch_size)
+    train_loader, val_loader, _ = get_dataloaders(
+        dataset_root=dataset_root,
+        batch_size=batch_size,
+        image_size=image_size
+    )
     print(f"Train Dataset        : {len(train_loader.dataset)} images ({len(train_loader)} batches)")
     print(f"Validation Dataset   : {len(val_loader.dataset)} images ({len(val_loader)} batches)")
 
@@ -57,8 +75,11 @@ def train_model(
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
-    best_val_iou = 0.0
+    best_val_iou = -1.0
+    epochs_without_improvement = 0
     history = []
+    checkpoint_file = Path(checkpoint_path)
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
 
@@ -69,7 +90,7 @@ def train_model(
         # --- TRAINING PHASE ---
         model.train()
         train_loss = 0.0
-        train_metrics_sum = {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
+        train_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
         for images, masks in train_loader:
             images = images.to(device)
@@ -83,19 +104,20 @@ def train_model(
 
             train_loss += loss.item() * images.size(0)
 
-            batch_metrics = calculate_metrics(logits, masks, threshold=threshold, is_logits=True)
-            for key in train_metrics_sum:
-                train_metrics_sum[key] += batch_metrics[key] * images.size(0)
+            batch_counts = calculate_confusion_counts(logits, masks, threshold=threshold, is_logits=True)
+            for key in train_counts:
+                train_counts[key] += batch_counts[key]
 
         num_train_samples = len(train_loader.dataset)
         avg_train_loss = train_loss / num_train_samples
-        avg_train_iou = train_metrics_sum["iou"] / num_train_samples
-        avg_train_dice = train_metrics_sum["dice"] / num_train_samples
+        train_metrics = metrics_from_counts(train_counts)
+        avg_train_iou = train_metrics["iou"]
+        avg_train_dice = train_metrics["dice"]
 
         # --- VALIDATION PHASE ---
         model.eval()
         val_loss = 0.0
-        val_metrics_sum = {"iou": 0.0, "dice": 0.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
+        val_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
         with torch.no_grad():
             for images, masks in val_loader:
@@ -107,17 +129,18 @@ def train_model(
 
                 val_loss += loss.item() * images.size(0)
 
-                batch_metrics = calculate_metrics(logits, masks, threshold=threshold, is_logits=True)
-                for key in val_metrics_sum:
-                    val_metrics_sum[key] += batch_metrics[key] * images.size(0)
+                batch_counts = calculate_confusion_counts(logits, masks, threshold=threshold, is_logits=True)
+                for key in val_counts:
+                    val_counts[key] += batch_counts[key]
 
         num_val_samples = len(val_loader.dataset)
         avg_val_loss = val_loss / num_val_samples
-        avg_val_iou = val_metrics_sum["iou"] / num_val_samples
-        avg_val_dice = val_metrics_sum["dice"] / num_val_samples
-        avg_val_prec = val_metrics_sum["precision"] / num_val_samples
-        avg_val_rec = val_metrics_sum["recall"] / num_val_samples
-        avg_val_acc = val_metrics_sum["accuracy"] / num_val_samples
+        val_metrics = metrics_from_counts(val_counts)
+        avg_val_iou = val_metrics["iou"]
+        avg_val_dice = val_metrics["dice"]
+        avg_val_prec = val_metrics["precision"]
+        avg_val_rec = val_metrics["recall"]
+        avg_val_acc = val_metrics["accuracy"]
 
         scheduler.step(avg_val_iou)
         epoch_elapsed = time.time() - epoch_start
@@ -142,18 +165,21 @@ def train_model(
         is_best = avg_val_iou > best_val_iou
         if is_best:
             best_val_iou = avg_val_iou
-            best_model_path = output_path / "best_unet.pth"
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_iou": avg_val_iou,
                 "val_dice": avg_val_dice,
-                "threshold": threshold
-            }, best_model_path)
+                "threshold": threshold,
+                "image_size": image_size,
+                "seed": seed
+            }, checkpoint_file)
             checkpoint_msg = " [BEST MODEL SAVED]"
+            epochs_without_improvement = 0
         else:
             checkpoint_msg = ""
+            epochs_without_improvement += 1
 
         print(
             f"Epoch [{epoch:02d}/{epochs:02d}] ({epoch_elapsed:.1f}s) | "
@@ -161,6 +187,10 @@ def train_model(
             f"Val Loss: {avg_val_loss:.4f}, IoU: {avg_val_iou:.4f}, Dice: {avg_val_dice:.4f}"
             f"{checkpoint_msg}"
         )
+
+        if epochs_without_improvement >= early_stopping_patience:
+            print(f"Early stopping after {epoch} epochs without validation IoU improvement.")
+            break
 
     total_time = time.time() - start_time
     print("-" * 60)

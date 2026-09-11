@@ -12,17 +12,17 @@ if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
 try:
-    from src.model import UNet
+    from src.model import CHECKPOINT_PATH, UNet
     from src.dataset import get_dataloaders
     from src.metrics import THRESHOLD
 except ModuleNotFoundError:
-    from model import UNet
+    from model import CHECKPOINT_PATH, UNet
     from dataset import get_dataloaders
     from metrics import THRESHOLD
 
 
 def run_inference(
-    checkpoint_path="outputs/best_unet.pth",
+    checkpoint_path=CHECKPOINT_PATH,
     dataset_root="data/Amazon Forest Dataset",
     output_dir="outputs/predictions",
     threshold=THRESHOLD
@@ -140,7 +140,7 @@ def run_inference(
 
     plt.suptitle("Test Dataset Forest Segmentation Overlay Summary", fontsize=16, y=0.98)
     plt.tight_layout()
-    grid_path = Path("outputs/test_predictions_summary.png")
+    grid_path = out_path.parent / "test_predictions_summary.png"
     plt.savefig(grid_path, dpi=150)
     plt.close()
 

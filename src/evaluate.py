@@ -12,17 +12,17 @@ if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
 try:
-    from src.model import UNet
+    from src.model import CHECKPOINT_PATH, UNet
     from src.dataset import get_dataloaders
-    from src.metrics import calculate_metrics, THRESHOLD
+    from src.metrics import calculate_confusion_counts, metrics_from_counts, THRESHOLD
 except ModuleNotFoundError:
-    from model import UNet
+    from model import CHECKPOINT_PATH, UNet
     from dataset import get_dataloaders
-    from metrics import calculate_metrics, THRESHOLD
+    from metrics import calculate_confusion_counts, metrics_from_counts, THRESHOLD
 
 
 def evaluate_model(
-    checkpoint_path="outputs/best_unet.pth",
+    checkpoint_path=CHECKPOINT_PATH,
     dataset_root="data/Amazon Forest Dataset",
     output_dir="outputs",
     threshold=THRESHOLD
@@ -53,7 +53,7 @@ def evaluate_model(
     num_samples = len(val_loader.dataset)
     print(f"Evaluating {num_samples} validation samples...")
 
-    all_metrics = []
+    validation_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     visualization_samples = []
 
     with torch.no_grad():
@@ -65,8 +65,9 @@ def evaluate_model(
             probs = torch.sigmoid(logits)
             preds = (probs > threshold).float()
 
-            metrics = calculate_metrics(logits, mask, threshold=threshold, is_logits=True)
-            all_metrics.append(metrics)
+            batch_counts = calculate_confusion_counts(logits, mask, threshold=threshold, is_logits=True)
+            for key in validation_counts:
+                validation_counts[key] += batch_counts[key]
 
             if i < 4:  # Save first 4 samples for visual plotting
                 img_np = image[0].permute(1, 2, 0).cpu().numpy()
@@ -76,12 +77,13 @@ def evaluate_model(
                 visualization_samples.append((img_np, gt_np, pred_np, prob_np))
 
     # 3. Compute Mean Metrics
+    aggregate_metrics = metrics_from_counts(validation_counts)
     mean_metrics = {
-        "iou": float(np.mean([m["iou"] for m in all_metrics])),
-        "dice": float(np.mean([m["dice"] for m in all_metrics])),
-        "precision": float(np.mean([m["precision"] for m in all_metrics])),
-        "recall": float(np.mean([m["recall"] for m in all_metrics])),
-        "accuracy": float(np.mean([m["accuracy"] for m in all_metrics])),
+        "iou": aggregate_metrics["iou"],
+        "dice": aggregate_metrics["dice"],
+        "precision": aggregate_metrics["precision"],
+        "recall": aggregate_metrics["recall"],
+        "accuracy": aggregate_metrics["accuracy"],
         "threshold": threshold,
         "total_samples": num_samples,
         "best_train_epoch": checkpoint.get("epoch", None)

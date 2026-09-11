@@ -6,7 +6,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
-TARGET_SIZE = (512, 512)
+IMAGE_SIZE = 256
+TARGET_SIZE = (IMAGE_SIZE, IMAGE_SIZE)
+SEED = 42
 
 
 class ForestDataset(Dataset):
@@ -28,6 +30,28 @@ class ForestDataset(Dataset):
 
         if len(self.images) == 0:
             raise RuntimeError(f"No TIFF images found in {self.image_dir}")
+
+        if self.mask_dir:
+            for image_path in self.images:
+                mask_path = self.mask_dir / (image_path.stem + ".png")
+                if not mask_path.exists():
+                    raise FileNotFoundError(
+                        f"Missing mask for image {image_path.name}: expected {mask_path}"
+                    )
+
+                with Image.open(image_path) as image, Image.open(mask_path) as mask:
+                    if image.width == 0 or image.height == 0 or mask.width == 0 or mask.height == 0:
+                        raise ValueError(
+                            f"Image/mask dimensions are invalid for {image_path.name}: "
+                            f"image={image.size}, mask={mask.size}"
+                        )
+                    image_ratio = image.width / image.height
+                    mask_ratio = mask.width / mask.height
+                    if abs(image_ratio - mask_ratio) > 0.05:
+                        raise ValueError(
+                            f"Image/mask dimensions are incompatible for {image_path.name}: "
+                            f"image={image.size}, mask={mask.size}"
+                        )
 
     def __len__(self):
         return len(self.images)
@@ -57,22 +81,21 @@ class ForestDataset(Dataset):
     def __getitem__(self, index):
         image_path = self.images[index]
 
-        # Load image & resize to target (512, 512)
+        # Resize images and masks to the same configurable training resolution.
         pil_image = Image.open(image_path).convert("RGB")
         if pil_image.size != self.target_size:
             pil_image = pil_image.resize(self.target_size, Image.Resampling.BILINEAR)
         
         image = np.array(pil_image, dtype=np.float32)
 
-        # Load mask if mask_dir exists & resize
+        # Load the validated mask if this is a labeled split.
         mask = None
         if self.mask_dir:
             mask_path = self.mask_dir / (image_path.stem + ".png")
-            if mask_path.exists():
-                pil_mask = Image.open(mask_path)
-                if pil_mask.size != self.target_size:
-                    pil_mask = pil_mask.resize(self.target_size, Image.Resampling.NEAREST)
-                mask = np.array(pil_mask)
+            pil_mask = Image.open(mask_path)
+            if pil_mask.size != self.target_size:
+                pil_mask = pil_mask.resize(self.target_size, Image.Resampling.NEAREST)
+            mask = np.array(pil_mask)
 
         # Apply augmentation if enabled
         if self.augment:
@@ -93,7 +116,12 @@ class ForestDataset(Dataset):
             return image_tensor, image_path.name
 
 
-def get_dataloaders(dataset_root="data/Amazon Forest Dataset", batch_size=2, num_workers=0):
+def get_dataloaders(
+    dataset_root="data/Amazon Forest Dataset",
+    batch_size=2,
+    num_workers=0,
+    image_size=IMAGE_SIZE
+):
     """
     Creates and returns DataLoaders for Training, Validation, and Test splits.
     Default batch_size is set to 2 for CPU training efficiency.
@@ -103,19 +131,22 @@ def get_dataloaders(dataset_root="data/Amazon Forest Dataset", batch_size=2, num
     train_dataset = ForestDataset(
         image_dir=root / "Training" / "images",
         mask_dir=root / "Training" / "masks",
-        augment=True
+        augment=True,
+        target_size=(image_size, image_size)
     )
 
     val_dataset = ForestDataset(
         image_dir=root / "Validation" / "images",
         mask_dir=root / "Validation" / "masks",
-        augment=False
+        augment=False,
+        target_size=(image_size, image_size)
     )
 
     test_dataset = ForestDataset(
         image_dir=root / "Test",
         mask_dir=None,
-        augment=False
+        augment=False,
+        target_size=(image_size, image_size)
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)

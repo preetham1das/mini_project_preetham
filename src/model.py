@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+CHECKPOINT_PATH = "models/best_unet_model.pth"
 
 class DoubleConv(nn.Module):
     """(Convolution -> BatchNorm -> ReLU) * 2"""
