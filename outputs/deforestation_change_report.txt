@@ -1,0 +1,18 @@
+========================================================
+TEMPORAL DEFORESTATION & CHANGE DETECTION REPORT
+========================================================
+
+T1 Image (Before) : data\Amazon Forest Dataset\Test\0.tiff
+T2 Image (After)  : data\Amazon Forest Dataset\Test\1.tiff
+Model Checkpoint  : outputs/best_unet.pth
+Threshold         : 0.5
+
+QUANTITATIVE CHANGE METRICS:
+- Total Image Pixels        : 262,144
+- T1 Forest Cover           : 97,441 px (37.17%)
+- T2 Forest Cover           : 245,027 px (93.47%)
+- Forest Loss (Deforested)  : 10,877 px (11.16% of T1 forest)
+- Forest Gain (Regrowth)   : 158,463 px (162.62% of T1 forest)
+- Stable Forest             : 86,564 px
+- Stable Non-Forest         : 6,240 px
+- Net Change in Forest      : +56.30%

@@ -13,4 +13,4 @@ print(f"OpenCV Version: {cv2.__version__}")
 print(f"NumPy Version: {np.__version__}")
 print(f"Pandas Version: {pd.__version__}")
 
-print("\nAll libraries are working successfully! 🎉")
+print("\nAll libraries are working successfully!")
