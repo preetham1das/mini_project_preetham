@@ -57,9 +57,10 @@ plt.tight_layout()
 
 # Save result
 output_path = Path("outputs/sample_pair.png")
+output_path.parent.mkdir(parents=True, exist_ok=True)
 plt.savefig(output_path, dpi=150)
 
 print("\nSaved visualization to:")
 print(output_path)
 
-plt.show()
+plt.close()

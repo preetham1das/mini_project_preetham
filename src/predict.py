@@ -39,7 +39,7 @@ def run_inference(
 
     # 1. Load Model
     print(f"Loading model checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_file, map_location=device)
+    checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=True)
 
     model = UNet(in_channels=3, out_channels=1, init_features=32).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])

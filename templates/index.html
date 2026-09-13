@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Deforestation Detection System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-icon">🌲</div>
+                <div class="brand-text">
+                    <h2>EcoVision AI</h2>
+                    <p>Satellite Analytics</p>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" data-tab="stage1">
+                    <span class="icon">🍃</span>
+                    <span>Stage 1: Forest Cover</span>
+                </button>
+                <button class="nav-item" data-tab="stage2">
+                    <span class="icon">🛰️</span>
+                    <span>Stage 2: Change Detection</span>
+                </button>
+                <button class="nav-item" data-tab="metrics">
+                    <span class="icon">📊</span>
+                    <span>Model Analytics</span>
+                </button>
+            </nav>
+
+            <div class="system-status">
+                <div class="status-indicator online"></div>
+                <div class="status-info">
+                    <span class="status-title">PyTorch Engine</span>
+                    <span class="status-sub">U-Net & Temporal U-Net Active</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header Bar -->
+            <header class="top-header">
+                <div class="header-title">
+                    <h1 id="page-title">Stage 1: Binary Forest Cover Segmentation</h1>
+                    <p id="page-desc">Extracting pixel-level forest canopy coverage from satellite imagery using Deep U-Net architecture.</p>
+                </div>
+            </header>
+
+            <!-- Tab 1: Stage 1 Forest Cover -->
+            <section id="tab-stage1" class="tab-content active">
+                <div class="control-panel glass-card">
+                    <div class="panel-section">
+                        <label class="section-label">Select Sample Satellite Image</label>
+                        <select id="stage1-sample-select" class="custom-select">
+                            <option value="">-- Choose Sample from Dataset --</option>
+                        </select>
+                    </div>
+
+                    <div class="panel-section">
+                        <label class="section-label">Or Upload Custom TIFF / PNG Image</label>
+                        <div class="file-dropzone" id="stage1-dropzone">
+                            <input type="file" id="stage1-file-input" accept="image/*,.tif,.tiff">
+                            <span class="drop-icon">📁</span>
+                            <span class="drop-text" id="stage1-filename">Drag & Drop or Click to Browse</span>
+                        </div>
+                    </div>
+
+                    <div class="panel-section threshold-box">
+                        <div class="slider-header">
+                            <label for="stage1-threshold">Probability Threshold</label>
+                            <span id="stage1-threshold-val">0.50</span>
+                        </div>
+                        <input type="range" id="stage1-threshold" min="0.10" max="0.90" step="0.05" value="0.50">
+                    </div>
+
+                    <div class="panel-section btn-container">
+                        <button id="stage1-run-btn" class="btn btn-primary">
+                            <span>🚀 Run U-Net Segmentation</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Stats Summary Cards -->
+                <div class="stats-grid" id="stage1-stats" style="display: none;">
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Forest Canopy Cover</span>
+                        <span class="stat-value text-green" id="s1-stat-pct">0%</span>
+                        <span class="stat-sub" id="s1-stat-px">0 pixels</span>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Non-Forest / Background</span>
+                        <span class="stat-value text-gray" id="s1-stat-nonpct">0%</span>
+                        <span class="stat-sub" id="s1-stat-nonpx">0 pixels</span>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Total Resolving Pixels</span>
+                        <span class="stat-value" id="s1-stat-total">65,536</span>
+                        <span class="stat-sub">256 × 256 Resolution</span>
+                    </div>
+                </div>
+
+                <!-- Visual Output Grid -->
+                <div class="visuals-grid" id="stage1-visuals" style="display: none;">
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Satellite RGB</div>
+                        <div class="img-wrapper">
+                            <img id="s1-img-orig" src="" alt="Satellite RGB">
+                        </div>
+                    </div>
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Predicted Forest Mask</div>
+                        <div class="img-wrapper">
+                            <img id="s1-img-mask" src="" alt="Predicted Forest Mask">
+                        </div>
+                    </div>
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Forest Canopy Overlay</div>
+                        <div class="img-wrapper">
+                            <img id="s1-img-overlay" src="" alt="Forest Canopy Overlay">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab 2: Stage 2 Temporal Change Detection -->
+            <section id="tab-stage2" class="tab-content">
+                <div class="control-panel glass-card">
+                    <div class="panel-section">
+                        <label class="section-label">Select Temporal Image Pair (T1 & T2)</label>
+                        <select id="stage2-sample-select" class="custom-select">
+                            <option value="">-- Select Temporal Pair from Dataset --</option>
+                        </select>
+                    </div>
+
+                    <div class="panel-section threshold-box">
+                        <div class="slider-header">
+                            <label for="stage2-threshold">Deforestation Sensitivity Threshold</label>
+                            <span id="stage2-threshold-val">0.50</span>
+                        </div>
+                        <input type="range" id="stage2-threshold" min="0.10" max="0.90" step="0.05" value="0.50">
+                    </div>
+
+                    <div class="panel-section btn-container">
+                        <button id="stage2-run-btn" class="btn btn-primary">
+                            <span>🛰️ Detect Deforestation (6-Ch Temporal U-Net)</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Stats Summary Cards Stage 2 -->
+                <div class="stats-grid" id="stage2-stats" style="display: none;">
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Deforestation (Forest Loss)</span>
+                        <span class="stat-value text-red" id="s2-stat-defor-pct">0%</span>
+                        <span class="stat-sub" id="s2-stat-defor-px">0 pixels</span>
+                    </div>
+                    <div class="stat-card glass-card">
+                        <span class="stat-label">Stable Area</span>
+                        <span class="stat-value text-gray" id="s2-stat-stable-pct">0%</span>
+                        <span class="stat-sub" id="s2-stat-stable-px">0 pixels</span>
+                    </div>
+                    <div class="stat-card glass-card" id="s2-card-gt" style="display: none;">
+                        <span class="stat-label">Sample IoU / Dice Score</span>
+                        <span class="stat-value text-accent" id="s2-stat-metrics">0.00 / 0.00</span>
+                        <span class="stat-sub">Ground Truth Verification</span>
+                    </div>
+                </div>
+
+                <!-- Visual Output Grid Stage 2 -->
+                <div class="visuals-grid stage2-grid" id="stage2-visuals" style="display: none;">
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Time 1 ($T1$ - Before)</div>
+                        <div class="img-wrapper">
+                            <img id="s2-img-t1" src="" alt="T1 Satellite Image">
+                        </div>
+                    </div>
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Time 2 ($T2$ - After)</div>
+                        <div class="img-wrapper">
+                            <img id="s2-img-t2" src="" alt="T2 Satellite Image">
+                        </div>
+                    </div>
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Predicted Deforestation Mask</div>
+                        <div class="img-wrapper">
+                            <img id="s2-img-mask" src="" alt="Deforestation Mask">
+                        </div>
+                    </div>
+                    <div class="visual-card glass-card">
+                        <div class="card-header">Deforestation Red Overlay ($T2$)</div>
+                        <div class="img-wrapper">
+                            <img id="s2-img-overlay" src="" alt="Deforestation Overlay">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab 3: Model Analytics -->
+            <section id="tab-metrics" class="tab-content">
+                <div class="analytics-grid">
+                    <div class="metric-group glass-card">
+                        <div class="group-title">
+                            <h3>Stage 1 U-Net (Amazon Forest Dataset)</h3>
+                            <span class="badge badge-success">Validation IoU: 83.80%</span>
+                        </div>
+                        <div class="metric-row">
+                            <div class="m-box">
+                                <span class="m-val">83.80%</span>
+                                <span class="m-lbl">Mean IoU</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">91.19%</span>
+                                <span class="m-lbl">Dice (F1)</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">92.26%</span>
+                                <span class="m-lbl">Precision</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">90.14%</span>
+                                <span class="m-lbl">Recall</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">90.91%</span>
+                                <span class="m-lbl">Accuracy</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="metric-group glass-card">
+                        <div class="group-title">
+                            <h3>Stage 2 Temporal U-Net (Forest-Change Dataset)</h3>
+                            <span class="badge badge-warning">Test Set Performance</span>
+                        </div>
+                        <div class="metric-row">
+                            <div class="m-box">
+                                <span class="m-val">29.83%</span>
+                                <span class="m-lbl">Global IoU</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">45.95%</span>
+                                <span class="m-lbl">Global Dice</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">41.31%</span>
+                                <span class="m-lbl">Precision</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">51.76%</span>
+                                <span class="m-lbl">Recall</span>
+                            </div>
+                            <div class="m-box">
+                                <span class="m-val">33 Pairs</span>
+                                <span class="m-lbl">Held-Out Test</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay" style="display: none;">
+        <div class="spinner"></div>
+        <p>Running Neural Network Inference...</p>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
