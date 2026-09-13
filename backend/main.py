@@ -5,7 +5,7 @@ import base64
 import numpy as np
 from PIL import Image
 import torch
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 import sys
@@ -167,23 +167,87 @@ def root():
     }
 
 
+@app.get("/api/samples")
+def get_samples():
+    base_dir = Path(__file__).resolve().parent.parent
+    amazon_dir = base_dir / "data" / "Amazon Forest Dataset"
+    stage1_samples = []
+    
+    val_dir = amazon_dir / "Validation" / "images"
+    if val_dir.exists():
+        val_images = sorted(list(val_dir.glob("*.tiff")) + list(val_dir.glob("*.tif")))
+        for f in val_images[:10]:
+            stage1_samples.append({
+                "id": f.name,
+                "name": f.name,
+                "split": "Validation",
+                "path": str(f.resolve())
+            })
+
+    test_dir = amazon_dir / "Test"
+    if test_dir.exists():
+        test_images = sorted(list(test_dir.glob("*.tiff")) + list(test_dir.glob("*.tif")))
+        for f in test_images[:10]:
+            stage1_samples.append({
+                "id": f.name,
+                "name": f"Test / {f.name}",
+                "split": "Test",
+                "path": str(f.resolve())
+            })
+
+    temporal_root = base_dir / "data" / "Forest-Change" / "extracted" / "Forest-Change-dataset" / "images"
+    stage2_samples = []
+    
+    test_a_dir = temporal_root / "test" / "A"
+    if test_a_dir.exists():
+        test_pairs = sorted([f.stem for f in test_a_dir.glob("*.png")])
+        for p in test_pairs[:12]:
+            stage2_samples.append({
+                "id": p,
+                "name": f"Test Pair: {p}",
+                "split": "test",
+                "path_a": str((test_a_dir / f"{p}.png").resolve()),
+                "path_b": str((temporal_root / "test" / "B" / f"{p}.png").resolve())
+            })
+            
+    val_a_dir = temporal_root / "val" / "A"
+    if val_a_dir.exists():
+        val_pairs = sorted([f.stem for f in val_a_dir.glob("*.png")])
+        for p in val_pairs[:6]:
+            stage2_samples.append({
+                "id": p,
+                "name": f"Val Pair: {p}",
+                "split": "val",
+                "path_a": str((val_a_dir / f"{p}.png").resolve()),
+                "path_b": str((temporal_root / "val" / "B" / f"{p}.png").resolve())
+            })
+
+    return {
+        "stage1_samples": stage1_samples,
+        "stage2_samples": stage2_samples
+    }
+
 @app.post("/predict")
 async def predict(
-    file: UploadFile = File(...)
+    file: UploadFile = File(None),
+    sample_path: str = Form(None),
+    threshold: float = Form(0.5)
 ):
-
-    # Read uploaded image
-    contents = await file.read()
-
-    try:
-        image = Image.open(
-            io.BytesIO(contents)
-        ).convert("RGB")
-    except Exception:
-        return {
-            "success": False,
-            "error": "Invalid image file."
-        }
+    if sample_path:
+        try:
+            image = Image.open(sample_path).convert("RGB")
+            filename = Path(sample_path).name
+        except Exception:
+            return {"success": False, "error": "Invalid sample path."}
+    elif file:
+        contents = await file.read()
+        try:
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
+            filename = file.filename
+        except Exception:
+            return {"success": False, "error": "Invalid image file."}
+    else:
+        return {"success": False, "error": "No file or sample_path provided."}
 
     # Original dimensions
     original_width, original_height = image.size
@@ -203,7 +267,7 @@ async def predict(
         probabilities = torch.sigmoid(logits)
 
         prediction = (
-            probabilities > THRESHOLD
+            probabilities > threshold
         ).float()
 
     # Get mask
@@ -233,7 +297,7 @@ async def predict(
 
     return {
         "success": True,
-        "filename": file.filename,
+        "filename": filename,
         "original_width": original_width,
         "original_height": original_height,
         "forest_percentage": round(
@@ -242,7 +306,7 @@ async def predict(
         ),
         "forest_pixels": forest_pixels,
         "total_pixels": total_pixels,
-        "threshold": THRESHOLD,
+        "threshold": threshold,
         "mask": mask_to_base64(mask),
         "original_image": image_to_base64(image)
     }
@@ -250,20 +314,28 @@ async def predict(
 
 @app.post("/predict-temporal")
 async def predict_temporal(
-    before_image: UploadFile = File(...),
-    after_image: UploadFile = File(...)
+    before_image: UploadFile = File(None),
+    after_image: UploadFile = File(None),
+    sample_path_a: str = Form(None),
+    sample_path_b: str = Form(None),
+    threshold: float = Form(0.5)
 ):
-    try:
-        t1_contents = await before_image.read()
-        img_a = Image.open(io.BytesIO(t1_contents)).convert("RGB")
-
-        t2_contents = await after_image.read()
-        img_b = Image.open(io.BytesIO(t2_contents)).convert("RGB")
-    except Exception:
-        return {
-            "success": False,
-            "error": "Invalid image file(s)."
-        }
+    if sample_path_a and sample_path_b:
+        try:
+            img_a = Image.open(sample_path_a).convert("RGB")
+            img_b = Image.open(sample_path_b).convert("RGB")
+        except Exception:
+            return {"success": False, "error": "Invalid sample paths."}
+    elif before_image and after_image:
+        try:
+            t1_contents = await before_image.read()
+            img_a = Image.open(io.BytesIO(t1_contents)).convert("RGB")
+            t2_contents = await after_image.read()
+            img_b = Image.open(io.BytesIO(t2_contents)).convert("RGB")
+        except Exception:
+            return {"success": False, "error": "Invalid image file(s)."}
+    else:
+        return {"success": False, "error": "Provide either uploaded files or sample paths."}
 
     # Compatible dimensions check
     if img_a.size != img_b.size:
@@ -282,7 +354,7 @@ async def predict_temporal(
     with torch.no_grad():
         logits = temporal_model(temporal_tensor)
         probabilities = torch.sigmoid(logits)
-        prediction = (probabilities > THRESHOLD).float()
+        prediction = (probabilities > threshold).float()
 
     mask = prediction[0, 0].cpu().numpy().astype(np.uint8)
 
