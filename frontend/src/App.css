@@ -16,7 +16,7 @@ body {
 header {
   text-align: center;
   padding: 40px 20px;
-  background: #173b24;
+  background: #50C878;
   color: white;
 }
 
@@ -63,7 +63,7 @@ main {
 }
 
 button {
-  background: #28743c;
+  background: #50C878;
   color: white;
   border: none;
   padding: 13px 28px;
@@ -73,7 +73,7 @@ button {
 }
 
 button:hover {
-  background: #1f5d30;
+  background: #3E9D5E;
 }
 
 button:disabled {
@@ -116,7 +116,7 @@ button:disabled {
 .percentage {
   font-size: 55px;
   font-weight: bold;
-  color: #28743c;
+  color: #50C878;
 }
 
 @media (max-width: 700px) {
@@ -137,7 +137,7 @@ button:disabled {
 }
 .mode-selector button.active {
   background: #fff;
-  color: #173b24;
+  color: #50C878;
   font-weight: bold;
 }
 
