@@ -333,10 +333,21 @@ input[type="range"] {
     margin: 4px 0;
 }
 
-.text-green { color: var(--primary-green); }
-.text-red { color: var(--accent-red); }
-.text-gray { color: var(--text-muted); }
-.text-accent { color: var(--accent-blue); }
+.text-green {
+    color: var(--primary-green);
+}
+
+.text-red {
+    color: var(--accent-red);
+}
+
+.text-gray {
+    color: var(--text-muted);
+}
+
+.text-accent {
+    color: var(--accent-blue);
+}
 
 .stat-sub {
     font-size: 0.72rem;
@@ -473,5 +484,7 @@ input[type="range"] {
 }
 
 @keyframes spin {
-    to { transform: rotate(360deg); }
+    to {
+        transform: rotate(360deg);
+    }
 }
