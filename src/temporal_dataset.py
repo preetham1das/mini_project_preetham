@@ -10,23 +10,33 @@ IMAGE_SIZE = 256
 TARGET_SIZE = (IMAGE_SIZE, IMAGE_SIZE)
 SEED = 42
 
+
 class TemporalForestDataset(Dataset):
     """
     PyTorch Dataset for Temporal Deforestation Detection.
     Loads matching T1 (A), T2 (B), and ground-truth label pairs.
+
+    Args:
+        split_dir:    Path to split directory containing A/, B/, label/
+        augment:      Apply random spatial augmentation (train only)
+        target_size:  Resize target (W, H)
+        diff_channels: If True, append |A-B| as 3 extra channels -> (9, H, W)
     """
 
-    def __init__(self, split_dir, augment=False, target_size=TARGET_SIZE):
+    def __init__(self, split_dir, augment=False, target_size=TARGET_SIZE, diff_channels=False):
         self.split_dir = Path(split_dir)
         self.augment = augment
         self.target_size = target_size
+        self.diff_channels = diff_channels
 
         self.a_dir = self.split_dir / "A"
         self.b_dir = self.split_dir / "B"
         self.label_dir = self.split_dir / "label"
 
         if not self.a_dir.exists() or not self.b_dir.exists() or not self.label_dir.exists():
-            raise FileNotFoundError(f"Missing required subdirectories (A, B, label) in {split_dir}")
+            raise FileNotFoundError(
+                f"Missing required subdirectories (A, B, label) in {split_dir}"
+            )
 
         self.image_names = sorted([f.name for f in self.a_dir.glob("*.png")])
 
@@ -45,6 +55,7 @@ class TemporalForestDataset(Dataset):
         return len(self.image_names)
 
     def _apply_augmentation(self, img_a, img_b, mask):
+        """Apply identical spatial augmentations to A, B, and mask."""
         # Random Horizontal Flip
         if random.random() > 0.5:
             img_a = np.fliplr(img_a)
@@ -83,13 +94,14 @@ class TemporalForestDataset(Dataset):
             pil_b = pil_b.resize(self.target_size, Image.Resampling.BILINEAR)
         img_b = np.array(pil_b, dtype=np.float32)
 
-        # Load and resize label
+        # Load and resize label (NEAREST to preserve binary values)
         pil_label = Image.open(label_path).convert("L")
         if pil_label.size != self.target_size:
             pil_label = pil_label.resize(self.target_size, Image.Resampling.NEAREST)
         mask = np.array(pil_label)
 
-        # Binary conversion (Deforestation > 0)
+        # Binary conversion -- any grayscale value > 0 -> deforestation
+        # (Label has multi-value grayscale encoding change intensity)
         mask = (mask > 0).astype(np.float32)
 
         if self.augment:
@@ -102,61 +114,89 @@ class TemporalForestDataset(Dataset):
         # Channel layout (H, W, C) -> (C, H, W)
         img_a_tensor = torch.tensor(img_a, dtype=torch.float32).permute(2, 0, 1)
         img_b_tensor = torch.tensor(img_b, dtype=torch.float32).permute(2, 0, 1)
-        
-        # Concatenate T1 and T2 along channel dim -> (6, H, W)
-        img_concat = torch.cat([img_a_tensor, img_b_tensor], dim=0)
-        
-        mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0) # (1, H, W)
+
+        if self.diff_channels:
+            # Absolute difference |A - B|: explicit temporal prior (3 extra channels)
+            diff_tensor = torch.abs(img_a_tensor - img_b_tensor)
+            # Concatenate T1, T2, |T1-T2| along channel dim -> (9, H, W)
+            img_concat = torch.cat([img_a_tensor, img_b_tensor, diff_tensor], dim=0)
+        else:
+            # Standard 6-channel: concatenate T1 and T2 -> (6, H, W)
+            img_concat = torch.cat([img_a_tensor, img_b_tensor], dim=0)
+
+        mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)  # (1, H, W)
 
         return img_concat, mask_tensor, name
+
+
+def compute_pos_weight(dataset_root, image_size=IMAGE_SIZE):
+    """
+    Compute exact pos_weight = neg_pixels / pos_pixels from full training set.
+    Call once before training. Returns a float.
+    """
+    root = Path(dataset_root)
+    ds = TemporalForestDataset(root / "train", augment=False, target_size=(image_size, image_size))
+    total_pos = 0
+    total_neg = 0
+    for _, mask, _ in ds:
+        total_pos += mask.sum().item()
+        total_neg += (mask == 0).sum().item()
+    weight = total_neg / (total_pos + 1e-8)
+    # Clamp to a sensible range for numerical stability
+    return float(min(max(weight, 1.0), 50.0))
 
 
 def get_temporal_dataloaders(
     dataset_root="data/Forest-Change/extracted/Forest-Change-dataset/images",
     batch_size=4,
     num_workers=0,
-    image_size=IMAGE_SIZE
+    image_size=IMAGE_SIZE,
+    diff_channels=False,
 ):
     root = Path(dataset_root)
 
     train_dataset = TemporalForestDataset(
         split_dir=root / "train",
         augment=True,
-        target_size=(image_size, image_size)
+        target_size=(image_size, image_size),
+        diff_channels=diff_channels,
     )
 
     val_dataset = TemporalForestDataset(
         split_dir=root / "val",
         augment=False,
-        target_size=(image_size, image_size)
+        target_size=(image_size, image_size),
+        diff_channels=diff_channels,
     )
 
     test_dataset = TemporalForestDataset(
         split_dir=root / "test",
         augment=False,
-        target_size=(image_size, image_size)
+        target_size=(image_size, image_size),
+        diff_channels=diff_channels,
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
 
     return train_loader, val_loader, test_loader
 
-if __name__ == "__main__":
-    train_loader, val_loader, test_loader = get_temporal_dataloaders(batch_size=2)
-    print("=" * 50)
-    print("TEMPORAL DATASET & DATALOADER TEST")
-    print("=" * 50)
-    print(f"Train pairs      : {len(train_loader.dataset)}")
-    print(f"Validation pairs : {len(val_loader.dataset)}")
-    print(f"Test pairs       : {len(test_loader.dataset)}")
 
-    images, masks, names = next(iter(train_loader))
-    print("\nSample Batch Information:")
-    print(f"Images batch shape : {images.shape} (Expected: B, 6, H, W)")
-    print(f"Masks batch shape  : {masks.shape} (Expected: B, 1, H, W)")
-    print(f"Image dtype        : {images.dtype}")
-    print(f"Mask dtype         : {masks.dtype}")
-    print(f"Image value range  : {images.min().item():.4f} to {images.max().item():.4f}")
-    print(f"Unique mask classes: {torch.unique(masks).tolist()}")
+if __name__ == "__main__":
+    # Quick sanity check
+    for diff in [False, True]:
+        train_loader, val_loader, test_loader = get_temporal_dataloaders(
+            batch_size=2, diff_channels=diff
+        )
+        images, masks, names = next(iter(train_loader))
+        ch = 9 if diff else 6
+        print(f"diff_channels={diff}: images={images.shape} (expect B,{ch},H,W), masks={masks.shape}")
+        print(f"  Image range: {images.min():.3f} to {images.max():.3f}")
+        print(f"  Mask unique: {torch.unique(masks).tolist()}")
