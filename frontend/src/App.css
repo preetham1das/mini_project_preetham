@@ -141,3 +141,8 @@ button:disabled {
   font-weight: bold;
 }
 
+
+.image-card h2, .image-card h3, .percentage-card h2, .upload-section h2, .upload-section h3 {
+  color: #1f2937;
+}
+

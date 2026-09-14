@@ -85,16 +85,27 @@ temporal_checkpoint = torch.load(
     weights_only=True
 )
 
+raw_state_dict = temporal_checkpoint.get("model_state_dict", temporal_checkpoint)
+temporal_state_dict = {}
+for k, v in raw_state_dict.items():
+    for i in range(1, 5):
+        if k.startswith(f"cu{i}."):
+            k = k.replace(f"cu{i}.", f"conv_up{i}.")
+            break
+    temporal_state_dict[k] = v
+
+temporal_in_channels = temporal_state_dict["inc.block.0.weight"].shape[1]
+
 temporal_model = TemporalUNet(
-    in_channels=6,
+    in_channels=temporal_in_channels,
     out_channels=1,
     init_features=32
 ).to(DEVICE)
 
-temporal_model.load_state_dict(temporal_checkpoint["model_state_dict"])
+temporal_model.load_state_dict(temporal_state_dict)
 temporal_model.eval()
 
-print("Stage 2 Temporal U-Net model loaded successfully.")
+print(f"Stage 2 Temporal U-Net model ({temporal_in_channels}-channel) loaded successfully.")
 
 # --------------------------------------------------
 # Image preprocessing
@@ -348,8 +359,12 @@ async def predict_temporal(
     img_a_tensor = preprocess_image(img_a)
     img_b_tensor = preprocess_image(img_b)
 
-    # Concatenate (1, 6, 256, 256)
-    temporal_tensor = torch.cat([img_a_tensor, img_b_tensor], dim=1).to(DEVICE)
+    # Concatenate according to model input channels
+    if temporal_in_channels == 9:
+        diff_tensor = torch.abs(img_a_tensor - img_b_tensor)
+        temporal_tensor = torch.cat([img_a_tensor, img_b_tensor, diff_tensor], dim=1).to(DEVICE)
+    else:
+        temporal_tensor = torch.cat([img_a_tensor, img_b_tensor], dim=1).to(DEVICE)
 
     with torch.no_grad():
         logits = temporal_model(temporal_tensor)
