@@ -4,68 +4,167 @@ import torch.nn.functional as F
 
 TEMPORAL_CHECKPOINT_PATH = "models/best_temporal_model.pth"
 
+
+# --------------------------------------------------
+# Building Blocks
+# --------------------------------------------------
+
 class DoubleConv(nn.Module):
-    """(Convolution -> BatchNorm -> ReLU) * 2"""
-    def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.double_conv = nn.Sequential(
+    """(Conv -> BN -> ReLU) x 2"""
+    def __init__(self, in_channels, out_channels, dropout_p=0.0):
+        super().__init__()
+        layers = [
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+            nn.ReLU(inplace=True),
+        ]
+        if dropout_p > 0.0:
+            layers.append(nn.Dropout2d(p=dropout_p))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x):
-        return self.double_conv(x)
+        return self.block(x)
 
+
+# --------------------------------------------------
+# Loss Functions
+# --------------------------------------------------
+
+class DiceLoss(nn.Module):
+    """Soft Dice Loss (operates on probabilities, not logits)."""
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits).view(-1)
+        targets = targets.view(-1).float()
+        intersection = (probs * targets).sum()
+        return 1.0 - (2.0 * intersection + self.smooth) / (
+            probs.sum() + targets.sum() + self.smooth
+        )
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for binary segmentation (Sigmoid-based).
+    Ref: Lin et al. 2017 -- "Focal Loss for Dense Object Detection"
+
+    gamma: focusing parameter (0 = BCE, 2 = standard focal)
+    alpha: weight for positive class (None = no weight)
+    """
+    def __init__(self, gamma=2.0, alpha=0.75, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        targets = targets.float()
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        focal_weight = (1 - p_t) ** self.gamma
+
+        if self.alpha is not None:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            focal_weight = alpha_t * focal_weight
+
+        loss = focal_weight * bce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+class WeightedBCEDiceLoss(nn.Module):
+    """Weighted BCE + Dice (original approach, improved)."""
+    def __init__(self, pos_weight_val=20.0, bce_weight=0.5, dice_weight=0.5):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        pos_w = torch.tensor([pos_weight_val])
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        self.dice = DiceLoss()
+
+    def forward(self, logits, targets):
+        targets = targets.float()
+        # Move pos_weight to same device as logits
+        self.bce.pos_weight = self.bce.pos_weight.to(logits.device)
+        return self.bce_weight * self.bce(logits, targets) + self.dice_weight * self.dice(logits, targets)
+
+
+class FocalDiceLoss(nn.Module):
+    """Focal Loss + Dice Loss (best for highly imbalanced change detection)."""
+    def __init__(self, focal_weight=0.5, dice_weight=0.5, gamma=2.0, alpha=0.75):
+        super().__init__()
+        self.focal_weight = focal_weight
+        self.dice_weight = dice_weight
+        self.focal = FocalLoss(gamma=gamma, alpha=alpha)
+        self.dice = DiceLoss()
+
+    def forward(self, logits, targets):
+        targets = targets.float()
+        return self.focal_weight * self.focal(logits, targets) + self.dice_weight * self.dice(logits, targets)
+
+
+# --------------------------------------------------
+# Model Architecture
+# --------------------------------------------------
 
 class TemporalUNet(nn.Module):
     """
-    Temporal U-Net Architecture for Deforestation Detection.
-    
-    Input: (B, 6, H, W) Concatenated T1 and T2 Satellite Imagery
-    Output: (B, 1, H, W) Logits for Deforestation Change (1) vs No Change (0)
+    Temporal U-Net for Deforestation Change Detection.
+
+    Supports:
+      - 6-channel input  [A_RGB, B_RGB]               (diff_channels=False)
+      - 9-channel input  [A_RGB, B_RGB, |A-B|_RGB]    (diff_channels=True)
+
+    Args:
+        in_channels:    6 or 9
+        out_channels:   1 (binary mask)
+        init_features:  base feature count (32 = standard, 48 = larger)
+        bottleneck_dropout: dropout probability in bottleneck (0.0 = off)
     """
-    def __init__(self, in_channels=6, out_channels=1, init_features=32):
-        super(TemporalUNet, self).__init__()
-        features = init_features
+    def __init__(
+        self,
+        in_channels=6,
+        out_channels=1,
+        init_features=32,
+        bottleneck_dropout=0.0,
+    ):
+        super().__init__()
+        f = init_features
 
         # Encoder
-        self.inc = DoubleConv(in_channels, features)  # 6 -> 32
-        self.down1 = nn.Sequential(
+        self.inc    = DoubleConv(in_channels, f)
+        self.down1  = nn.Sequential(nn.MaxPool2d(2), DoubleConv(f,     f * 2))
+        self.down2  = nn.Sequential(nn.MaxPool2d(2), DoubleConv(f * 2, f * 4))
+        self.down3  = nn.Sequential(nn.MaxPool2d(2), DoubleConv(f * 4, f * 8))
+        self.down4  = nn.Sequential(
             nn.MaxPool2d(2),
-            DoubleConv(features, features * 2)         # 32 -> 64
-        )
-        self.down2 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(features * 2, features * 4)     # 64 -> 128
-        )
-        self.down3 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(features * 4, features * 8)     # 128 -> 256
-        )
-        self.down4 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(features * 8, features * 16)    # 256 -> 512
+            DoubleConv(f * 8, f * 16, dropout_p=bottleneck_dropout),
         )
 
         # Decoder
-        self.up1 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
-        self.conv_up1 = DoubleConv(features * 16, features * 8)
+        self.up1     = nn.ConvTranspose2d(f * 16, f * 8, kernel_size=2, stride=2)
+        self.conv_up1 = DoubleConv(f * 16, f * 8)
 
-        self.up2 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
-        self.conv_up2 = DoubleConv(features * 8, features * 4)
+        self.up2     = nn.ConvTranspose2d(f * 8,  f * 4, kernel_size=2, stride=2)
+        self.conv_up2 = DoubleConv(f * 8,  f * 4)
 
-        self.up3 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
-        self.conv_up3 = DoubleConv(features * 4, features * 2)
+        self.up3     = nn.ConvTranspose2d(f * 4,  f * 2, kernel_size=2, stride=2)
+        self.conv_up3 = DoubleConv(f * 4,  f * 2)
 
-        self.up4 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
-        self.conv_up4 = DoubleConv(features * 2, features)
+        self.up4     = nn.ConvTranspose2d(f * 2,  f,     kernel_size=2, stride=2)
+        self.conv_up4 = DoubleConv(f * 2,  f)
 
-        # Output Layer
-        self.outc = nn.Conv2d(features, out_channels, kernel_size=1)
+        self.outc = nn.Conv2d(f, out_channels, kernel_size=1)
 
     def forward(self, x):
         x1 = self.inc(x)
@@ -74,37 +173,18 @@ class TemporalUNet(nn.Module):
         x4 = self.down3(x3)
         x5 = self.down4(x4)
 
-        x_up = self.up1(x5)
-        x_up = torch.cat([x4, x_up], dim=1)
-        x_up = self.conv_up1(x_up)
+        u = self.up1(x5);  u = self.conv_up1(torch.cat([x4, u], dim=1))
+        u = self.up2(u);   u = self.conv_up2(torch.cat([x3, u], dim=1))
+        u = self.up3(u);   u = self.conv_up3(torch.cat([x2, u], dim=1))
+        u = self.up4(u);   u = self.conv_up4(torch.cat([x1, u], dim=1))
 
-        x_up = self.up2(x_up)
-        x_up = torch.cat([x3, x_up], dim=1)
-        x_up = self.conv_up2(x_up)
+        return self.outc(u)
 
-        x_up = self.up3(x_up)
-        x_up = torch.cat([x2, x_up], dim=1)
-        x_up = self.conv_up3(x_up)
-
-        x_up = self.up4(x_up)
-        x_up = torch.cat([x1, x_up], dim=1)
-        x_up = self.conv_up4(x_up)
-
-        logits = self.outc(x_up)
-        return logits
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("TEMPORAL U-NET MODEL ARCHITECTURE TEST")
-    print("=" * 50)
-
-    model = TemporalUNet(in_channels=6, out_channels=1, init_features=32)
-    dummy_input = torch.randn(2, 6, 256, 256)
-    output = model(dummy_input)
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f"Input shape       : {dummy_input.shape}")
-    print(f"Output shape      : {output.shape}")
-    print(f"Trainable params  : {total_params:,}")
-    print("Temporal model architecture verification successful!")
+    for ch in [6, 9]:
+        model = TemporalUNet(in_channels=ch, out_channels=1, init_features=32)
+        dummy = torch.randn(2, ch, 256, 256)
+        out = model(dummy)
+        params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"in_channels={ch}: output={out.shape}, params={params:,}")
