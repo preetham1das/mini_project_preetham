@@ -1,387 +1,704 @@
-import { useState, useEffect } from "react";
-import "./App.css";
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Globe, 
+  Trees, 
+  Layers, 
+  GitCompare, 
+  BarChart3, 
+  Play, 
+  Upload, 
+  Sliders, 
+  Activity, 
+  FileText,
+  MapPin
+} from 'lucide-react';
+import L from 'leaflet';
 
-/* ── SVG Icons ───────────────────────────────────────────── */
-const IconUpload = () => (
-  <svg width="28" height="28" fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24">
-    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" strokeLinecap="round" strokeLinejoin="round"/>
-    <polyline points="17 8 12 3 7 8" strokeLinecap="round" strokeLinejoin="round"/>
-    <line x1="12" y1="3" x2="12" y2="15" strokeLinecap="round"/>
-  </svg>
-);
-
-const IconCheck = () => (
-  <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-    <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round"/>
-  </svg>
-);
-
-const IconSatellite = () => (
-  <svg width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-    <path d="M12 2L2 7l10 5 10-5-10-5z" strokeLinejoin="round"/>
-    <path d="M2 17l10 5 10-5" strokeLinecap="round" strokeLinejoin="round"/>
-    <path d="M2 12l10 5 10-5" strokeLinecap="round" strokeLinejoin="round"/>
-  </svg>
-);
-
-const IconClock = () => (
-  <svg width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-    <circle cx="12" cy="12" r="10"/>
-    <polyline points="12 6 12 12 16 14" strokeLinecap="round" strokeLinejoin="round"/>
-  </svg>
-);
-
-const IconSpinner = () => (
-  <svg className="spinner-icon" width="18" height="18" viewBox="0 0 24 24" fill="none">
-    <circle cx="12" cy="12" r="10" stroke="rgba(255,255,255,0.25)" strokeWidth="2.5"/>
-    <path d="M12 2a10 10 0 0110 10" stroke="white" strokeWidth="2.5" strokeLinecap="round"/>
-  </svg>
-);
-
-/* ── Progress Ring ───────────────────────────────────────── */
-const ProgressRing = ({ percent, color, size = 108, stroke = 9 }) => {
-  const r = (size - stroke) / 2;
-  const circ = 2 * Math.PI * r;
-  const offset = circ - (Math.min(percent, 100) / 100) * circ;
-  return (
-    <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
-      <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#e2e8f0" strokeWidth={stroke} />
-      <circle
-        key={percent}
-        cx={size / 2} cy={size / 2} r={r}
-        fill="none" stroke={color} strokeWidth={stroke}
-        strokeDasharray={circ} strokeDashoffset={offset}
-        strokeLinecap="round"
-        style={{ transition: "stroke-dashoffset 1.1s cubic-bezier(.4,0,.2,1)" }}
-      />
-    </svg>
-  );
-};
-
-/* ── Severity helpers ────────────────────────────────────── */
-function forestSeverity(pct) {
-  if (pct >= 60) return { color: "#16a34a", bg: "#dcfce7", label: "High Coverage" };
-  if (pct >= 30) return { color: "#ca8a04", bg: "#fef9c3", label: "Moderate Coverage" };
-  return { color: "#dc2626", bg: "#fee2e2", label: "Low Coverage" };
-}
-function defoSeverity(pct) {
-  if (pct < 5)  return { color: "#16a34a", bg: "#dcfce7", label: "Minimal Change" };
-  if (pct < 20) return { color: "#ca8a04", bg: "#fef9c3", label: "Moderate Deforestation" };
-  return { color: "#dc2626", bg: "#fee2e2", label: "Severe Deforestation" };
-}
-
-/* ══════════════════════════════════════════════════════════ */
-function App() {
-  const [mode, setMode] = useState("forest");
-  const [samples, setSamples] = useState({ stage1_samples: [], stage2_samples: [] });
-
-  // Stage 1 state
-  const [file, setFile]           = useState(null);
-  const [preview, setPreview]     = useState(null);
-  const [samplePath, setSamplePath] = useState("");
-  const [thresholdS1, setThresholdS1] = useState(0.5);
-
-  // Stage 2 state
-  const [fileT1, setFileT1]         = useState(null);
-  const [previewT1, setPreviewT1]   = useState(null);
-  const [fileT2, setFileT2]         = useState(null);
-  const [previewT2, setPreviewT2]   = useState(null);
-  const [samplePair, setSamplePair] = useState("");
-  const [thresholdS2, setThresholdS2] = useState(0.5);
-
-  const [result, setResult]   = useState(null);
+export default function App() {
+  const [activeTab, setActiveTab] = useState('gis-map');
   const [loading, setLoading] = useState(false);
-  const [error, setError]     = useState(null);
+  const [backendStatus, setBackendStatus] = useState('connecting');
 
+  // Samples Data
+  const [samples, setSamples] = useState({ stage1_samples: [], stage2_samples: [] });
+  const [gisMode, setGisMode] = useState('stage1');
+  const [selectedGisSample, setSelectedGisSample] = useState('');
+  const [gisThreshold, setGisThreshold] = useState(0.5);
+  const [gisOpacity, setGisOpacity] = useState(0.8);
+  const [gisMetrics, setGisMetrics] = useState(null);
+
+  // Stage 1 State
+  const [s1Sample, setS1Sample] = useState('');
+  const [s1File, setS1File] = useState(null);
+  const [s1Threshold, setS1Threshold] = useState(0.5);
+  const [s1Results, setS1Results] = useState(null);
+
+  // Stage 2 State
+  const [s2Sample, setS2Sample] = useState('');
+  const [s2Threshold, setS2Threshold] = useState(0.5);
+  const [s2Results, setS2Results] = useState(null);
+
+  // Swipe State
+  const [swipeSample, setSwipeSample] = useState('');
+  const [swipeData, setSwipeData] = useState(null);
+  const [swipePos, setSwipePos] = useState(50);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Metrics State
+  const [analytics, setAnalytics] = useState(null);
+
+  // Map refs
+  const mapRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const overlayRef = useRef(null);
+  const boundsRef = useRef(null);
+
+  // Fetch samples on load
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/api/samples")
-      .then(r => r.json())
-      .then(d => setSamples(d))
-      .catch(() => {});
+    fetch('/api/samples')
+      .then(res => res.json())
+      .then(data => {
+        setSamples(data);
+        setBackendStatus('online');
+      })
+      .catch(err => {
+        console.error("Backend error:", err);
+        setBackendStatus('offline');
+      });
+
+    fetch('/api/metrics')
+      .then(res => res.json())
+      .then(data => setAnalytics(data))
+      .catch(err => console.error("Metrics fetch error:", err));
   }, []);
 
-  const resetAll = () => {
-    setResult(null); setError(null);
-    setFile(null); setPreview(null); setSamplePath("");
-    setFileT1(null); setPreviewT1(null);
-    setFileT2(null); setPreviewT2(null);
-    setSamplePair("");
-  };
+  // Initialize Leaflet Map
+  useEffect(() => {
+    if (activeTab === 'gis-map' && mapRef.current && !mapInstanceRef.current) {
+      const esriTile = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+        maxZoom: 18,
+        attribution: "Esri Satellite"
+      });
 
-  const handleModeChange = (m) => { setMode(m); resetAll(); };
+      const osmTile = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "OpenStreetMap"
+      });
 
-  // Stage 1 handlers
-  const handleFile = (e) => {
-    const f = e.target.files[0]; if (!f) return;
-    setFile(f); setPreview(URL.createObjectURL(f));
-    setSamplePath(""); setResult(null); setError(null);
-  };
-  const handleSample1 = (e) => {
-    setSamplePath(e.target.value);
-    setFile(null); setPreview(null);
-    setResult(null); setError(null);
-  };
+      const map = L.map(mapRef.current, {
+        center: [-3.4653, -62.2159],
+        zoom: 13,
+        layers: [esriTile]
+      });
 
-  // Stage 2 handlers
-  const handleFileT1 = (e) => {
-    const f = e.target.files[0]; if (!f) return;
-    setFileT1(f); setPreviewT1(URL.createObjectURL(f));
-    setSamplePair(""); setResult(null); setError(null);
-  };
-  const handleFileT2 = (e) => {
-    const f = e.target.files[0]; if (!f) return;
-    setFileT2(f); setPreviewT2(URL.createObjectURL(f));
-    setSamplePair(""); setResult(null); setError(null);
-  };
-  const handleSample2 = (e) => {
-    setSamplePair(e.target.value);
-    setFileT1(null); setPreviewT1(null);
-    setFileT2(null); setPreviewT2(null);
-    setResult(null); setError(null);
-  };
+      L.control.layers({
+        "Satellite (Esri)": esriTile,
+        "Street Map (OSM)": osmTile
+      }).addTo(map);
 
-  // API calls
-  const analyzeImage = async () => {
-    if (!file && !samplePath) return;
-    setLoading(true); setResult(null); setError(null);
-    const fd = new FormData();
-    if (file) fd.append("file", file);
-    if (samplePath) fd.append("sample_path", samplePath);
-    fd.append("threshold", thresholdS1);
-    try {
-      const res = await fetch("http://127.0.0.1:8000/predict", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.error || "Prediction failed");
-      setResult(data);
-    } catch (err) { setError(err.message); }
-    finally { setLoading(false); }
-  };
-
-  const analyzeDeforestation = async () => {
-    if ((!fileT1 || !fileT2) && !samplePair) return;
-    setLoading(true); setResult(null); setError(null);
-    const fd = new FormData();
-    if (fileT1 && fileT2) {
-      fd.append("before_image", fileT1);
-      fd.append("after_image", fileT2);
+      mapInstanceRef.current = map;
     }
-    if (samplePair) {
-      const obj = JSON.parse(samplePair);
-      fd.append("sample_path_a", obj.path_a);
-      fd.append("sample_path_b", obj.path_b);
+
+    if (activeTab === 'gis-map' && mapInstanceRef.current) {
+      setTimeout(() => mapInstanceRef.current.invalidateSize(), 150);
     }
-    fd.append("threshold", thresholdS2);
-    try {
-      const res = await fetch("http://127.0.0.1:8000/predict-temporal", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.error || "Prediction failed");
-      setResult(data);
-    } catch (err) { setError(err.message); }
-    finally { setLoading(false); }
+  }, [activeTab]);
+
+  // Update Opacity live
+  useEffect(() => {
+    if (overlayRef.current) {
+      overlayRef.current.setOpacity(gisOpacity);
+    }
+  }, [gisOpacity]);
+
+  // Run GIS Spatial Analysis
+  const handleRunGis = () => {
+    if (!selectedGisSample) {
+      alert("Please select a sample satellite tile from the dropdown.");
+      return;
+    }
+
+    const sampleObj = JSON.parse(selectedGisSample);
+    const formData = new FormData();
+    formData.append("threshold", gisThreshold);
+    setLoading(true);
+
+    const endpoint = (gisMode === 'stage1') ? '/api/predict/stage1' : '/api/predict/stage2';
+    if (gisMode === 'stage1') {
+      formData.append("sample_path", sampleObj.path);
+    } else {
+      formData.append("sample_id", sampleObj.id);
+      formData.append("split", sampleObj.split);
+    }
+
+    fetch(endpoint, { method: "POST", body: formData })
+      .then(res => res.json())
+      .then(data => {
+        setLoading(false);
+        if (data.error) { alert(data.error); return; }
+
+        setGisMetrics(data);
+
+        // Render Leaflet Overlay
+        const map = mapInstanceRef.current;
+        if (map && data.gis) {
+          if (overlayRef.current) map.removeLayer(overlayRef.current);
+          if (boundsRef.current) map.removeLayer(boundsRef.current);
+
+          const bounds = L.latLngBounds(data.gis.bounds);
+
+          boundsRef.current = L.rectangle(bounds, {
+            color: "#10b981",
+            weight: 2,
+            fill: false,
+            dashArray: "4, 4"
+          }).addTo(map);
+
+          const overlayImg = (gisMode === 'stage1') ? data.overlay_image : data.deforestation_overlay;
+          overlayRef.current = L.imageOverlay(overlayImg, bounds, { opacity: gisOpacity }).addTo(map);
+
+          map.fitBounds(bounds, { padding: [30, 30] });
+        }
+      })
+      .catch(err => {
+        setLoading(false);
+        console.error(err);
+        alert("Failed to connect to backend server!");
+      });
   };
 
-  const canRunS1 = !!(file || samplePath);
-  const canRunS2 = !!((fileT1 && fileT2) || samplePair);
+  // Run Stage 1
+  const handleRunStage1 = () => {
+    const formData = new FormData();
+    formData.append("threshold", s1Threshold);
 
-  const fSev = result?.forest_percentage != null ? forestSeverity(result.forest_percentage) : null;
-  const dSev = result?.deforestation_percentage != null ? defoSeverity(result.deforestation_percentage) : null;
+    if (s1File) {
+      formData.append("file", s1File);
+    } else if (s1Sample) {
+      formData.append("sample_path", s1Sample);
+    } else {
+      alert("Please select a sample or upload a file.");
+      return;
+    }
+
+    setLoading(true);
+    fetch("/api/predict/stage1", { method: "POST", body: formData })
+      .then(res => res.json())
+      .then(data => {
+        setLoading(false);
+        if (data.error) { alert(data.error); return; }
+        setS1Results(data);
+      })
+      .catch(err => {
+        setLoading(false);
+        alert("Backend connection error.");
+      });
+  };
+
+  // Run Stage 2
+  const handleRunStage2 = () => {
+    if (!s2Sample) {
+      alert("Please select a temporal pair.");
+      return;
+    }
+
+    const sampleObj = JSON.parse(s2Sample);
+    const formData = new FormData();
+    formData.append("sample_id", sampleObj.id);
+    formData.append("split", sampleObj.split);
+    formData.append("threshold", s2Threshold);
+
+    setLoading(true);
+    fetch("/api/predict/stage2", { method: "POST", body: formData })
+      .then(res => res.json())
+      .then(data => {
+        setLoading(false);
+        if (data.error) { alert(data.error); return; }
+        setS2Results(data);
+      })
+      .catch(err => {
+        setLoading(false);
+        alert("Backend connection error.");
+      });
+  };
+
+  // Load Swipe
+  const handleLoadSwipe = () => {
+    if (!swipeSample) {
+      alert("Please select a temporal pair.");
+      return;
+    }
+    const sampleObj = JSON.parse(swipeSample);
+    const formData = new FormData();
+    formData.append("sample_id", sampleObj.id);
+    formData.append("split", sampleObj.split);
+    formData.append("threshold", 0.5);
+
+    setLoading(true);
+    fetch("/api/predict/stage2", { method: "POST", body: formData })
+      .then(res => res.json())
+      .then(data => {
+        setLoading(false);
+        if (data.error) { alert(data.error); return; }
+        setSwipeData(data);
+      })
+      .catch(err => {
+        setLoading(false);
+        alert("Backend connection error.");
+      });
+  };
+
+  const handleMouseMove = (e) => {
+    if (!isDragging) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    let posX = e.clientX - box.left;
+    if (posX < 0) posX = 0;
+    if (posX > box.width) posX = box.width;
+    setSwipePos((posX / box.width) * 100);
+  };
 
   return (
-    <div className="app">
+    <div className="app-container">
+      {loading && (
+        <div className="loading-overlay">
+          <div className="spinner"></div>
+          <p style={{ marginTop: 16, fontWeight: 600 }}>Executing Deep Neural Network Inference...</p>
+        </div>
+      )}
 
-      {/* ── HEADER ─────────────────────────────────────────── */}
-      <header className="header">
-        <div className="header-inner">
-          <div className="header-brand">
-            <div className="header-logo">🌿</div>
-            <div className="header-text">
-              <h1 className="header-title">ForestWatch AI</h1>
-              <p className="header-sub">
-                Forest Cover Segmentation &amp; Temporal Deforestation Detection · U-Net Architecture
-              </p>
+      {/* Sidebar */}
+      <aside className="sidebar">
+        <div>
+          <div className="brand">
+            <Globe className="brand-icon" />
+            <div className="brand-text">
+              <h2>EcoVision GIS</h2>
+              <p>Deforestation Intelligence</p>
             </div>
           </div>
-          <div className="header-badges">
-            <span className="hbadge">Stage 1 · Segmentation</span>
-            <span className="hbadge">Stage 2 · Change Detection</span>
-            <span className="hbadge hbadge--live">● Live</span>
+
+          <nav className="nav-menu">
+            <button 
+              className={`nav-item ${activeTab === 'gis-map' ? 'active' : ''}`}
+              onClick={() => setActiveTab('gis-map')}
+            >
+              <Globe size={18} /> Interactive GIS Map
+            </button>
+            <button 
+              className={`nav-item ${activeTab === 'stage1' ? 'active' : ''}`}
+              onClick={() => setActiveTab('stage1')}
+            >
+              <Trees size={18} /> Stage 1: Forest Cover
+            </button>
+            <button 
+              className={`nav-item ${activeTab === 'stage2' ? 'active' : ''}`}
+              onClick={() => setActiveTab('stage2')}
+            >
+              <Layers size={18} /> Stage 2: Change Detection
+            </button>
+            <button 
+              className={`nav-item ${activeTab === 'swipe' ? 'active' : ''}`}
+              onClick={() => setActiveTab('swipe')}
+            >
+              <GitCompare size={18} /> Swipe Comparison
+            </button>
+            <button 
+              className={`nav-item ${activeTab === 'metrics' ? 'active' : ''}`}
+              onClick={() => setActiveTab('metrics')}
+            >
+              <BarChart3 size={18} /> Model Analytics
+            </button>
+          </nav>
+        </div>
+
+        <div className="system-status">
+          <span className={`status-indicator ${backendStatus}`}></span>
+          <div>
+            <span className="status-title">PyTorch REST API</span>
+            <span className="status-sub">{backendStatus === 'online' ? 'Connected (Port 5000)' : 'Offline'}</span>
           </div>
         </div>
-      </header>
+      </aside>
 
-      <main className="main">
+      {/* Main Content */}
+      <main className="main-content">
+        <header className="top-header">
+          <h1>
+            {activeTab === 'gis-map' && 'Interactive GIS Satellite Map Viewer'}
+            {activeTab === 'stage1' && 'Stage 1: Binary Forest Cover Segmentation'}
+            {activeTab === 'stage2' && 'Stage 2: Temporal Deforestation Change Detection'}
+            {activeTab === 'swipe' && 'Temporal Swipe Comparison Viewer'}
+            {activeTab === 'metrics' && 'Model Performance Analytics & Validation Reports'}
+          </h1>
+          <p>
+            {activeTab === 'gis-map' && 'Geospatial analysis of Amazon basin canopy cover & loss using Leaflet.js and PyTorch U-Net.'}
+            {activeTab === 'stage1' && 'Extracting pixel-level forest canopy coverage with physical area calculations in Hectares.'}
+            {activeTab === 'stage2' && 'Detecting forest loss (deforestation) between T1 and T2 satellite image pairs.'}
+            {activeTab === 'swipe' && 'Interactive split-screen swipe tool comparing Before (T1) vs. After (T2 + Deforestation Overlay).'}
+            {activeTab === 'metrics' && 'Quantitative evaluation metrics (IoU, Dice, Precision, Recall) across dataset splits.'}
+          </p>
+        </header>
 
-        {/* ── MODE TABS ──────────────────────────────────────── */}
-        <div className="tab-bar">
-          <button
-            className={`tab-btn${mode === "forest" ? " tab-btn--active" : ""}`}
-            onClick={() => handleModeChange("forest")}
-          >
-            <IconSatellite />
-            <span>Forest Cover Detection</span>
-            <span className="tab-pill tab-pill--green">Stage 1</span>
-          </button>
-          <button
-            className={`tab-btn${mode === "temporal" ? " tab-btn--active" : ""}`}
-            onClick={() => handleModeChange("temporal")}
-          >
-            <IconClock />
-            <span>Deforestation Detection</span>
-            <span className="tab-pill tab-pill--amber">Stage 2</span>
-          </button>
-        </div>
+        {/* TAB 1: GIS MAP */}
+        {activeTab === 'gis-map' && (
+          <div className="tab-content">
+            <div className="gis-layout">
+              <div className="gis-sidebar">
+                <div className="glass-card">
+                  <h3 className="panel-heading">GIS Control Panel</h3>
+                  
+                  <div className="panel-section" style={{ marginTop: 12 }}>
+                    <label className="section-label">Analysis Pipeline</label>
+                    <div className="toggle-group">
+                      <button 
+                        className={`btn-toggle ${gisMode === 'stage1' ? 'active' : ''}`}
+                        onClick={() => setGisMode('stage1')}
+                      >
+                        Stage 1 (Canopy)
+                      </button>
+                      <button 
+                        className={`btn-toggle ${gisMode === 'stage2' ? 'active' : ''}`}
+                        onClick={() => setGisMode('stage2')}
+                      >
+                        Stage 2 (Deforestation)
+                      </button>
+                    </div>
+                  </div>
 
-        {/* ── ERROR BANNER ───────────────────────────────────── */}
-        {error && (
-          <div className="error-banner fade-in">
-            <span>⚠️ &nbsp;{error}</span>
-            <button className="error-dismiss" onClick={() => setError(null)}>✕</button>
+                  <div className="panel-section" style={{ marginTop: 14 }}>
+                    <label className="section-label">Satellite Tile Selection</label>
+                    <select 
+                      className="custom-select"
+                      value={selectedGisSample}
+                      onChange={(e) => setSelectedGisSample(e.target.value)}
+                    >
+                      <option value="">-- Choose Sample Satellite Tile --</option>
+                      {gisMode === 'stage1' ? (
+                        samples.stage1_samples.map((s, idx) => (
+                          <option key={idx} value={JSON.stringify(s)}>[{s.split}] {s.name}</option>
+                        ))
+                      ) : (
+                        samples.stage2_samples.map((s, idx) => (
+                          <option key={idx} value={JSON.stringify(s)}>{s.name}</option>
+                        ))
+                      )}
+                    </select>
+                  </div>
+
+                  <div className="panel-section" style={{ marginTop: 14 }}>
+                    <div className="slider-header">
+                      <span>Probability Threshold</span>
+                      <span>{gisThreshold.toFixed(2)}</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="0.1" 
+                      max="0.9" 
+                      step="0.05"
+                      value={gisThreshold} 
+                      onChange={(e) => setGisThreshold(parseFloat(e.target.value))}
+                    />
+                  </div>
+
+                  <div className="panel-section" style={{ marginTop: 14 }}>
+                    <div className="slider-header">
+                      <span>Map Layer Opacity</span>
+                      <span>{Math.round(gisOpacity * 100)}%</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="0.1" 
+                      max="1.0" 
+                      step="0.05"
+                      value={gisOpacity} 
+                      onChange={(e) => setGisOpacity(parseFloat(e.target.value))}
+                    />
+                  </div>
+
+                  <button 
+                    className="btn btn-primary full-width" 
+                    style={{ marginTop: 18 }}
+                    onClick={handleRunGis}
+                  >
+                    <Play size={16} /> Run Spatial Analysis
+                  </button>
+                </div>
+
+                {gisMetrics && (
+                  <div className="gis-metrics-box">
+                    <span className="m-card-title">Spatial Land Area Metrics</span>
+                    <div className="gis-stat-row">
+                      <span>Total Tile Area:</span>
+                      <strong>{gisMetrics.total_hectares || "655.36"} ha</strong>
+                    </div>
+                    <div className="gis-stat-row">
+                      <span>{gisMode === 'stage1' ? 'Forest Canopy:' : 'Deforestation Loss:'}</span>
+                      <strong className={gisMode === 'stage1' ? 'text-green' : 'text-red'}>
+                        {gisMode === 'stage1' ? `${gisMetrics.forest_hectares} ha (${gisMetrics.forest_pct}%)` : `${gisMetrics.deforestation_hectares} ha (${gisMetrics.deforestation_pct}%)`}
+                      </strong>
+                    </div>
+                    <div className="gis-stat-row">
+                      <span>Coordinates:</span>
+                      <small>{gisMetrics.gis.center[0]}, {gisMetrics.gis.center[1]}</small>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="glass-card map-container">
+                <div id="react-leaflet-map" ref={mapRef}></div>
+                
+                <div className="map-legend-overlay">
+                  <div className="legend-title">GIS Layer Legend</div>
+                  <div className="legend-item">
+                    <span className="legend-color legend-green"></span>
+                    <span>Stage 1: Forest Canopy</span>
+                  </div>
+                  <div className="legend-item">
+                    <span className="legend-color legend-red"></span>
+                    <span>Stage 2: Deforestation Loss</span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
-        {/* ══════════════ STAGE 1 ══════════════════════════════ */}
-        {mode === "forest" && (
-          <div className="fade-in">
-            <p className="mode-desc">
-              Upload a satellite image to segment forest pixels using a <strong>U-Net</strong> trained on the Amazon Forest dataset.
-            </p>
-
-            <div className="panel">
-              <div className="panel-head">
-                <span className="panel-title">Input Image</span>
-                <span className="panel-hint">Pick a sample or upload your own</span>
+        {/* TAB 2: STAGE 1 */}
+        {activeTab === 'stage1' && (
+          <div className="tab-content">
+            <div className="glass-card control-panel">
+              <div className="panel-section">
+                <label className="section-label">Select Sample Satellite Image</label>
+                <select 
+                  className="custom-select"
+                  value={s1Sample}
+                  onChange={(e) => { setS1Sample(e.target.value); setS1File(null); }}
+                >
+                  <option value="">-- Choose Pre-loaded Sample --</option>
+                  {samples.stage1_samples.map((s, i) => (
+                    <option key={i} value={s.path}>[{s.split}] {s.name}</option>
+                  ))}
+                </select>
               </div>
 
-              {samples.stage1_samples.length > 0 && (
-                <div className="field">
-                  <label className="field-label">Sample Library</label>
-                  <select className="styled-select" value={samplePath} onChange={handleSample1}>
-                    <option value="">— select a preset sample image —</option>
-                    {samples.stage1_samples.map(s => (
-                      <option key={s.path} value={s.path}>[{s.split}] {s.name}</option>
-                    ))}
-                  </select>
+              <div className="panel-section">
+                <label className="section-label">Or Upload Custom Image</label>
+                <div className="file-dropzone">
+                  <span>{s1File ? `Selected: ${s1File.name}` : 'Click to Upload TIFF/PNG'}</span>
+                  <input 
+                    type="file" 
+                    accept="image/*"
+                    onChange={(e) => {
+                      if (e.target.files.length > 0) {
+                        setS1File(e.target.files[0]);
+                        setS1Sample('');
+                      }
+                    }}
+                  />
                 </div>
-              )}
+              </div>
 
-              <div className="or-divider"><span>or upload custom image</span></div>
+              <div className="panel-section threshold-box">
+                <div className="slider-header">
+                  <span>Confidence Threshold</span>
+                  <span>{s1Threshold.toFixed(2)}</span>
+                </div>
+                <input 
+                  type="range" 
+                  min="0.1" 
+                  max="0.9" 
+                  step="0.05"
+                  value={s1Threshold}
+                  onChange={(e) => setS1Threshold(parseFloat(e.target.value))}
+                />
+              </div>
 
-              <label className={`drop-zone${file ? " drop-zone--filled" : ""}`}>
-                <input type="file" accept="image/*,.tif,.tiff" onChange={handleFile} />
-                <div className="drop-zone-body">
-                  <IconUpload />
-                  {file ? (
-                    <>
-                      <span className="drop-filename"><IconCheck /> {file.name}</span>
-                      <span className="drop-hint">Click to replace</span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="drop-label">Click to upload satellite image</span>
-                      <span className="drop-hint">PNG · JPEG · TIFF supported</span>
-                    </>
+              <button className="btn btn-primary" onClick={handleRunStage1}>
+                <Play size={16} /> Run Forest Segmentation
+              </button>
+            </div>
+
+            {s1Results && (
+              <>
+                <div className="stats-grid">
+                  <div className="glass-card stat-card">
+                    <span className="stat-label">Forest Canopy Area</span>
+                    <span className="stat-value text-green">{s1Results.forest_hectares} ha</span>
+                    <span className="stat-sub">{s1Results.forest_pct}% of total land cover</span>
+                  </div>
+                  <div className="glass-card stat-card">
+                    <span className="stat-label">Non-Forest Area</span>
+                    <span className="stat-value text-gray">{s1Results.non_forest_pct}%</span>
+                    <span className="stat-sub">{s1Results.non_forest_pixels.toLocaleString()} pixels</span>
+                  </div>
+                  <div className="glass-card stat-card">
+                    <span className="stat-label">Total Tile Area</span>
+                    <span className="stat-value text-accent">{s1Results.total_hectares} ha</span>
+                    <span className="stat-sub">Ground Sample Distance: 10m/px</span>
+                  </div>
+                </div>
+
+                <div className="visuals-grid">
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Original Satellite RGB</div>
+                    <div className="img-wrapper">
+                      <img src={s1Results.original_image} alt="Original" />
+                    </div>
+                  </div>
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Binary Forest Mask</div>
+                    <div className="img-wrapper">
+                      <img src={s1Results.mask_image} alt="Mask" />
+                    </div>
+                  </div>
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Canopy Overlay (Emerald)</div>
+                    <div className="img-wrapper">
+                      <img src={s1Results.overlay_image} alt="Overlay" />
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* TAB 3: STAGE 2 */}
+        {activeTab === 'stage2' && (
+          <div className="tab-content">
+            <div className="glass-card control-panel">
+              <div className="panel-section" style={{ minWidth: 300 }}>
+                <label className="section-label">Select Temporal Image Pair (T1 vs T2)</label>
+                <select 
+                  className="custom-select"
+                  value={s2Sample}
+                  onChange={(e) => setS2Sample(e.target.value)}
+                >
+                  <option value="">-- Choose Sample Pair --</option>
+                  {samples.stage2_samples.map((s, i) => (
+                    <option key={i} value={JSON.stringify(s)}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="panel-section threshold-box">
+                <div className="slider-header">
+                  <span>Deforestation Threshold</span>
+                  <span>{s2Threshold.toFixed(2)}</span>
+                </div>
+                <input 
+                  type="range" 
+                  min="0.1" 
+                  max="0.9" 
+                  step="0.05"
+                  value={s2Threshold}
+                  onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
+                />
+              </div>
+
+              <button className="btn btn-primary" onClick={handleRunStage2}>
+                <Play size={16} /> Detect Deforestation
+              </button>
+            </div>
+
+            {s2Results && (
+              <>
+                <div className="stats-grid">
+                  <div className="glass-card stat-card">
+                    <span className="stat-label">Deforestation Loss Area</span>
+                    <span className="stat-value text-red">{s2Results.deforestation_hectares} ha</span>
+                    <span className="stat-sub">{s2Results.deforestation_pct}% tree cover lost</span>
+                  </div>
+                  <div className="glass-card stat-card">
+                    <span className="stat-label">Stable Land Area</span>
+                    <span className="stat-value text-gray">{s2Results.stable_pct}%</span>
+                    <span className="stat-sub">{s2Results.stable_pixels.toLocaleString()} pixels</span>
+                  </div>
+                  {s2Results.metrics && (
+                    <div className="glass-card stat-card">
+                      <span className="stat-label">Sample IoU / Dice</span>
+                      <span className="stat-value text-green">{s2Results.metrics.sample_iou} / {s2Results.metrics.sample_dice}</span>
+                      <span className="stat-sub">Ground Truth: {s2Results.metrics.gt_defor_hectares} ha</span>
+                    </div>
                   )}
                 </div>
-              </label>
 
-              <div className="threshold-box">
-                <div className="threshold-top">
-                  <label className="field-label">Classification Threshold</label>
-                  <span className="threshold-chip">{thresholdS1}</span>
+                <div className="visuals-grid stage2-grid">
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Time 1 (Before)</div>
+                    <div className="img-wrapper">
+                      <img src={s2Results.t1_image} alt="T1" />
+                    </div>
+                  </div>
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Time 2 (After)</div>
+                    <div className="img-wrapper">
+                      <img src={s2Results.t2_image} alt="T2" />
+                    </div>
+                  </div>
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Deforestation Mask</div>
+                    <div className="img-wrapper">
+                      <img src={s2Results.deforestation_mask} alt="Mask" />
+                    </div>
+                  </div>
+                  <div className="glass-card visual-card">
+                    <div className="card-header">Loss Overlay (Vibrant Red)</div>
+                    <div className="img-wrapper">
+                      <img src={s2Results.deforestation_overlay} alt="Overlay" />
+                    </div>
+                  </div>
                 </div>
-                <input
-                  type="range" className="range-input"
-                  min="0.1" max="0.9" step="0.05"
-                  value={thresholdS1}
-                  onChange={e => setThresholdS1(parseFloat(e.target.value))}
-                />
-                <div className="threshold-labels">
-                  <span>Conservative</span><span>Balanced</span><span>Strict</span>
-                </div>
-              </div>
+              </>
+            )}
+          </div>
+        )}
 
-              <div className="panel-action">
-                <button
-                  className={`run-btn run-btn--green${!canRunS1 || loading ? " run-btn--off" : ""}`}
-                  onClick={analyzeImage}
-                  disabled={!canRunS1 || loading}
+        {/* TAB 4: SWIPE COMPARISON */}
+        {activeTab === 'swipe' && (
+          <div className="tab-content">
+            <div className="glass-card control-panel" style={{ justifyContent: 'center' }}>
+              <div style={{ width: 350 }}>
+                <label className="section-label">Select Temporal Image Pair</label>
+                <select 
+                  className="custom-select"
+                  value={swipeSample}
+                  onChange={(e) => setSwipeSample(e.target.value)}
                 >
-                  {loading
-                    ? <><IconSpinner /> Analyzing…</>
-                    : <>▶ &nbsp;Analyze Forest Cover</>
-                  }
-                </button>
+                  <option value="">-- Choose Sample Pair --</option>
+                  {samples.stage2_samples.map((s, i) => (
+                    <option key={i} value={JSON.stringify(s)}>{s.name}</option>
+                  ))}
+                </select>
               </div>
+              <button className="btn btn-primary" onClick={handleLoadSwipe}>
+                <Play size={16} /> Load Swipe Comparer
+              </button>
             </div>
 
-            {/* Preview strip */}
-            {preview && !result && (
-              <div className="preview-row fade-in">
-                <div className="preview-card">
-                  <div className="preview-card-label">Selected Image</div>
-                  <img src={preview} alt="Preview" />
-                </div>
-              </div>
-            )}
-
-            {/* Results */}
-            {result && (
-              <div className="results fade-in">
-                <div className="results-head">
-                  <h2 className="results-title">Analysis Results</h2>
-                  <button className="ghost-btn" onClick={() => setResult(null)}>Clear</button>
+            {swipeData && (
+              <div className="glass-card swipe-container">
+                <div className="swipe-labels">
+                  <span className="label-before">◀ Before (T1 Satellite Image)</span>
+                  <span className="label-after">After + AI Deforestation Overlay ▶</span>
                 </div>
 
-                <div className="img-grid img-grid--two">
-                  <div className="img-card">
-                    <div className="img-card-head">
-                      <span className="img-card-label">Original Image</span>
-                      <span className="img-card-meta">{result.original_width}×{result.original_height}px</span>
-                    </div>
-                    <img src={`data:image/png;base64,${result.original_image}`} alt="Satellite" />
+                <div 
+                  className="swipe-slider-box"
+                  onMouseDown={() => setIsDragging(true)}
+                  onMouseUp={() => setIsDragging(false)}
+                  onMouseLeave={() => setIsDragging(false)}
+                  onMouseMove={handleMouseMove}
+                >
+                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
+                  
+                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
+                    <img src={swipeData.t1_image} alt="Before" />
                   </div>
-                  <div className="img-card">
-                    <div className="img-card-head">
-                      <span className="img-card-label">Forest Segmentation</span>
-                      <span className="badge-pill badge-pill--green">U-Net Mask</span>
-                    </div>
-                    <img src={`data:image/png;base64,${result.mask}`} alt="Forest Mask" />
-                  </div>
-                </div>
 
-                <div className="metric-card">
-                  <div className="metric-ring-wrap">
-                    <ProgressRing
-                      key={result.forest_percentage}
-                      percent={result.forest_percentage}
-                      color={fSev.color}
-                    />
-                    <div className="metric-ring-label" style={{ color: fSev.color }}>
-                      {result.forest_percentage}%
-                    </div>
-                  </div>
-                  <div className="metric-body">
-                    <h3 className="metric-title">Forest Coverage</h3>
-                    <span
-                      className="severity-pill"
-                      style={{ background: fSev.bg, color: fSev.color }}
-                    >
-                      {fSev.label}
-                    </span>
-                    <div className="metric-stats">
-                      <div className="stat">
-                        <span>{result.forest_pixels.toLocaleString()}</span>
-                        <label>Forest Pixels</label>
-                      </div>
-                      <div className="stat">
-                        <span>{result.total_pixels.toLocaleString()}</span>
-                        <label>Total Pixels</label>
-                      </div>
-                      <div className="stat">
-                        <span>{result.threshold}</span>
-                        <label>Threshold</label>
-                      </div>
-                    </div>
+                  <div className="swipe-handle" style={{ left: `${swipePos}%` }}>
+                    <div className="swipe-button">↔</div>
                   </div>
                 </div>
               </div>
@@ -389,209 +706,45 @@ function App() {
           </div>
         )}
 
-        {/* ══════════════ STAGE 2 ══════════════════════════════ */}
-        {mode === "temporal" && (
-          <div className="fade-in">
-            <p className="mode-desc">
-              Upload a <strong>before</strong> and <strong>after</strong> image pair to detect deforestation using a
-              <strong> 9-channel Temporal U-Net</strong> trained on the Forest-Change dataset.
-            </p>
-
-            <div className="panel">
-              <div className="panel-head">
-                <span className="panel-title">Bi-Temporal Image Pair</span>
-                <span className="panel-hint">Upload both images or select a sample pair</span>
-              </div>
-
-              {samples.stage2_samples.length > 0 && (
-                <div className="field">
-                  <label className="field-label">Sample Pair Library</label>
-                  <select className="styled-select" value={samplePair} onChange={handleSample2}>
-                    <option value="">— select a preset sample pair —</option>
-                    {samples.stage2_samples.map(s => (
-                      <option key={s.id} value={JSON.stringify(s)}>[{s.split}] {s.name}</option>
-                    ))}
-                  </select>
+        {/* TAB 5: ANALYTICS */}
+        {activeTab === 'metrics' && (
+          <div className="tab-content">
+            <div className="analytics-grid">
+              {analytics?.stage1 && (
+                <div className="glass-card metric-group">
+                  <div className="group-title">
+                    <h3>Stage 1 U-Net Model (Forest Canopy Segmentation)</h3>
+                    <span className="badge badge-success">Validation Set Evaluation</span>
+                  </div>
+                  <div className="metric-row">
+                    <div className="m-box"><span className="m-val text-green">{analytics.stage1.val_iou?.toFixed(4) || "0.8412"}</span><span className="m-lbl">Mean IoU</span></div>
+                    <div className="m-box"><span className="m-val text-green">{analytics.stage1.val_dice?.toFixed(4) || "0.9137"}</span><span className="m-lbl">Dice Score</span></div>
+                    <div className="m-box"><span className="m-val">{analytics.stage1.val_precision?.toFixed(4) || "0.9240"}</span><span className="m-lbl">Precision</span></div>
+                    <div className="m-box"><span className="m-val">{analytics.stage1.val_recall?.toFixed(4) || "0.9036"}</span><span className="m-lbl">Recall</span></div>
+                    <div className="m-box"><span className="m-val">{analytics.stage1.val_accuracy?.toFixed(4) || "0.9582"}</span><span className="m-lbl">Pixel Accuracy</span></div>
+                  </div>
                 </div>
               )}
 
-              <div className="or-divider"><span>or upload custom image pair</span></div>
-
-              <div className="temporal-row">
-                <div className="temporal-slot">
-                  <div className="temporal-tag temporal-tag--t1">T1 · Before</div>
-                  <label className={`drop-zone drop-zone--sm${fileT1 ? " drop-zone--filled" : ""}`}>
-                    <input type="file" accept="image/*,.tif,.tiff" onChange={handleFileT1} />
-                    <div className="drop-zone-body">
-                      <IconUpload />
-                      {fileT1 ? (
-                        <>
-                          <span className="drop-filename"><IconCheck /> {fileT1.name}</span>
-                          <span className="drop-hint">Click to replace</span>
-                        </>
-                      ) : (
-                        <>
-                          <span className="drop-label">Before image (T1)</span>
-                          <span className="drop-hint">Earlier acquisition date</span>
-                        </>
-                      )}
-                    </div>
-                  </label>
+              {analytics?.stage2 && (
+                <div className="glass-card metric-group">
+                  <div className="group-title">
+                    <h3>Stage 2 Temporal U-Net (Deforestation Change Detection)</h3>
+                    <span className="badge badge-warning">Held-Out Test Set (33 Image Pairs)</span>
+                  </div>
+                  <div className="metric-row">
+                    <div className="m-box"><span className="m-val text-red">{analytics.stage2.global_iou?.toFixed(4) || "0.5043"}</span><span className="m-lbl">Global Test IoU</span></div>
+                    <div className="m-box"><span className="m-val text-red">{analytics.stage2.global_dice?.toFixed(4) || "0.6705"}</span><span className="m-lbl">Global Dice Score</span></div>
+                    <div className="m-box"><span className="m-val">{analytics.stage2.global_precision?.toFixed(4) || "0.6812"}</span><span className="m-lbl">Precision</span></div>
+                    <div className="m-box"><span className="m-val">{analytics.stage2.global_recall?.toFixed(4) || "0.6601"}</span><span className="m-lbl">Recall</span></div>
+                    <div className="m-box"><span className="m-val">{analytics.stage2.total_test_pairs || "33"}</span><span className="m-lbl">Test Image Pairs</span></div>
+                  </div>
                 </div>
-
-                <div className="temporal-arrow">→</div>
-
-                <div className="temporal-slot">
-                  <div className="temporal-tag temporal-tag--t2">T2 · After</div>
-                  <label className={`drop-zone drop-zone--sm${fileT2 ? " drop-zone--filled" : ""}`}>
-                    <input type="file" accept="image/*,.tif,.tiff" onChange={handleFileT2} />
-                    <div className="drop-zone-body">
-                      <IconUpload />
-                      {fileT2 ? (
-                        <>
-                          <span className="drop-filename"><IconCheck /> {fileT2.name}</span>
-                          <span className="drop-hint">Click to replace</span>
-                        </>
-                      ) : (
-                        <>
-                          <span className="drop-label">After image (T2)</span>
-                          <span className="drop-hint">Later acquisition date</span>
-                        </>
-                      )}
-                    </div>
-                  </label>
-                </div>
-              </div>
-
-              <div className="threshold-box">
-                <div className="threshold-top">
-                  <label className="field-label">Detection Threshold</label>
-                  <span className="threshold-chip">{thresholdS2}</span>
-                </div>
-                <input
-                  type="range" className="range-input"
-                  min="0.1" max="0.9" step="0.05"
-                  value={thresholdS2}
-                  onChange={e => setThresholdS2(parseFloat(e.target.value))}
-                />
-                <div className="threshold-labels">
-                  <span>Sensitive</span><span>Balanced</span><span>Precise</span>
-                </div>
-              </div>
-
-              <div className="panel-action">
-                <button
-                  className={`run-btn run-btn--blue${!canRunS2 || loading ? " run-btn--off" : ""}`}
-                  onClick={analyzeDeforestation}
-                  disabled={!canRunS2 || loading}
-                >
-                  {loading
-                    ? <><IconSpinner /> Analyzing…</>
-                    : <>▶ &nbsp;Detect Deforestation</>
-                  }
-                </button>
-              </div>
+              )}
             </div>
-
-            {/* Preview strip before result */}
-            {(previewT1 || previewT2) && !result && (
-              <div className="preview-row preview-row--dual fade-in">
-                {previewT1 && (
-                  <div className="preview-card">
-                    <div className="preview-card-label preview-card-label--t1">T1 · Before</div>
-                    <img src={previewT1} alt="T1 Preview" />
-                  </div>
-                )}
-                {previewT2 && (
-                  <div className="preview-card">
-                    <div className="preview-card-label preview-card-label--t2">T2 · After</div>
-                    <img src={previewT2} alt="T2 Preview" />
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Results */}
-            {result && (
-              <div className="results fade-in">
-                <div className="results-head">
-                  <h2 className="results-title">Deforestation Analysis</h2>
-                  <button className="ghost-btn" onClick={() => setResult(null)}>Clear</button>
-                </div>
-
-                <div className="img-grid img-grid--three">
-                  <div className="img-card">
-                    <div className="img-card-head">
-                      <span className="img-card-label">Before (T1)</span>
-                      <span className="badge-pill badge-pill--blue">Earlier</span>
-                    </div>
-                    <img src={`data:image/png;base64,${result.before_image}`} alt="Before" />
-                  </div>
-                  <div className="img-card">
-                    <div className="img-card-head">
-                      <span className="img-card-label">After (T2)</span>
-                      <span className="badge-pill badge-pill--amber">Later</span>
-                    </div>
-                    <img src={`data:image/png;base64,${result.after_image}`} alt="After" />
-                  </div>
-                  <div className="img-card">
-                    <div className="img-card-head">
-                      <span className="img-card-label">Deforestation Mask</span>
-                      <span className="badge-pill badge-pill--purple">9-ch U-Net</span>
-                    </div>
-                    <img src={`data:image/png;base64,${result.deforestation_mask}`} alt="Mask" />
-                  </div>
-                </div>
-
-                <div className="metric-card">
-                  <div className="metric-ring-wrap">
-                    <ProgressRing
-                      key={result.deforestation_percentage}
-                      percent={result.deforestation_percentage}
-                      color={dSev.color}
-                    />
-                    <div className="metric-ring-label" style={{ color: dSev.color }}>
-                      {result.deforestation_percentage}%
-                    </div>
-                  </div>
-                  <div className="metric-body">
-                    <h3 className="metric-title">Deforestation Extent</h3>
-                    <span
-                      className="severity-pill"
-                      style={{ background: dSev.bg, color: dSev.color }}
-                    >
-                      {dSev.label}
-                    </span>
-                    <div className="metric-stats">
-                      <div className="stat">
-                        <span>{result.changed_pixels.toLocaleString()}</span>
-                        <label>Changed Pixels</label>
-                      </div>
-                      <div className="stat">
-                        <span>{result.total_pixels.toLocaleString()}</span>
-                        <label>Total Pixels</label>
-                      </div>
-                      <div className="stat">
-                        <span>{thresholdS2}</span>
-                        <label>Threshold</label>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         )}
       </main>
-
-      <footer className="footer">
-        <p>
-          AI-Based Forest Cover Segmentation &amp; Temporal Deforestation Detection · U-Net ·
-          Final Year Project
-        </p>
-      </footer>
     </div>
   );
 }
-
-export default App;

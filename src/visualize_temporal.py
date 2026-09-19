@@ -41,12 +41,18 @@ def main():
 
     # 1. Load Model
     checkpoint = torch.load(checkpoint_file, map_location=DEVICE, weights_only=True)
-    model = TemporalUNet(in_channels=6, out_channels=1, init_features=32).to(DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        nk = k.replace("cu1.", "conv_up1.").replace("cu2.", "conv_up2.").replace("cu3.", "conv_up3.").replace("cu4.", "conv_up4.")
+        new_state_dict[nk] = v
+
+    model = TemporalUNet(in_channels=9, out_channels=1, init_features=32).to(DEVICE)
+    model.load_state_dict(new_state_dict)
     model.eval()
 
     # 2. Dataloader
-    _, _, test_loader = get_temporal_dataloaders(batch_size=1)
+    _, _, test_loader = get_temporal_dataloaders(batch_size=1, diff_channels=True)
 
     out_dir = Path("outputs/temporal/visualizations")
     out_dir.mkdir(parents=True, exist_ok=True)

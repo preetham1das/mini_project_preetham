@@ -3,10 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Deforestation Detection System</title>
+    <title>EcoVision GIS - Satellite Deforestation Detection Platform</title>
+    
+    <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Leaflet.js CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+    
+    <!-- Custom GIS Platform CSS -->
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -14,21 +21,29 @@
         <!-- Sidebar Navigation -->
         <aside class="sidebar">
             <div class="brand">
-                <div class="brand-icon">🌲</div>
+                <div class="brand-icon">🌐</div>
                 <div class="brand-text">
-                    <h2>EcoVision AI</h2>
-                    <p>Satellite Analytics</p>
+                    <h2>EcoVision GIS</h2>
+                    <p>Satellite Geospatial Platform</p>
                 </div>
             </div>
 
             <nav class="nav-menu">
-                <button class="nav-item active" data-tab="stage1">
+                <button class="nav-item active" data-tab="gis-map">
+                    <span class="icon">🗺️</span>
+                    <span>Interactive GIS Map</span>
+                </button>
+                <button class="nav-item" data-tab="stage1">
                     <span class="icon">🍃</span>
                     <span>Stage 1: Forest Cover</span>
                 </button>
                 <button class="nav-item" data-tab="stage2">
                     <span class="icon">🛰️</span>
                     <span>Stage 2: Change Detection</span>
+                </button>
+                <button class="nav-item" data-tab="swipe">
+                    <span class="icon">🔍</span>
+                    <span>Temporal Swipe Viewer</span>
                 </button>
                 <button class="nav-item" data-tab="metrics">
                     <span class="icon">📊</span>
@@ -39,8 +54,8 @@
             <div class="system-status">
                 <div class="status-indicator online"></div>
                 <div class="status-info">
-                    <span class="status-title">PyTorch Engine</span>
-                    <span class="status-sub">U-Net & Temporal U-Net Active</span>
+                    <span class="status-title">PyTorch U-Net Engine</span>
+                    <span class="status-sub">GIS Ground Resolution: 10m/px</span>
                 </div>
             </div>
         </aside>
@@ -50,13 +65,88 @@
             <!-- Header Bar -->
             <header class="top-header">
                 <div class="header-title">
-                    <h1 id="page-title">Stage 1: Binary Forest Cover Segmentation</h1>
-                    <p id="page-desc">Extracting pixel-level forest canopy coverage from satellite imagery using Deep U-Net architecture.</p>
+                    <h1 id="page-title">Interactive GIS Satellite Map Viewer</h1>
+                    <p id="page-desc">Geospatial analysis of Amazon basin canopy cover and deforestation detection using Leaflet.js and PyTorch.</p>
                 </div>
             </header>
 
+            <!-- Tab 0: Interactive GIS Map -->
+            <section id="tab-gis-map" class="tab-content active">
+                <div class="gis-layout">
+                    <!-- Left Control Panel -->
+                    <div class="gis-sidebar glass-card">
+                        <h3 class="panel-heading">Map & Layer Controls</h3>
+                        
+                        <div class="panel-section">
+                            <label class="section-label">Target Dataset Split / Region</label>
+                            <select id="gis-sample-select" class="custom-select">
+                                <option value="">-- Choose Sample Satellite Tile --</option>
+                            </select>
+                        </div>
+
+                        <div class="panel-section">
+                            <label class="section-label">Analysis Stage</label>
+                            <div class="toggle-group">
+                                <button id="gis-mode-stage1" class="btn btn-toggle active">Stage 1: Forest</button>
+                                <button id="gis-mode-stage2" class="btn btn-toggle">Stage 2: Deforestation</button>
+                            </div>
+                        </div>
+
+                        <div class="panel-section threshold-box">
+                            <div class="slider-header">
+                                <label for="gis-threshold">Model Threshold</label>
+                                <span id="gis-threshold-val">0.50</span>
+                            </div>
+                            <input type="range" id="gis-threshold" min="0.10" max="0.90" step="0.05" value="0.50">
+                        </div>
+
+                        <div class="panel-section">
+                            <div class="slider-header">
+                                <label for="gis-opacity">Overlay Map Opacity</label>
+                                <span id="gis-opacity-val">70%</span>
+                            </div>
+                            <input type="range" id="gis-opacity" min="0.10" max="1.0" step="0.05" value="0.70">
+                        </div>
+
+                        <div class="panel-section btn-container">
+                            <button id="gis-run-btn" class="btn btn-primary full-width">
+                                <span>🚀 Run Spatial Analysis</span>
+                            </button>
+                        </div>
+
+                        <!-- Real-time GIS Metrics -->
+                        <div class="gis-metrics-box" id="gis-metrics-card" style="display: none;">
+                            <div class="m-card-title">Geospatial Area Summary</div>
+                            <div class="gis-stat-row">
+                                <span>Total Area:</span>
+                                <strong id="gis-total-ha">655.36 ha</strong>
+                            </div>
+                            <div class="gis-stat-row">
+                                <span id="gis-stat-name">Forest Canopy:</span>
+                                <strong class="text-green" id="gis-stat-val">0 ha (0%)</strong>
+                            </div>
+                            <div class="gis-stat-row">
+                                <span>Spatial Bounds:</span>
+                                <small id="gis-bounds-txt">-3.465, -62.215</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Map Viewport Container -->
+                    <div class="map-container glass-card">
+                        <div id="leaflet-map"></div>
+                        <!-- Custom Map Legend Overlay -->
+                        <div class="map-legend-overlay">
+                            <div class="legend-title">Map Layers</div>
+                            <div class="legend-item"><span class="legend-color legend-green"></span> Forest Canopy (Stage 1)</div>
+                            <div class="legend-item"><span class="legend-color legend-red"></span> Deforestation Loss (Stage 2)</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <!-- Tab 1: Stage 1 Forest Cover -->
-            <section id="tab-stage1" class="tab-content active">
+            <section id="tab-stage1" class="tab-content">
                 <div class="control-panel glass-card">
                     <div class="panel-section">
                         <label class="section-label">Select Sample Satellite Image</label>
@@ -92,19 +182,19 @@
                 <!-- Stats Summary Cards -->
                 <div class="stats-grid" id="stage1-stats" style="display: none;">
                     <div class="stat-card glass-card">
-                        <span class="stat-label">Forest Canopy Cover</span>
-                        <span class="stat-value text-green" id="s1-stat-pct">0%</span>
-                        <span class="stat-sub" id="s1-stat-px">0 pixels</span>
+                        <span class="stat-label">Forest Canopy Area</span>
+                        <span class="stat-value text-green" id="s1-stat-ha">0 ha</span>
+                        <span class="stat-sub" id="s1-stat-pct">0% (0 pixels)</span>
                     </div>
                     <div class="stat-card glass-card">
-                        <span class="stat-label">Non-Forest / Background</span>
+                        <span class="stat-label">Non-Forest Land</span>
                         <span class="stat-value text-gray" id="s1-stat-nonpct">0%</span>
                         <span class="stat-sub" id="s1-stat-nonpx">0 pixels</span>
                     </div>
                     <div class="stat-card glass-card">
-                        <span class="stat-label">Total Resolving Pixels</span>
-                        <span class="stat-value" id="s1-stat-total">65,536</span>
-                        <span class="stat-sub">256 × 256 Resolution</span>
+                        <span class="stat-label">Physical Tile Area</span>
+                        <span class="stat-value" id="s1-stat-total-ha">655.36 ha</span>
+                        <span class="stat-sub">2.56 km × 2.56 km (6.55 km²)</span>
                     </div>
                 </div>
 
@@ -160,8 +250,8 @@
                 <div class="stats-grid" id="stage2-stats" style="display: none;">
                     <div class="stat-card glass-card">
                         <span class="stat-label">Deforestation (Forest Loss)</span>
-                        <span class="stat-value text-red" id="s2-stat-defor-pct">0%</span>
-                        <span class="stat-sub" id="s2-stat-defor-px">0 pixels</span>
+                        <span class="stat-value text-red" id="s2-stat-defor-ha">0 ha</span>
+                        <span class="stat-sub" id="s2-stat-defor-pct">0% (0 pixels)</span>
                     </div>
                     <div class="stat-card glass-card">
                         <span class="stat-label">Stable Area</span>
@@ -171,20 +261,20 @@
                     <div class="stat-card glass-card" id="s2-card-gt" style="display: none;">
                         <span class="stat-label">Sample IoU / Dice Score</span>
                         <span class="stat-value text-accent" id="s2-stat-metrics">0.00 / 0.00</span>
-                        <span class="stat-sub">Ground Truth Verification</span>
+                        <span class="stat-sub" id="s2-stat-gt-ha">Ground Truth Deforestation</span>
                     </div>
                 </div>
 
                 <!-- Visual Output Grid Stage 2 -->
                 <div class="visuals-grid stage2-grid" id="stage2-visuals" style="display: none;">
                     <div class="visual-card glass-card">
-                        <div class="card-header">Time 1 ($T1$ - Before)</div>
+                        <div class="card-header">Time 1 (T1 - Before)</div>
                         <div class="img-wrapper">
                             <img id="s2-img-t1" src="" alt="T1 Satellite Image">
                         </div>
                     </div>
                     <div class="visual-card glass-card">
-                        <div class="card-header">Time 2 ($T2$ - After)</div>
+                        <div class="card-header">Time 2 (T2 - After)</div>
                         <div class="img-wrapper">
                             <img id="s2-img-t2" src="" alt="T2 Satellite Image">
                         </div>
@@ -196,7 +286,7 @@
                         </div>
                     </div>
                     <div class="visual-card glass-card">
-                        <div class="card-header">Deforestation Red Overlay ($T2$)</div>
+                        <div class="card-header">Deforestation Red Overlay (T2)</div>
                         <div class="img-wrapper">
                             <img id="s2-img-overlay" src="" alt="Deforestation Overlay">
                         </div>
@@ -204,7 +294,41 @@
                 </div>
             </section>
 
-            <!-- Tab 3: Model Analytics -->
+            <!-- Tab 3: Swipe / Split Screen Temporal Comparer -->
+            <section id="tab-swipe" class="tab-content">
+                <div class="control-panel glass-card">
+                    <div class="panel-section">
+                        <label class="section-label">Select Temporal Pair for Interactive Swipe</label>
+                        <select id="swipe-sample-select" class="custom-select">
+                            <option value="">-- Choose Temporal Pair --</option>
+                        </select>
+                    </div>
+                    <div class="panel-section btn-container">
+                        <button id="swipe-load-btn" class="btn btn-primary">
+                            <span>🔍 Load Swipe Comparer</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="swipe-container glass-card" id="swipe-wrapper" style="display: none;">
+                    <div class="swipe-slider-box" id="swipe-box">
+                        <img id="swipe-img-after" class="swipe-img after-img" src="" alt="T2 After Image with Overlay">
+                        <div class="swipe-img-before-wrapper" id="swipe-before-wrapper">
+                            <img id="swipe-img-before" class="swipe-img before-img" src="" alt="T1 Before Image">
+                        </div>
+                        <div class="swipe-handle" id="swipe-handle">
+                            <div class="swipe-line"></div>
+                            <div class="swipe-button">⇹</div>
+                        </div>
+                    </div>
+                    <div class="swipe-labels">
+                        <span class="label-before">◀ Time 1 (Before)</span>
+                        <span class="label-after">Time 2 (After + Deforestation Overlay) ▶</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab 4: Model Analytics -->
             <section id="tab-metrics" class="tab-content">
                 <div class="analytics-grid">
                     <div class="metric-group glass-card">
@@ -272,9 +396,11 @@
     <!-- Loading Overlay -->
     <div id="loading-overlay" class="loading-overlay" style="display: none;">
         <div class="spinner"></div>
-        <p>Running Neural Network Inference...</p>
+        <p>Processing Neural Network & GIS Spatial Layers...</p>
     </div>
 
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>

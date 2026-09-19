@@ -2,12 +2,12 @@ STAGE 2: TEMPORAL DEFORESTATION DETECTION TEST REPORT
 ===================================================
 Evaluated on 33 Test Pairs
 
-Global IoU: 0.2983
-Global Dice (F1): 0.4595
-Global Precision: 0.4131
-Global Recall: 0.5176
-Global Pixel Accuracy: 0.9430
+Global IoU: 0.3828
+Global Dice (F1): 0.5536
+Global Precision: 0.6412
+Global Recall: 0.4871
+Global Pixel Accuracy: 0.9632
 
-Total Predicted Deforestation: 126,876.0 px (5.87%)
+Total Predicted Deforestation: 76,932.0 px (3.56%)
 Total Ground Truth Deforestation: 101,274.0 px (4.68%)
-Confusion Counts -> TP: 52416, FP: 74460, FN: 48858, TN: 1986954
+Confusion Counts -> TP: 49330, FP: 27602, FN: 51944, TN: 2033812

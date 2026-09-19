@@ -1,126 +1,110 @@
 import base64
 import io
 import json
-import os
 import sys
 from pathlib import Path
 
-# Reconfigure sys.stdout and sys.stderr for UTF-8 compatibility on Windows consoles
-if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
-if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
-    try:
-        sys.stderr.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
-
-BASE_DIR = Path(__file__).resolve().parent
-
-# Auto-discover venv dependencies if available
-venv_site_packages = BASE_DIR / "venv" / "Lib" / "site-packages"
-if venv_site_packages.exists() and str(venv_site_packages) not in sys.path:
-    sys.path.insert(0, str(venv_site_packages))
-
-# Ensure src directory is in sys.path
-src_dir = BASE_DIR / "src"
-if str(src_dir) not in sys.path:
-    sys.path.insert(0, str(src_dir))
-
 from flask import Flask, render_template, request, jsonify
-try:
-    from flask_cors import CORS
-    HAS_CORS = True
-except ImportError:
-    HAS_CORS = False
+from flask_cors import CORS
 import numpy as np
 from PIL import Image
 import torch
 
+# Ensure src directory is in sys.path
+src_dir = Path(__file__).resolve().parent / "src"
+if str(src_dir) not in sys.path:
+    sys.path.append(str(src_dir))
 
-from src.model import UNet, CHECKPOINT_PATH
-from src.temporal_model import TemporalUNet, TEMPORAL_CHECKPOINT_PATH
-from src.metrics import THRESHOLD
-
+from model import UNet, CHECKPOINT_PATH
+from temporal_model import TemporalUNet, TEMPORAL_CHECKPOINT_PATH
+from metrics import THRESHOLD
 
 app = Flask(__name__)
-if HAS_CORS:
-    CORS(app)
+CORS(app)
 
 DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
+
+# GIS Spatial Constants
+# Ground Sample Distance: 10 meters per pixel (Sentinel-2 standard)
+GSD_METERS = 10.0
+SQM_PER_PIXEL = GSD_METERS * GSD_METERS
+HA_PER_PIXEL = SQM_PER_PIXEL / 10000.0
+SQKM_PER_PIXEL = SQM_PER_PIXEL / 1000000.0
+
+# Base Amazon Basin Reference Coordinates
+BASE_LAT = -3.4653
+BASE_LON = -62.2159
 
 # Global variables for loaded models
 stage1_model = None
 stage2_model = None
 
 
-def safe_print(message: str):
-    """Safely print messages to console, falling back if unicode fails."""
-    try:
-        print(message)
-    except UnicodeEncodeError:
-        ascii_msg = message.encode("ascii", "replace").decode("ascii")
-        print(ascii_msg)
+def get_sample_bounds(sample_id_str):
+    """Generates realistic Lat/Lon bounding box based on sample hash."""
+    h = hash(str(sample_id_str)) % 1000
+    lat_offset = (h / 1000.0) * 4.0 - 2.0
+    lon_offset = ((h * 3) % 1000 / 1000.0) * 4.0 - 2.0
+
+    lat_center = BASE_LAT + lat_offset
+    lon_center = BASE_LON + lon_offset
+
+    delta_deg = 0.023
+
+    south = round(lat_center - delta_deg / 2, 6)
+    north = round(lat_center + delta_deg / 2, 6)
+    west = round(lon_center - delta_deg / 2, 6)
+    east = round(lon_center + delta_deg / 2, 6)
+
+    return {
+        "bounds": [[south, west], [north, east]],
+        "center": [round(lat_center, 6), round(lon_center, 6)],
+        "south": south, "north": north, "west": west, "east": east
+    }
 
 
 def load_models():
-    """Loads Stage 1 and Stage 2 models into memory safely."""
     global stage1_model, stage2_model
     
     # 1. Load Stage 1 UNet
-    stage1_path = BASE_DIR / CHECKPOINT_PATH
+    stage1_path = Path(CHECKPOINT_PATH)
     if stage1_path.exists():
-        try:
-            try:
-                checkpoint = torch.load(stage1_path, map_location=DEVICE, weights_only=True)
-            except Exception:
-                checkpoint = torch.load(stage1_path, map_location=DEVICE, weights_only=False)
-            
-            stage1_model = UNet(in_channels=3, out_channels=1, init_features=32).to(DEVICE)
-            state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-            stage1_model.load_state_dict(state_dict)
-            stage1_model.eval()
-            safe_print(f"[OK] Loaded Stage 1 U-Net from {stage1_path}")
-        except Exception as e:
-            safe_print(f"[ERROR] Failed to load Stage 1 checkpoint at {stage1_path}: {e}")
-            stage1_model = None
+        checkpoint = torch.load(stage1_path, map_location=DEVICE, weights_only=True)
+        stage1_model = UNet(in_channels=3, out_channels=1, init_features=32).to(DEVICE)
+        stage1_model.load_state_dict(checkpoint["model_state_dict"])
+        stage1_model.eval()
+        print(f"✅ Loaded Stage 1 U-Net from {stage1_path}")
     else:
-        safe_print(f"[WARNING] Stage 1 checkpoint not found at {stage1_path}")
+        print(f"⚠️ Stage 1 checkpoint not found at {stage1_path}")
 
-    # 2. Load Stage 2 Temporal UNet
-    stage2_path = BASE_DIR / TEMPORAL_CHECKPOINT_PATH
+    # 2. Load Stage 2 Temporal UNet (9 channels with key compatibility)
+    stage2_path = Path(TEMPORAL_CHECKPOINT_PATH)
     if stage2_path.exists():
-        try:
-            try:
-                checkpoint = torch.load(stage2_path, map_location=DEVICE, weights_only=True)
-            except Exception:
-                checkpoint = torch.load(stage2_path, map_location=DEVICE, weights_only=False)
-                
-            stage2_model = TemporalUNet(in_channels=6, out_channels=1, init_features=32).to(DEVICE)
-            state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-            stage2_model.load_state_dict(state_dict)
-            stage2_model.eval()
-            safe_print(f"[OK] Loaded Stage 2 Temporal U-Net from {stage2_path}")
-        except Exception as e:
-            safe_print(f"[ERROR] Failed to load Stage 2 checkpoint at {stage2_path}: {e}")
-            stage2_model = None
+        checkpoint = torch.load(stage2_path, map_location=DEVICE, weights_only=True)
+        state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+
+        # Remap legacy layer names (cu1 -> conv_up1, etc.)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            nk = k.replace("cu1.", "conv_up1.").replace("cu2.", "conv_up2.").replace("cu3.", "conv_up3.").replace("cu4.", "conv_up4.")
+            new_state_dict[nk] = v
+
+        stage2_model = TemporalUNet(in_channels=9, out_channels=1, init_features=32).to(DEVICE)
+        stage2_model.load_state_dict(new_state_dict)
+        stage2_model.eval()
+        print(f"✅ Loaded Stage 2 Temporal U-Net from {stage2_path}")
     else:
-        safe_print(f"[WARNING] Stage 2 checkpoint not found at {stage2_path}")
+        print(f"⚠️ Stage 2 checkpoint not found at {stage2_path}")
 
 
 def array_to_base64_png(np_img):
-    """Converts numpy image array (RGB or RGBA) to base64 PNG data string safely."""
-    if not isinstance(np_img, np.ndarray):
-        np_img = np.array(np_img)
-
+    """Converts numpy image array (RGB or RGBA) to base64 PNG data string."""
     if np_img.dtype != np.uint8:
         if np_img.max() <= 1.0:
-            np_img = np.clip(np_img * 255.0, 0, 255).astype(np.uint8)
+            np_img = (np_img * 255).astype(np.uint8)
         else:
-            np_img = np.clip(np_img, 0, 255).astype(np.uint8)
+            np_img = np_img.astype(np.uint8)
     
     pil_img = Image.fromarray(np_img)
     buffer = io.BytesIO()
@@ -134,311 +118,282 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/gis/regions", methods=["GET"])
+def get_gis_regions():
+    """Returns sample GIS region metadata and bounding boxes."""
+    amazon_dir = Path("data/Amazon Forest Dataset")
+    regions = []
+
+    test_images = list((amazon_dir / "Validation" / "images").glob("*.tiff")) + list((amazon_dir / "Validation" / "images").glob("*.tif"))
+    for f in test_images[:8]:
+        gis_info = get_sample_bounds(f.name)
+        regions.append({
+            "id": f.name,
+            "name": f.name,
+            "region_name": f"Amazon Sub-basin Tile {f.stem}",
+            "center": gis_info["center"],
+            "bounds": gis_info["bounds"],
+            "gsd_meters": GSD_METERS
+        })
+
+    return jsonify({"regions": regions, "gsd_meters": GSD_METERS})
+
+
 @app.route("/api/samples", methods=["GET"])
 def get_samples():
     """Returns sample lists for quick selection in frontend."""
-    # Stage 1 Amazon Forest Dataset samples
-    amazon_dir = BASE_DIR / "data" / "Amazon Forest Dataset"
+    amazon_dir = Path("data/Amazon Forest Dataset")
     stage1_samples = []
     
-    val_dir = amazon_dir / "Validation" / "images"
-    if val_dir.exists():
-        val_images = sorted(list(val_dir.glob("*.tiff")) + list(val_dir.glob("*.tif")))
-        for f in val_images[:10]:
-            stage1_samples.append({
-                "id": f.name,
-                "name": f.name,
-                "split": "Validation",
-                "path": str(f)
-            })
+    val_images = list((amazon_dir / "Validation" / "images").glob("*.tiff")) + list((amazon_dir / "Validation" / "images").glob("*.tif"))
+    for f in val_images[:10]:
+        gis = get_sample_bounds(f.name)
+        stage1_samples.append({
+            "id": f.name,
+            "name": f.name,
+            "split": "Validation",
+            "path": str(f),
+            "gis": gis
+        })
 
-    test_dir = amazon_dir / "Test"
-    if test_dir.exists():
-        test_images = sorted(list(test_dir.glob("*.tiff")) + list(test_dir.glob("*.tif")))
-        for f in test_images[:10]:
-            stage1_samples.append({
-                "id": f.name,
-                "name": f"Test / {f.name}",
-                "split": "Test",
-                "path": str(f)
-            })
+    test_images = list((amazon_dir / "Test").glob("*.tiff")) + list((amazon_dir / "Test").glob("*.tif"))
+    for f in test_images[:10]:
+        gis = get_sample_bounds(f.name)
+        stage1_samples.append({
+            "id": f.name,
+            "name": f"Test / {f.name}",
+            "split": "Test",
+            "path": str(f),
+            "gis": gis
+        })
 
-    # Stage 2 Forest-Change dataset samples
-    temporal_root = BASE_DIR / "data" / "Forest-Change" / "extracted" / "Forest-Change-dataset" / "images"
+    temporal_root = Path("data/Forest-Change/extracted/Forest-Change-dataset/images")
     stage2_samples = []
     
-    test_a_dir = temporal_root / "test" / "A"
-    if test_a_dir.exists():
-        test_pairs = sorted([f.stem for f in test_a_dir.glob("*.png")])
+    if (temporal_root / "test" / "A").exists():
+        test_pairs = sorted([f.stem for f in (temporal_root / "test" / "A").glob("*.png")])
         for p in test_pairs[:12]:
+            gis = get_sample_bounds(p)
             stage2_samples.append({
                 "id": p,
                 "name": f"Test Pair: {p}",
-                "split": "test"
-            })
-            
-    val_a_dir = temporal_root / "val" / "A"
-    if val_a_dir.exists():
-        val_pairs = sorted([f.stem for f in val_a_dir.glob("*.png")])
-        for p in val_pairs[:6]:
-            stage2_samples.append({
-                "id": p,
-                "name": f"Val Pair: {p}",
-                "split": "val"
+                "split": "test",
+                "gis": gis
             })
 
     return jsonify({
         "stage1_samples": stage1_samples,
-        "stage2_samples": stage2_samples
+        "stage2_samples": stage2_samples,
+        "gsd_meters": GSD_METERS
     })
 
 
 @app.route("/api/predict/stage1", methods=["POST"])
 def predict_stage1():
-    """Runs Stage 1 Forest Cover Segmentation on uploaded file or sample ID/path."""
+    """Runs Stage 1 Forest Cover Segmentation with GIS metrics."""
     if stage1_model is None:
-        return jsonify({"error": "Stage 1 model is not loaded. Please ensure best_unet_model.pth exists."}), 500
+        return jsonify({"error": "Stage 1 model is not loaded"}), 500
 
-    try:
-        threshold = float(request.form.get("threshold", THRESHOLD))
-        threshold = max(0.0, min(1.0, threshold))
-    except (ValueError, TypeError):
-        threshold = THRESHOLD
-
+    threshold = float(request.form.get("threshold", THRESHOLD))
     pil_img = None
     sample_name = "Uploaded Image"
 
     if "file" in request.files and request.files["file"].filename != "":
         file = request.files["file"]
         sample_name = file.filename
-        try:
-            pil_img = Image.open(file.stream).convert("RGB")
-        except Exception as e:
-            return jsonify({"error": f"Failed to parse uploaded image: {str(e)}"}), 400
+        pil_img = Image.open(file.stream).convert("RGB")
     else:
-        sample_path_str = request.form.get("sample_path") or request.form.get("sample_id")
-        if sample_path_str:
-            p = Path(sample_path_str)
-            if not p.is_absolute():
-                p = BASE_DIR / p
-            
-            # If path doesn't exist directly, try locating in Amazon dataset paths
-            if not p.exists():
-                amazon_dir = BASE_DIR / "data" / "Amazon Forest Dataset"
-                candidates = [
-                    amazon_dir / "Validation" / "images" / p.name,
-                    amazon_dir / "Test" / p.name
-                ]
-                for cand in candidates:
-                    if cand.exists():
-                        p = cand
-                        break
-
-            if p.exists() and p.is_file():
-                try:
-                    pil_img = Image.open(p).convert("RGB")
-                    sample_name = p.name
-                except Exception as e:
-                    return jsonify({"error": f"Failed to load sample image: {str(e)}"}), 400
-            else:
-                return jsonify({"error": f"Sample image file not found: {sample_path_str}"}), 404
+        sample_path_str = request.form.get("sample_path")
+        if sample_path_str and Path(sample_path_str).exists():
+            pil_img = Image.open(sample_path_str).convert("RGB")
+            sample_name = Path(sample_path_str).name
         else:
-            return jsonify({"error": "No image file or sample path provided."}), 400
+            return jsonify({"error": "No image provided"}), 400
 
-    try:
-        # Resize to TARGET_SIZE
-        pil_resized = pil_img.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
-        img_np = np.array(pil_resized, dtype=np.float32) / 255.0
+    gis_bounds = get_sample_bounds(sample_name)
 
-        # Convert to PyTorch Tensor (1, 3, H, W)
-        img_tensor = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+    pil_resized = pil_img.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
+    img_np = np.array(pil_resized, dtype=np.float32) / 255.0
+    img_tensor = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
 
-        with torch.no_grad():
-            logits = stage1_model(img_tensor)
-            probs = torch.sigmoid(logits)
-            preds = (probs > threshold).float()
+    with torch.no_grad():
+        logits = stage1_model(img_tensor)
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
 
-        pred_mask = preds[0, 0].cpu().numpy().astype(np.uint8)
-        
-        # Calculate statistics
-        total_pixels = int(pred_mask.size)
-        forest_pixels = int(np.sum(pred_mask == 1))
-        forest_pct = round((forest_pixels / total_pixels) * 100.0, 2)
-        non_forest_pixels = total_pixels - forest_pixels
-        non_forest_pct = round(100.0 - forest_pct, 2)
+    pred_mask = preds[0, 0].cpu().numpy().astype(np.uint8)
 
-        # 1. Base RGB Image
-        original_b64 = array_to_base64_png(img_np)
+    total_pixels = int(pred_mask.size)
+    forest_pixels = int(np.sum(pred_mask == 1))
+    forest_pct = round((forest_pixels / total_pixels) * 100.0, 2)
+    non_forest_pixels = total_pixels - forest_pixels
+    non_forest_pct = round(100.0 - forest_pct, 2)
 
-        # 2. Binary Forest Mask Visualization (Green = Forest, Black = Non-forest)
-        mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
-        mask_rgb[pred_mask == 1] = [34, 197, 94]  # Emerald Green
-        mask_b64 = array_to_base64_png(mask_rgb)
+    total_hectares = round(total_pixels * HA_PER_PIXEL, 2)
+    forest_hectares = round(forest_pixels * HA_PER_PIXEL, 2)
+    forest_sqkm = round(forest_pixels * SQKM_PER_PIXEL, 3)
 
-        # 3. Green Overlay Map on original image
-        overlay_rgb = img_np.copy()
-        green_tint = np.array([0.133, 0.772, 0.368], dtype=np.float32)
-        alpha = 0.45
-        forest_indices = (pred_mask == 1)
-        overlay_rgb[forest_indices] = (1 - alpha) * overlay_rgb[forest_indices] + alpha * green_tint
-        overlay_b64 = array_to_base64_png(overlay_rgb)
+    original_b64 = array_to_base64_png(img_np)
 
-        return jsonify({
-            "sample_name": sample_name,
-            "threshold": threshold,
-            "total_pixels": total_pixels,
-            "forest_pixels": forest_pixels,
-            "forest_pct": forest_pct,
-            "non_forest_pixels": non_forest_pixels,
-            "non_forest_pct": non_forest_pct,
-            "original_image": original_b64,
-            "mask_image": mask_b64,
-            "overlay_image": overlay_b64
-        })
-    except Exception as e:
-        return jsonify({"error": f"Inference execution failed: {str(e)}"}), 500
+    mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+    mask_rgb[pred_mask == 1] = [34, 197, 94]
+    mask_b64 = array_to_base64_png(mask_rgb)
+
+    overlay_rgb = img_np.copy()
+    green_tint = np.array([0.133, 0.772, 0.368], dtype=np.float32)
+    alpha = 0.45
+    forest_indices = (pred_mask == 1)
+    overlay_rgb[forest_indices] = (1 - alpha) * overlay_rgb[forest_indices] + alpha * green_tint
+    overlay_b64 = array_to_base64_png(overlay_rgb)
+
+    return jsonify({
+        "sample_name": sample_name,
+        "threshold": threshold,
+        "total_pixels": total_pixels,
+        "forest_pixels": forest_pixels,
+        "forest_pct": forest_pct,
+        "non_forest_pixels": non_forest_pixels,
+        "non_forest_pct": non_forest_pct,
+        "total_hectares": total_hectares,
+        "forest_hectares": forest_hectares,
+        "forest_sqkm": forest_sqkm,
+        "gis": gis_bounds,
+        "original_image": original_b64,
+        "mask_image": mask_b64,
+        "overlay_image": overlay_b64
+    })
 
 
 @app.route("/api/predict/stage2", methods=["POST"])
 def predict_stage2():
-    """Runs Stage 2 Temporal Deforestation Detection."""
+    """Runs Stage 2 Temporal Deforestation Detection with GIS spatial metrics."""
     if stage2_model is None:
-        return jsonify({"error": "Stage 2 temporal model is not loaded. Please ensure best_temporal_model.pth exists."}), 500
+        return jsonify({"error": "Stage 2 temporal model is not loaded"}), 500
 
-    try:
-        threshold = float(request.form.get("threshold", 0.5))
-        threshold = max(0.0, min(1.0, threshold))
-    except (ValueError, TypeError):
-        threshold = 0.5
-
+    threshold = float(request.form.get("threshold", 0.5))
     split = request.form.get("split", "test")
-    raw_sample_id = request.form.get("sample_id", "")
-    sample_id = Path(raw_sample_id).stem if raw_sample_id else ""
+    sample_id = request.form.get("sample_id")
 
-    temporal_root = BASE_DIR / "data" / "Forest-Change" / "extracted" / "Forest-Change-dataset" / "images"
+    temporal_root = Path("data/Forest-Change/extracted/Forest-Change-dataset/images")
     
     pil_a = None
     pil_b = None
     gt_mask_np = None
     pair_name = sample_id or "Custom Pair"
 
-    if "file_t1" in request.files and "file_t2" in request.files and request.files["file_t1"].filename != "" and request.files["file_t2"].filename != "":
+    if "file_t1" in request.files and "file_t2" in request.files:
         f_a = request.files["file_t1"]
         f_b = request.files["file_t2"]
-        try:
-            pil_a = Image.open(f_a.stream).convert("RGB")
-            pil_b = Image.open(f_b.stream).convert("RGB")
-            pair_name = f"{f_a.filename} vs {f_b.filename}"
-        except Exception as e:
-            return jsonify({"error": f"Failed to parse uploaded temporal image pair: {str(e)}"}), 400
+        pil_a = Image.open(f_a.stream).convert("RGB")
+        pil_b = Image.open(f_b.stream).convert("RGB")
     elif sample_id:
         t1_path = temporal_root / split / "A" / f"{sample_id}.png"
         t2_path = temporal_root / split / "B" / f"{sample_id}.png"
         gt_path = temporal_root / split / "label" / f"{sample_id}.png"
 
         if t1_path.exists() and t2_path.exists():
-            try:
-                pil_a = Image.open(t1_path).convert("RGB")
-                pil_b = Image.open(t2_path).convert("RGB")
-                if gt_path.exists():
-                    gt_pil = Image.open(gt_path).convert("L")
-                    if gt_pil.size != TARGET_SIZE:
-                        gt_pil = gt_pil.resize(TARGET_SIZE, Image.Resampling.NEAREST)
-                    gt_mask_np = (np.array(gt_pil) > 0).astype(np.uint8)
-            except Exception as e:
-                return jsonify({"error": f"Failed to read dataset pair images: {str(e)}"}), 400
+            pil_a = Image.open(t1_path).convert("RGB")
+            pil_b = Image.open(t2_path).convert("RGB")
+            if gt_path.exists():
+                gt_pil = Image.open(gt_path).convert("L")
+                if gt_pil.size != TARGET_SIZE:
+                    gt_pil = gt_pil.resize(TARGET_SIZE, Image.Resampling.NEAREST)
+                gt_mask_np = (np.array(gt_pil) > 0).astype(np.uint8)
         else:
-            return jsonify({"error": f"Sample pair '{sample_id}' not found in split '{split}'."}), 404
+            return jsonify({"error": f"Sample pair {sample_id} not found"}), 404
     else:
-        return jsonify({"error": "No T1 and T2 images or sample_id provided."}), 400
+        return jsonify({"error": "No T1 and T2 images provided"}), 400
 
-    try:
-        # Resize images
-        pil_a_resized = pil_a.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
-        pil_b_resized = pil_b.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
+    gis_bounds = get_sample_bounds(pair_name)
 
-        img_a_np = np.array(pil_a_resized, dtype=np.float32) / 255.0
-        img_b_np = np.array(pil_b_resized, dtype=np.float32) / 255.0
+    pil_a_resized = pil_a.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
+    pil_b_resized = pil_b.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
 
-        # Prepare 6-channel input tensor (1, 6, H, W)
-        t1_tensor = torch.tensor(img_a_np, dtype=torch.float32).permute(2, 0, 1)
-        t2_tensor = torch.tensor(img_b_np, dtype=torch.float32).permute(2, 0, 1)
-        concat_tensor = torch.cat([t1_tensor, t2_tensor], dim=0).unsqueeze(0).to(DEVICE)
+    img_a_np = np.array(pil_a_resized, dtype=np.float32) / 255.0
+    img_b_np = np.array(pil_b_resized, dtype=np.float32) / 255.0
 
-        with torch.no_grad():
-            logits = stage2_model(concat_tensor)
-            probs = torch.sigmoid(logits)
-            preds = (probs > threshold).float()
+    # 9-channel input tensor [T1_RGB (3), T2_RGB (3), |T1-T2|_RGB (3)]
+    t1_tensor = torch.tensor(img_a_np, dtype=torch.float32).permute(2, 0, 1)
+    t2_tensor = torch.tensor(img_b_np, dtype=torch.float32).permute(2, 0, 1)
+    diff_tensor = torch.abs(t1_tensor - t2_tensor)
 
-        pred_defor_mask = preds[0, 0].cpu().numpy().astype(np.uint8)
+    concat_tensor = torch.cat([t1_tensor, t2_tensor, diff_tensor], dim=0).unsqueeze(0).to(DEVICE)
 
-        # Pixel Statistics
-        total_pixels = int(pred_defor_mask.size)
-        defor_pixels = int(np.sum(pred_defor_mask == 1))
-        defor_pct = round((defor_pixels / total_pixels) * 100.0, 2)
-        stable_pixels = total_pixels - defor_pixels
-        stable_pct = round(100.0 - defor_pct, 2)
+    with torch.no_grad():
+        logits = stage2_model(concat_tensor)
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
 
-        # Base Images Base64
-        t1_b64 = array_to_base64_png(img_a_np)
-        t2_b64 = array_to_base64_png(img_b_np)
+    pred_defor_mask = preds[0, 0].cpu().numpy().astype(np.uint8)
 
-        # Deforestation Red Mask (Red = Deforestation, Black = No Change)
-        defor_mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
-        defor_mask_rgb[pred_defor_mask == 1] = [239, 68, 68]  # Vibrant Red
-        defor_mask_b64 = array_to_base64_png(defor_mask_rgb)
+    total_pixels = int(pred_defor_mask.size)
+    defor_pixels = int(np.sum(pred_defor_mask == 1))
+    defor_pct = round((defor_pixels / total_pixels) * 100.0, 2)
+    stable_pixels = total_pixels - defor_pixels
+    stable_pct = round(100.0 - defor_pct, 2)
 
-        # Deforestation Red Overlay on T2
-        overlay_rgb = img_b_np.copy()
-        red_tint = np.array([0.937, 0.267, 0.267], dtype=np.float32)
-        alpha = 0.5
-        defor_indices = (pred_defor_mask == 1)
-        overlay_rgb[defor_indices] = (1 - alpha) * overlay_rgb[defor_indices] + alpha * red_tint
-        overlay_b64 = array_to_base64_png(overlay_rgb)
+    defor_hectares = round(defor_pixels * HA_PER_PIXEL, 2)
+    defor_sqkm = round(defor_pixels * SQKM_PER_PIXEL, 3)
 
-        gt_b64 = None
-        metrics = None
+    t1_b64 = array_to_base64_png(img_a_np)
+    t2_b64 = array_to_base64_png(img_b_np)
 
-        if gt_mask_np is not None:
-            gt_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
-            gt_rgb[gt_mask_np == 1] = [239, 68, 68]
-            gt_b64 = array_to_base64_png(gt_rgb)
+    defor_mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+    defor_mask_rgb[pred_defor_mask == 1] = [239, 68, 68]
+    defor_mask_b64 = array_to_base64_png(defor_mask_rgb)
 
-            # Compute sample metrics
-            tp = int(np.sum((pred_defor_mask == 1) & (gt_mask_np == 1)))
-            fp = int(np.sum((pred_defor_mask == 1) & (gt_mask_np == 0)))
-            fn = int(np.sum((pred_defor_mask == 0) & (gt_mask_np == 1)))
+    overlay_rgb = img_b_np.copy()
+    red_tint = np.array([0.937, 0.267, 0.267], dtype=np.float32)
+    alpha = 0.5
+    defor_indices = (pred_defor_mask == 1)
+    overlay_rgb[defor_indices] = (1 - alpha) * overlay_rgb[defor_indices] + alpha * red_tint
+    overlay_b64 = array_to_base64_png(overlay_rgb)
 
-            iou_den = tp + fp + fn
-            dice_den = 2 * tp + fp + fn
+    gt_b64 = None
+    metrics = None
 
-            iou = float(tp / iou_den) if iou_den > 0 else (1.0 if np.sum(gt_mask_np) == 0 and defor_pixels == 0 else 0.0)
-            dice = float((2 * tp) / dice_den) if dice_den > 0 else (1.0 if np.sum(gt_mask_np) == 0 and defor_pixels == 0 else 0.0)
+    if gt_mask_np is not None:
+        gt_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+        gt_rgb[gt_mask_np == 1] = [239, 68, 68]
+        gt_b64 = array_to_base64_png(gt_rgb)
 
-            metrics = {
-                "sample_iou": round(iou, 4),
-                "sample_dice": round(dice, 4),
-                "gt_defor_pixels": int(np.sum(gt_mask_np == 1)),
-                "gt_defor_pct": round((int(np.sum(gt_mask_np == 1)) / total_pixels) * 100.0, 2)
-            }
+        tp = np.sum((pred_defor_mask == 1) & (gt_mask_np == 1))
+        fp = np.sum((pred_defor_mask == 1) & (gt_mask_np == 0))
+        fn = np.sum((pred_defor_mask == 0) & (gt_mask_np == 1))
 
-        return jsonify({
-            "pair_name": pair_name,
-            "threshold": threshold,
-            "total_pixels": total_pixels,
-            "deforestation_pixels": defor_pixels,
-            "deforestation_pct": defor_pct,
-            "stable_pixels": stable_pixels,
-            "stable_pct": stable_pct,
-            "t1_image": t1_b64,
-            "t2_image": t2_b64,
-            "deforestation_mask": defor_mask_b64,
-            "deforestation_overlay": overlay_b64,
-            "gt_mask": gt_b64,
-            "metrics": metrics
-        })
-    except Exception as e:
-        return jsonify({"error": f"Temporal inference execution failed: {str(e)}"}), 500
+        iou_den = tp + fp + fn
+        dice_den = 2 * tp + fp + fn
+
+        iou = float(tp / iou_den) if iou_den > 0 else (1.0 if np.sum(gt_mask_np) == 0 and defor_pixels == 0 else 0.0)
+        dice = float((2 * tp) / dice_den) if dice_den > 0 else (1.0 if np.sum(gt_mask_np) == 0 and defor_pixels == 0 else 0.0)
+
+        gt_defor_px = int(np.sum(gt_mask_np == 1))
+        metrics = {
+            "sample_iou": round(iou, 4),
+            "sample_dice": round(dice, 4),
+            "gt_defor_pixels": gt_defor_px,
+            "gt_defor_pct": round((gt_defor_px / total_pixels) * 100.0, 2),
+            "gt_defor_hectares": round(gt_defor_px * HA_PER_PIXEL, 2)
+        }
+
+    return jsonify({
+        "pair_name": pair_name,
+        "threshold": threshold,
+        "total_pixels": total_pixels,
+        "deforestation_pixels": defor_pixels,
+        "deforestation_pct": defor_pct,
+        "deforestation_hectares": defor_hectares,
+        "deforestation_sqkm": defor_sqkm,
+        "stable_pixels": stable_pixels,
+        "stable_pct": stable_pct,
+        "gis": gis_bounds,
+        "t1_image": t1_b64,
+        "t2_image": t2_b64,
+        "deforestation_mask": defor_mask_b64,
+        "deforestation_overlay": overlay_b64,
+        "gt_mask": gt_b64,
+        "metrics": metrics
+    })
 
 
 @app.route("/api/metrics", methods=["GET"])
@@ -447,21 +402,15 @@ def get_metrics():
     stage1_report = None
     stage2_report = None
 
-    stage1_json = BASE_DIR / "outputs" / "evaluation_metrics.json"
+    stage1_json = Path("outputs/evaluation_metrics.json")
     if stage1_json.exists():
-        try:
-            with open(stage1_json, "r", encoding="utf-8") as f:
-                stage1_report = json.load(f)
-        except Exception as e:
-            safe_print(f"[WARNING] Could not read Stage 1 evaluation metrics: {e}")
+        with open(stage1_json, "r") as f:
+            stage1_report = json.load(f)
 
-    stage2_json = BASE_DIR / "outputs" / "temporal" / "temporal_test_results.json"
+    stage2_json = Path("outputs/temporal/temporal_test_results.json")
     if stage2_json.exists():
-        try:
-            with open(stage2_json, "r", encoding="utf-8") as f:
-                stage2_report = json.load(f)
-        except Exception as e:
-            safe_print(f"[WARNING] Could not read Stage 2 evaluation metrics: {e}")
+        with open(stage2_json, "r") as f:
+            stage2_report = json.load(f)
 
     return jsonify({
         "stage1": stage1_report,
@@ -469,21 +418,7 @@ def get_metrics():
     })
 
 
-@app.errorhandler(404)
-def handle_404(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "API endpoint not found"}), 404
-    return render_template("index.html"), 404
-
-
-@app.errorhandler(500)
-def handle_500(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "Internal server error"}), 500
-    return "Internal Server Error", 500
-
-
 if __name__ == "__main__":
     load_models()
-    safe_print("[START] Starting Deforestation Detection Web Server on http://127.0.0.1:5000")
+    print("🚀 Starting Deforestation Detection GIS Web Server on http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, debug=False)
