@@ -35,6 +35,8 @@ export default function App() {
 
   // Stage 2 State
   const [s2Sample, setS2Sample] = useState('');
+  const [s2FileT1, setS2FileT1] = useState(null);
+  const [s2FileT2, setS2FileT2] = useState(null);
   const [s2Threshold, setS2Threshold] = useState(0.5);
   const [s2Results, setS2Results] = useState(null);
 
@@ -197,16 +199,26 @@ export default function App() {
 
   // Run Stage 2
   const handleRunStage2 = () => {
-    if (!s2Sample) {
-      alert("Please select a temporal pair.");
+    const formData = new FormData();
+    formData.append("threshold", s2Threshold);
+
+    if (s2FileT1 && s2FileT2) {
+      formData.append("file_t1", s2FileT1);
+      formData.append("file_t2", s2FileT2);
+    } else if (s2Sample) {
+      const sampleObj = JSON.parse(s2Sample);
+      formData.append("sample_id", sampleObj.id);
+      formData.append("split", sampleObj.split);
+    } else {
+      if (s2FileT1 && !s2FileT2) {
+        alert("Please also upload the After Image (T2).");
+      } else if (!s2FileT1 && s2FileT2) {
+        alert("Please also upload the Before Image (T1).");
+      } else {
+        alert("Please select a sample pair or upload both Before (T1) and After (T2) images.");
+      }
       return;
     }
-
-    const sampleObj = JSON.parse(s2Sample);
-    const formData = new FormData();
-    formData.append("sample_id", sampleObj.id);
-    formData.append("split", sampleObj.split);
-    formData.append("threshold", s2Threshold);
 
     setLoading(true);
     fetch("/api/predict/stage2", { method: "POST", body: formData })
@@ -568,18 +580,56 @@ export default function App() {
         {activeTab === 'stage2' && (
           <div className="tab-content">
             <div className="glass-card control-panel">
-              <div className="panel-section" style={{ minWidth: 300 }}>
-                <label className="section-label">Select Temporal Image Pair (T1 vs T2)</label>
+              <div className="panel-section" style={{ minWidth: 260 }}>
+                <label className="section-label">Select Pre-loaded Temporal Pair</label>
                 <select 
                   className="custom-select"
                   value={s2Sample}
-                  onChange={(e) => setS2Sample(e.target.value)}
+                  onChange={(e) => {
+                    setS2Sample(e.target.value);
+                    setS2FileT1(null);
+                    setS2FileT2(null);
+                  }}
                 >
                   <option value="">-- Choose Sample Pair --</option>
                   {samples.stage2_samples.map((s, i) => (
                     <option key={i} value={JSON.stringify(s)}>{s.name}</option>
                   ))}
                 </select>
+              </div>
+
+              <div className="panel-section">
+                <label className="section-label">Or Upload T1 (Before Image)</label>
+                <div className="file-dropzone">
+                  <span>{s2FileT1 ? `T1: ${s2FileT1.name}` : 'Click to Upload Before (T1)'}</span>
+                  <input 
+                    type="file" 
+                    accept="image/*,.tif,.tiff"
+                    onChange={(e) => {
+                      if (e.target.files.length > 0) {
+                        setS2FileT1(e.target.files[0]);
+                        setS2Sample('');
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="panel-section">
+                <label className="section-label">And Upload T2 (After Image)</label>
+                <div className="file-dropzone">
+                  <span>{s2FileT2 ? `T2: ${s2FileT2.name}` : 'Click to Upload After (T2)'}</span>
+                  <input 
+                    type="file" 
+                    accept="image/*,.tif,.tiff"
+                    onChange={(e) => {
+                      if (e.target.files.length > 0) {
+                        setS2FileT2(e.target.files[0]);
+                        setS2Sample('');
+                      }
+                    }}
+                  />
+                </div>
               </div>
 
               <div className="panel-section threshold-box">

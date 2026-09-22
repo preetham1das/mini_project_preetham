@@ -74,9 +74,9 @@ def load_models():
         stage1_model = UNet(in_channels=3, out_channels=1, init_features=32).to(DEVICE)
         stage1_model.load_state_dict(checkpoint["model_state_dict"])
         stage1_model.eval()
-        print(f"✅ Loaded Stage 1 U-Net from {stage1_path}")
+        print(f"[OK] Loaded Stage 1 U-Net from {stage1_path}")
     else:
-        print(f"⚠️ Stage 1 checkpoint not found at {stage1_path}")
+        print(f"[WARNING] Stage 1 checkpoint not found at {stage1_path}")
 
     # 2. Load Stage 2 Temporal UNet (9 channels with key compatibility)
     stage2_path = Path(TEMPORAL_CHECKPOINT_PATH)
@@ -93,9 +93,9 @@ def load_models():
         stage2_model = TemporalUNet(in_channels=9, out_channels=1, init_features=32).to(DEVICE)
         stage2_model.load_state_dict(new_state_dict)
         stage2_model.eval()
-        print(f"✅ Loaded Stage 2 Temporal U-Net from {stage2_path}")
+        print(f"[OK] Loaded Stage 2 Temporal U-Net from {stage2_path}")
     else:
-        print(f"⚠️ Stage 2 checkpoint not found at {stage2_path}")
+        print(f"[WARNING] Stage 2 checkpoint not found at {stage2_path}")
 
 
 def array_to_base64_png(np_img):
@@ -420,5 +420,5 @@ def get_metrics():
 
 if __name__ == "__main__":
     load_models()
-    print("🚀 Starting Deforestation Detection GIS Web Server on http://127.0.0.1:5000")
+    print("[START] Deforestation Detection GIS Web Server running on http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, debug=False)
