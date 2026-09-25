@@ -255,6 +255,7 @@ def search_sentinel():
       - start_date (YYYY-MM-DD)
       - end_date (YYYY-MM-DD)
       - limit (optional int, default 50, max 100)
+      - bbox (optional str, "west,south,east,north"; if omitted, 0.05 deg delta around lat/lon)
     """
     # 1. Parameter extraction
     lat_raw = request.args.get("lat") or request.args.get("latitude")
@@ -306,13 +307,29 @@ def search_sentinel():
     if not token:
         return jsonify(err_dict), status_code
 
-    # 6. Define small geographic area around location (~0.01 deg ~= 1.1 km bounding box)
-    delta_deg = 0.01
-    min_lon = round(lon - delta_deg, 6)
-    max_lon = round(lon + delta_deg, 6)
-    min_lat = round(lat - delta_deg, 6)
-    max_lat = round(lat + delta_deg, 6)
-    bbox = [min_lon, min_lat, max_lon, max_lat]
+    # 6. Define geographic area for search.
+    #    Optional 'bbox' param: "west,south,east,north" (e.g. "-62.3,-3.5,-62.1,-3.4").
+    #    If not provided, use 0.05 degree delta around lat/lon (~5.5 km bounding box).
+    bbox_raw = request.args.get("bbox")
+    if bbox_raw:
+        try:
+            parts = [float(v.strip()) for v in bbox_raw.split(",")]
+            if len(parts) != 4:
+                raise ValueError("bbox must have exactly 4 comma-separated values")
+            search_bbox = [round(parts[0], 6), round(parts[1], 6),
+                           round(parts[2], 6), round(parts[3], 6)]
+        except ValueError as ve:
+            return jsonify({"success": False,
+                            "error": f"Invalid 'bbox' parameter: {str(ve)}. "
+                                     "Expected 'west,south,east,north'."}), 400
+    else:
+        delta_deg = 0.05
+        search_bbox = [
+            round(lon - delta_deg, 6),
+            round(lat - delta_deg, 6),
+            round(lon + delta_deg, 6),
+            round(lat + delta_deg, 6),
+        ]
 
     # 7. Query Copernicus Data Space / Sentinel Hub STAC Catalog
     base_url = os.environ.get("SENTINEL_BASE_URL", SENTINEL_BASE_URL).rstrip("/")
@@ -328,7 +345,7 @@ def search_sentinel():
     search_payload = {
         "collections": ["sentinel-2-l2a"],
         "datetime": f"{start_date_raw.strip()}T00:00:00Z/{end_date_raw.strip()}T23:59:59Z",
-        "bbox": bbox,
+        "bbox": search_bbox,
         "limit": limit_val
     }
 
@@ -398,7 +415,7 @@ def search_sentinel():
             "longitude": lon,
             "start_date": start_date_raw.strip(),
             "end_date": end_date_raw.strip(),
-            "bbox": bbox
+            "search_bbox": search_bbox
         },
         "acquisitions": acquisitions
     }
@@ -420,6 +437,9 @@ def preview_sentinel():
       - lat or latitude
       - lon or longitude
       - format (optional: 'png' [default] or 'json')
+      - bbox (optional str, "west,south,east,north"; if omitted, 0.05 deg delta around lat/lon)
+      - width (optional int, default 512, max 1024)
+      - height (optional int, default 512, max 1024)
     """
     # 1. Parameter extraction & validation
     acquisition_id = request.args.get("acquisition_id") or request.args.get("id")
@@ -551,13 +571,39 @@ def preview_sentinel():
             "error": f"Could not determine acquisition date for ID '{acquisition_id}'. Please ensure the ID was obtained from /api/sentinel/search."
         }), 404
 
-    # 4. Small geographic bounding box around coordinates (~2.5 km box)
-    delta_deg = 0.023
-    min_lon = round(lon - delta_deg / 2, 6)
-    max_lon = round(lon + delta_deg / 2, 6)
-    min_lat = round(lat - delta_deg / 2, 6)
-    max_lat = round(lat + delta_deg / 2, 6)
-    bbox = [min_lon, min_lat, max_lon, max_lat]
+    # 4. Geographic bounding box for the Process API.
+    #    Optional 'bbox' param: "west,south,east,north" (e.g. "-62.3,-3.5,-62.1,-3.4").
+    #    If not provided, use 0.05 degree delta around lat/lon (~5.5 km bounding box).
+    bbox_raw = request.args.get("bbox")
+    if bbox_raw:
+        try:
+            parts = [float(v.strip()) for v in bbox_raw.split(",")]
+            if len(parts) != 4:
+                raise ValueError("bbox must have exactly 4 comma-separated values")
+            bbox = [round(parts[0], 6), round(parts[1], 6),
+                    round(parts[2], 6), round(parts[3], 6)]
+        except ValueError as ve:
+            return jsonify({"success": False,
+                            "error": f"Invalid 'bbox' parameter: {str(ve)}. "
+                                     "Expected 'west,south,east,north'."}), 400
+    else:
+        delta_deg = 0.05
+        bbox = [
+            round(lon - delta_deg, 6),
+            round(lat - delta_deg, 6),
+            round(lon + delta_deg, 6),
+            round(lat + delta_deg, 6),
+        ]
+
+    # 4b. Optional output dimensions (default 512x512, max 1024)
+    try:
+        out_width = min(max(1, int(request.args.get("width", 512))), 1024)
+    except (ValueError, TypeError):
+        out_width = 512
+    try:
+        out_height = min(max(1, int(request.args.get("height", 512))), 1024)
+    except (ValueError, TypeError):
+        out_height = 512
 
     # 5. Request 512x512 RGB from Sentinel Hub Process API
     process_url = f"{base_url}/process"
@@ -597,8 +643,8 @@ function evaluatePixel(sample) {
             ]
         },
         "output": {
-            "width": 512,
-            "height": 512,
+            "width": out_width,
+            "height": out_height,
             "responses": [
                 {
                     "identifier": "default",
@@ -663,8 +709,8 @@ function evaluatePixel(sample) {
             "latitude": lat,
             "longitude": lon,
             "bbox": bbox,
-            "width": 512,
-            "height": 512,
+            "width": out_width,
+            "height": out_height,
             "image": f"data:image/png;base64,{b64_str}",
             "time_range": {
                 "from": time_from,
@@ -684,6 +730,186 @@ function evaluatePixel(sample) {
         }
     )
 
+
+
+@app.route("/api/sentinel/info", methods=["GET"])
+def get_sentinel_info():
+    """Returns metadata about the Sentinel-2 integration."""
+    return jsonify({
+        "configured": is_sentinel_configured(),
+        "provider": "Copernicus Data Space Ecosystem / Sentinel Hub",
+        "collections": ["sentinel-2-l2a"],
+        "rgb_resolution_meters": 10,
+        "bands": {"R": "B04", "G": "B03", "B": "B02"},
+        "note": ("Sentinel-2 imagery is for visualization only and is NOT "
+                 "connected to the ML model pipeline.")
+    })
+
+
+@app.route("/api/sentinel/analyze", methods=["POST"])
+def analyze_sentinel_deforestation():
+    """
+    Runs Stage-2 Temporal U-Net deforestation analysis on two Sentinel-2 images.
+
+    Accepts JSON body:
+      {
+        "image_before": "data:image/png;base64,...",   // T1 (FROM date)
+        "image_after":  "data:image/png;base64,...",   // T2 (TO date)
+        "date_before":  "2023-01-21",
+        "date_after":   "2024-01-21",
+        "bbox":         [west, south, east, north],
+        "threshold":    0.5    // optional, default 0.5
+      }
+
+    Preprocessing matches the Stage-2 training pipeline exactly:
+      - Convert to RGB
+      - Resize to 256x256 with BILINEAR resampling
+      - Normalize [0,255] -> [0.0, 1.0]  (identical to temporal_dataset.py)
+      - Build 9-channel tensor: [T1_RGB, T2_RGB, |T1-T2|]
+
+    Returns JSON with deforestation mask, overlay, and area metrics.
+    Includes an explicit domain-gap disclosure.
+    """
+    if stage2_model is None:
+        return jsonify({
+            "success": False,
+            "error": "Stage 2 Temporal U-Net is not loaded."
+        }), 500
+
+    # -- Parse JSON body -------------------------------------------------------
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"success": False, "error": "Expected JSON body."}), 400
+
+    img_before_b64 = data.get("image_before", "")
+    img_after_b64  = data.get("image_after",  "")
+    date_before    = data.get("date_before", "Unknown")
+    date_after     = data.get("date_after",  "Unknown")
+    bbox           = data.get("bbox", None)
+    threshold      = float(data.get("threshold", 0.5))
+
+    if not img_before_b64 or not img_after_b64:
+        return jsonify({
+            "success": False,
+            "error": "Both image_before and image_after are required."
+        }), 400
+
+    # -- Decode base64 PNG images -----------------------------------------------
+    def decode_b64_image(b64_str, label):
+        """Strip data-URI prefix and decode base64 to PIL Image (RGB)."""
+        try:
+            if "," in b64_str:
+                b64_str = b64_str.split(",", 1)[1]
+            img_bytes = base64.b64decode(b64_str)
+            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            return pil_img, None
+        except Exception as exc:
+            return None, f"Failed to decode {label} image: {str(exc)}"
+
+    pil_before, err = decode_b64_image(img_before_b64, "image_before")
+    if err:
+        return jsonify({"success": False, "error": err}), 400
+
+    pil_after, err = decode_b64_image(img_after_b64, "image_after")
+    if err:
+        return jsonify({"success": False, "error": err}), 400
+
+    # -- Preprocessing: identical to temporal_dataset.py TemporalForestDataset -
+    # Step 1: Resize to 256x256 (BILINEAR, same as training)
+    pil_before_r = pil_before.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
+    pil_after_r  = pil_after.resize(TARGET_SIZE,  Image.Resampling.BILINEAR)
+
+    # Step 2: Convert to float32 numpy, normalize [0,255] -> [0,1]
+    img_t1 = np.array(pil_before_r, dtype=np.float32) / 255.0   # (256,256,3)
+    img_t2 = np.array(pil_after_r,  dtype=np.float32) / 255.0   # (256,256,3)
+
+    # Step 3: Build 9-channel tensor [T1_RGB(3), T2_RGB(3), |T1-T2|(3)]
+    t1_tensor   = torch.tensor(img_t1, dtype=torch.float32).permute(2, 0, 1)  # (3,256,256)
+    t2_tensor   = torch.tensor(img_t2, dtype=torch.float32).permute(2, 0, 1)  # (3,256,256)
+    diff_tensor = torch.abs(t1_tensor - t2_tensor)                             # (3,256,256)
+
+    concat_tensor = torch.cat([t1_tensor, t2_tensor, diff_tensor], dim=0)      # (9,256,256)
+    input_tensor  = concat_tensor.unsqueeze(0).to(DEVICE)                      # (1,9,256,256)
+
+    # -- Inference -------------------------------------------------------------
+    with torch.no_grad():
+        logits = stage2_model(input_tensor)
+        probs  = torch.sigmoid(logits)
+        preds  = (probs > threshold).float()
+
+    pred_mask = preds[0, 0].cpu().numpy().astype(np.uint8)    # (256,256) binary
+
+    # -- Metrics ---------------------------------------------------------------
+    total_pixels  = int(pred_mask.size)
+    defor_pixels  = int(np.sum(pred_mask == 1))
+    stable_pixels = total_pixels - defor_pixels
+    defor_pct     = round((defor_pixels / total_pixels) * 100.0, 2)
+    stable_pct    = round(100.0 - defor_pct, 2)
+    defor_ha      = round(defor_pixels * HA_PER_PIXEL, 2)
+    defor_sqkm    = round(defor_pixels * SQKM_PER_PIXEL, 3)
+
+    # -- GIS bounds for overlay ------------------------------------------------
+    if bbox and len(bbox) == 4:
+        west, south, east, north = bbox
+        gis_bounds_obj = {
+            "bounds": [[south, west], [north, east]],
+            "center": [(south + north) / 2, (west + east) / 2],
+            "west": west, "east": east, "south": south, "north": north,
+        }
+    else:
+        gis_bounds_obj = get_sample_bounds("sentinel_analysis")
+
+    # -- Encode output images --------------------------------------------------
+    # Before image (resized)
+    before_b64 = array_to_base64_png(img_t1)
+
+    # After image (resized)
+    after_b64 = array_to_base64_png(img_t2)
+
+    # Deforestation mask (red channel)
+    mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
+    mask_rgb[pred_mask == 1] = [239, 68, 68]
+    mask_b64 = array_to_base64_png(mask_rgb)
+
+    # Overlay: after image with red deforestation regions
+    overlay_np = img_t2.copy()
+    red_tint   = np.array([0.937, 0.267, 0.267], dtype=np.float32)
+    alpha_v    = 0.55
+    defor_idx  = (pred_mask == 1)
+    overlay_np[defor_idx] = (1 - alpha_v) * overlay_np[defor_idx] + alpha_v * red_tint
+    overlay_b64 = array_to_base64_png(overlay_np)
+
+    # Difference image (absolute change)
+    diff_np = np.abs(img_t2 - img_t1)
+    diff_b64 = array_to_base64_png(diff_np)
+
+    return jsonify({
+        "success": True,
+        "date_before": date_before,
+        "date_after":  date_after,
+        "threshold": threshold,
+        "total_pixels":  total_pixels,
+        "defor_pixels":  defor_pixels,
+        "stable_pixels": stable_pixels,
+        "deforestation_pct":  defor_pct,
+        "stable_pct":         stable_pct,
+        "deforestation_hectares": defor_ha,
+        "deforestation_sqkm":     defor_sqkm,
+        "gis": gis_bounds_obj,
+        "before_image":        before_b64,
+        "after_image":         after_b64,
+        "deforestation_mask":  mask_b64,
+        "deforestation_overlay": overlay_b64,
+        "difference_image":    diff_b64,
+        "model_note": (
+            "Domain-gap disclosure: the Temporal U-Net was trained on the "
+            "Forest-Change dataset (480x480 tropical satellite imagery). "
+            "Live Sentinel-2 imagery may have different radiometric "
+            "characteristics. Results are indicative, not validated. "
+            "Do not use for regulatory or scientific decisions without "
+            "independent ground-truth validation."
+        )
+    })
 
 @app.route("/api/gis/regions", methods=["GET"])
 def get_gis_regions():
