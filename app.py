@@ -1,10 +1,38 @@
 import base64
 import io
 import json
+import os
+import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify
+import requests
+
+# Load environment variables (.env) if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+def _load_env_fallback():
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+
+_load_env_fallback()
+
+from flask import Flask, render_template, request, jsonify, Response, send_file
 from flask_cors import CORS
 import numpy as np
 from PIL import Image
@@ -35,6 +63,82 @@ SQKM_PER_PIXEL = SQM_PER_PIXEL / 1000000.0
 # Base Amazon Basin Reference Coordinates
 BASE_LAT = -3.4653
 BASE_LON = -62.2159
+
+# Sentinel-2 / Copernicus Data Space Ecosystem Configuration
+SENTINEL_CLIENT_ID = os.environ.get("SENTINEL_CLIENT_ID", "").strip()
+SENTINEL_CLIENT_SECRET = os.environ.get("SENTINEL_CLIENT_SECRET", "").strip()
+SENTINEL_INSTANCE_ID = os.environ.get("SENTINEL_INSTANCE_ID", "").strip()
+SENTINEL_TOKEN_URL = os.environ.get(
+    "SENTINEL_TOKEN_URL",
+    "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+).strip()
+SENTINEL_BASE_URL = os.environ.get(
+    "SENTINEL_BASE_URL",
+    "https://sh.dataspace.copernicus.eu/api/v1"
+).strip()
+
+
+def is_sentinel_configured():
+    """Checks whether Copernicus Data Space / Sentinel credentials are provided."""
+    cid = os.environ.get("SENTINEL_CLIENT_ID", "").strip()
+    sec = os.environ.get("SENTINEL_CLIENT_SECRET", "").strip()
+    return bool(cid and sec)
+
+
+def get_sentinel_token():
+    """
+    Retrieves an OAuth2 access token from Copernicus Data Space / Sentinel Hub.
+    Returns (token_str, error_dict, http_status_code).
+    """
+    # Re-check env or fallback in case .env was added during runtime
+    if not (os.environ.get("SENTINEL_CLIENT_ID") and os.environ.get("SENTINEL_CLIENT_SECRET")):
+        _load_env_fallback()
+
+    client_id = os.environ.get("SENTINEL_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SENTINEL_CLIENT_SECRET", "").strip()
+
+    if not client_id or not client_secret:
+        return None, {
+            "success": False,
+            "error": "Sentinel credentials are not configured. Please set SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET in .env."
+        }, 400
+
+    token_url = os.environ.get(
+        "SENTINEL_TOKEN_URL",
+        "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+    ).strip()
+
+    try:
+        resp = requests.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            token_data = resp.json()
+            return token_data.get("access_token"), None, 200
+        else:
+            err_msg = "Invalid client or client credentials"
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get("error_description") or err_data.get("error") or str(err_data)
+            except Exception:
+                err_msg = resp.text[:200]
+            return None, {
+                "success": False,
+                "error": f"Sentinel authentication failed: {err_msg}"
+            }, 401
+    except requests.exceptions.RequestException as e:
+        return None, {
+            "success": False,
+            "error": f"Network error during Sentinel authentication: {str(e)}"
+        }, 503
+
 
 # Global variables for loaded models
 stage1_model = None
@@ -116,6 +220,469 @@ def array_to_base64_png(np_img):
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/sentinel/status", methods=["GET"])
+def get_sentinel_status():
+    """
+    Verifies that Copernicus Data Space / Sentinel Hub API configuration is present.
+    Does not make satellite requests; checks credentials readiness.
+    """
+    configured = is_sentinel_configured()
+    client_id = os.environ.get("SENTINEL_CLIENT_ID", "").strip()
+
+    masked_id = None
+    if client_id:
+        masked_id = f"{client_id[:4]}...{client_id[-4:]}" if len(client_id) > 8 else "***"
+
+    return jsonify({
+        "configured": configured,
+        "provider": "Copernicus Data Space Ecosystem / Sentinel Hub",
+        "auth_url": os.environ.get("SENTINEL_TOKEN_URL", SENTINEL_TOKEN_URL),
+        "api_base_url": os.environ.get("SENTINEL_BASE_URL", SENTINEL_BASE_URL),
+        "client_id_configured": bool(client_id),
+        "client_id_preview": masked_id
+    })
+
+
+@app.route("/api/sentinel/search", methods=["GET"])
+def search_sentinel():
+    """
+    Searches for available Sentinel-2 acquisitions around a target location and date range.
+    Accepts:
+      - lat or latitude (float, -90 to 90)
+      - lon or longitude (float, -180 to 180)
+      - start_date (YYYY-MM-DD)
+      - end_date (YYYY-MM-DD)
+      - limit (optional int, default 50, max 100)
+    """
+    # 1. Parameter extraction
+    lat_raw = request.args.get("lat") or request.args.get("latitude")
+    lon_raw = request.args.get("lon") or request.args.get("longitude")
+    start_date_raw = request.args.get("start_date")
+    end_date_raw = request.args.get("end_date")
+
+    # 2. Check missing parameters
+    if not lat_raw:
+        return jsonify({"success": False, "error": "Missing required parameter: 'lat' (or 'latitude')"}), 400
+    if not lon_raw:
+        return jsonify({"success": False, "error": "Missing required parameter: 'lon' (or 'longitude')"}), 400
+    if not start_date_raw:
+        return jsonify({"success": False, "error": "Missing required parameter: 'start_date' (format: YYYY-MM-DD)"}), 400
+    if not end_date_raw:
+        return jsonify({"success": False, "error": "Missing required parameter: 'end_date' (format: YYYY-MM-DD)"}), 400
+
+    # 3. Coordinate validation
+    try:
+        lat = float(lat_raw)
+        if not (-90.0 <= lat <= 90.0):
+            return jsonify({"success": False, "error": "Latitude must be between -90 and 90 degrees."}), 400
+    except ValueError:
+        return jsonify({"success": False, "error": f"Invalid latitude value: '{lat_raw}'. Expected float."}), 400
+
+    try:
+        lon = float(lon_raw)
+        if not (-180.0 <= lon <= 180.0):
+            return jsonify({"success": False, "error": "Longitude must be between -180 and 180 degrees."}), 400
+    except ValueError:
+        return jsonify({"success": False, "error": f"Invalid longitude value: '{lon_raw}'. Expected float."}), 400
+
+    # 4. Date validation
+    try:
+        start_dt = datetime.strptime(start_date_raw.strip(), "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"success": False, "error": f"Invalid start_date: '{start_date_raw}'. Expected YYYY-MM-DD format."}), 400
+
+    try:
+        end_dt = datetime.strptime(end_date_raw.strip(), "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"success": False, "error": f"Invalid end_date: '{end_date_raw}'. Expected YYYY-MM-DD format."}), 400
+
+    if start_dt > end_dt:
+        return jsonify({"success": False, "error": f"'start_date' ({start_date_raw}) cannot be later than 'end_date' ({end_date_raw})."}), 400
+
+    # 5. Sentinel credentials & authentication
+    token, err_dict, status_code = get_sentinel_token()
+    if not token:
+        return jsonify(err_dict), status_code
+
+    # 6. Define small geographic area around location (~0.01 deg ~= 1.1 km bounding box)
+    delta_deg = 0.01
+    min_lon = round(lon - delta_deg, 6)
+    max_lon = round(lon + delta_deg, 6)
+    min_lat = round(lat - delta_deg, 6)
+    max_lat = round(lat + delta_deg, 6)
+    bbox = [min_lon, min_lat, max_lon, max_lat]
+
+    # 7. Query Copernicus Data Space / Sentinel Hub STAC Catalog
+    base_url = os.environ.get("SENTINEL_BASE_URL", SENTINEL_BASE_URL).rstrip("/")
+    catalog_url = f"{base_url}/catalog/1.0.0/search"
+
+    limit_val = 50
+    if request.args.get("limit"):
+        try:
+            limit_val = min(max(1, int(request.args.get("limit"))), 100)
+        except ValueError:
+            pass
+
+    search_payload = {
+        "collections": ["sentinel-2-l2a"],
+        "datetime": f"{start_date_raw.strip()}T00:00:00Z/{end_date_raw.strip()}T23:59:59Z",
+        "bbox": bbox,
+        "limit": limit_val
+    }
+
+    try:
+        cat_resp = requests.post(
+            catalog_url,
+            json=search_payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            timeout=25
+        )
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "success": False,
+            "error": f"Network error connecting to Sentinel-2 catalog: {str(e)}"
+        }), 503
+
+    if cat_resp.status_code != 200:
+        err_detail = cat_resp.text[:300]
+        try:
+            err_json = cat_resp.json()
+            err_detail = err_json.get("description") or err_json.get("error") or err_detail
+        except Exception:
+            pass
+        return jsonify({
+            "success": False,
+            "error": f"Sentinel catalog search failed (HTTP {cat_resp.status_code}): {err_detail}"
+        }), cat_resp.status_code
+
+    try:
+        cat_data = cat_resp.json()
+    except Exception:
+        return jsonify({"success": False, "error": "Invalid JSON received from Sentinel catalog service."}), 502
+
+    features = cat_data.get("features", [])
+
+    acquisitions = []
+    for item in features:
+        item_id = item.get("id")
+        props = item.get("properties", {})
+        dt_str = props.get("datetime")
+        cloud = props.get("eo:cloud_cover")
+        if cloud is None:
+            cloud = props.get("cloudCover")
+        if cloud is not None:
+            try:
+                cloud = round(float(cloud), 2)
+            except (ValueError, TypeError):
+                pass
+
+        acquisitions.append({
+            "id": item_id,
+            "datetime": dt_str,
+            "cloud_coverage": cloud
+        })
+
+    # Sort acquisitions newest first
+    acquisitions.sort(key=lambda x: x.get("datetime") or "", reverse=True)
+
+    resp_payload = {
+        "success": True,
+        "count": len(acquisitions),
+        "query": {
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": start_date_raw.strip(),
+            "end_date": end_date_raw.strip(),
+            "bbox": bbox
+        },
+        "acquisitions": acquisitions
+    }
+
+    if len(acquisitions) == 0:
+        resp_payload["message"] = "No matching Sentinel-2 acquisitions found for the requested location and date range."
+
+    return jsonify(resp_payload), 200
+
+
+@app.route("/api/sentinel/preview", methods=["GET"])
+def preview_sentinel():
+    """
+    Given a Sentinel-2 acquisition ID returned by /api/sentinel/search,
+    requests a small 512x512 RGB preview image from Sentinel Hub / CDSE Process API.
+    
+    Accepts:
+      - acquisition_id (or id)
+      - lat or latitude
+      - lon or longitude
+      - format (optional: 'png' [default] or 'json')
+    """
+    # 1. Parameter extraction & validation
+    acquisition_id = request.args.get("acquisition_id") or request.args.get("id")
+    lat_raw = request.args.get("lat") or request.args.get("latitude")
+    lon_raw = request.args.get("lon") or request.args.get("longitude")
+
+    if not acquisition_id or not acquisition_id.strip():
+        return jsonify({
+            "success": False,
+            "error": "Missing required parameter: 'acquisition_id' (or 'id')."
+        }), 400
+
+    acquisition_id = acquisition_id.strip()
+
+    if not lat_raw:
+        return jsonify({
+            "success": False,
+            "error": "Missing required parameter: 'lat' (or 'latitude')."
+        }), 400
+    if not lon_raw:
+        return jsonify({
+            "success": False,
+            "error": "Missing required parameter: 'lon' (or 'longitude')."
+        }), 400
+
+    try:
+        lat = float(lat_raw)
+        if not (-90.0 <= lat <= 90.0):
+            return jsonify({
+                "success": False,
+                "error": "Latitude must be between -90 and 90 degrees."
+            }), 400
+    except ValueError:
+        return jsonify({
+            "success": False,
+            "error": f"Invalid latitude value: '{lat_raw}'. Expected float."
+        }), 400
+
+    try:
+        lon = float(lon_raw)
+        if not (-180.0 <= lon <= 180.0):
+            return jsonify({
+                "success": False,
+                "error": "Longitude must be between -180 and 180 degrees."
+            }), 400
+    except ValueError:
+        return jsonify({
+            "success": False,
+            "error": f"Invalid longitude value: '{lon_raw}'. Expected float."
+        }), 400
+
+    # 2. Authenticate
+    token, err_dict, status_code = get_sentinel_token()
+    if not token:
+        return jsonify(err_dict), status_code
+
+    base_url = os.environ.get("SENTINEL_BASE_URL", SENTINEL_BASE_URL).rstrip("/")
+
+    # 3. Resolve the acquisition timestamp/date
+    time_from = None
+    time_to = None
+
+    # Check if date/datetime passed explicitly in query args
+    if request.args.get("datetime"):
+        dt_param = request.args.get("datetime").strip()
+        try:
+            dt = datetime.fromisoformat(dt_param.replace("Z", "+00:00"))
+            time_from = (dt - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            time_to = (dt + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            time_from = f"{dt_param[:10]}T00:00:00Z"
+            time_to = f"{dt_param[:10]}T23:59:59Z"
+    elif request.args.get("date"):
+        d_param = request.args.get("date").strip()
+        time_from = f"{d_param}T00:00:00Z"
+        time_to = f"{d_param}T23:59:59Z"
+
+    # Query STAC catalog by ID to get the exact datetime if not yet resolved
+    if not time_from:
+        stac_search_url = f"{base_url}/catalog/1.0.0/search"
+        try:
+            stac_resp = requests.post(
+                stac_search_url,
+                json={"collections": ["sentinel-2-l2a"], "ids": [acquisition_id]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                timeout=15
+            )
+            if stac_resp.status_code == 200:
+                features = stac_resp.json().get("features", [])
+                if features:
+                    dt_str = features[0].get("properties", {}).get("datetime")
+                    if dt_str:
+                        try:
+                            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                            time_from = (dt - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            time_to = (dt + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        except Exception:
+                            date_part = dt_str.split("T")[0]
+                            time_from = f"{date_part}T00:00:00Z"
+                            time_to = f"{date_part}T23:59:59Z"
+        except Exception:
+            pass
+
+    # Extract timestamp from standard Sentinel-2 product name if still not resolved
+    if not time_from:
+        match = re.search(r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})", acquisition_id)
+        if match:
+            y, m, d, H, M, S = match.groups()
+            dt = datetime(int(y), int(m), int(d), int(H), int(M), int(S))
+            time_from = (dt - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            time_to = (dt + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            match_date = re.search(r"(\d{4})-(\d{2})-(\d{2})", acquisition_id) or re.search(r"(\d{4})(\d{2})(\d{2})", acquisition_id)
+            if match_date:
+                if len(match_date.groups()) == 3:
+                    y, m, d = match_date.groups()
+                else:
+                    s = match_date.group(0)
+                    y, m, d = s[:4], s[4:6], s[6:8]
+                time_from = f"{y}-{m}-{d}T00:00:00Z"
+                time_to = f"{y}-{m}-{d}T23:59:59Z"
+
+    if not time_from:
+        return jsonify({
+            "success": False,
+            "error": f"Could not determine acquisition date for ID '{acquisition_id}'. Please ensure the ID was obtained from /api/sentinel/search."
+        }), 404
+
+    # 4. Small geographic bounding box around coordinates (~2.5 km box)
+    delta_deg = 0.023
+    min_lon = round(lon - delta_deg / 2, 6)
+    max_lon = round(lon + delta_deg / 2, 6)
+    min_lat = round(lat - delta_deg / 2, 6)
+    max_lat = round(lat + delta_deg / 2, 6)
+    bbox = [min_lon, min_lat, max_lon, max_lat]
+
+    # 5. Request 512x512 RGB from Sentinel Hub Process API
+    process_url = f"{base_url}/process"
+
+    evalscript = """//VERSION=3
+function setup() {
+  return {
+    input: ["B04", "B03", "B02"],
+    output: { bands: 3 }
+  };
+}
+
+function evaluatePixel(sample) {
+  return [2.5 * sample.B04, 2.5 * sample.B03, 2.5 * sample.B02];
+}
+"""
+
+    process_payload = {
+        "input": {
+            "bounds": {
+                "bbox": bbox,
+                "properties": {
+                    "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"
+                }
+            },
+            "data": [
+                {
+                    "type": "sentinel-2-l2a",
+                    "dataFilter": {
+                        "timeRange": {
+                            "from": time_from,
+                            "to": time_to
+                        },
+                        "mosaickingOrder": "mostRecent"
+                    }
+                }
+            ]
+        },
+        "output": {
+            "width": 512,
+            "height": 512,
+            "responses": [
+                {
+                    "identifier": "default",
+                    "format": {
+                        "type": "image/png"
+                    }
+                }
+            ]
+        },
+        "evalscript": evalscript
+    }
+
+    try:
+        proc_resp = requests.post(
+            process_url,
+            json=process_payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "image/png"
+            },
+            timeout=30
+        )
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "success": False,
+            "error": f"Network error connecting to Sentinel Hub Process API: {str(e)}"
+        }), 503
+
+    if proc_resp.status_code != 200:
+        err_msg = "Sentinel Hub cannot provide the requested image."
+        try:
+            err_json = proc_resp.json()
+            err_msg = err_json.get("error", {}).get("message") or err_json.get("description") or err_msg
+        except Exception:
+            err_msg = proc_resp.text[:300] or err_msg
+
+        return jsonify({
+            "success": False,
+            "error": f"Sentinel Hub cannot provide the requested image (HTTP {proc_resp.status_code}): {err_msg}"
+        }), proc_resp.status_code
+
+    # 6. Verify image content with PIL
+    try:
+        test_img = Image.open(io.BytesIO(proc_resp.content))
+        test_img.verify()
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Invalid or corrupted image received from Sentinel Hub: {str(e)}"
+        }), 502
+
+    # 7. Return in browser-friendly format
+    req_format = (request.args.get("format") or "").lower()
+    accept_header = request.headers.get("Accept", "")
+
+    if req_format == "json" or ("application/json" in accept_header and req_format != "png"):
+        b64_str = base64.b64encode(proc_resp.content).decode("utf-8")
+        return jsonify({
+            "success": True,
+            "acquisition_id": acquisition_id,
+            "latitude": lat,
+            "longitude": lon,
+            "bbox": bbox,
+            "width": 512,
+            "height": 512,
+            "image": f"data:image/png;base64,{b64_str}",
+            "time_range": {
+                "from": time_from,
+                "to": time_to
+            }
+        }), 200
+
+    # Direct browser-friendly PNG response
+    return Response(
+        proc_resp.content,
+        mimetype="image/png",
+        headers={
+            "Content-Type": "image/png",
+            "Content-Disposition": f"inline; filename={acquisition_id}_preview.png",
+            "X-Acquisition-ID": acquisition_id,
+            "X-Sentinel-BBox": f"{bbox}"
+        }
+    )
 
 
 @app.route("/api/gis/regions", methods=["GET"])

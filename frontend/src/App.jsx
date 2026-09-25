@@ -27,6 +27,13 @@ export default function App() {
   const [gisOpacity, setGisOpacity] = useState(0.8);
   const [gisMetrics, setGisMetrics] = useState(null);
 
+  // Sentinel-2 Preview State
+  const [sentinelLoading, setSentinelLoading] = useState(false);
+  const [sentinelStatusMsg, setSentinelStatusMsg] = useState('');
+  const [sentinelAcquisition, setSentinelAcquisition] = useState(null);
+  const [sentinelAcquisitions, setSentinelAcquisitions] = useState([]);
+  const [selectedAcquisitionId, setSelectedAcquisitionId] = useState(null);
+
   // Stage 1 State
   const [s1Sample, setS1Sample] = useState('');
   const [s1File, setS1File] = useState(null);
@@ -166,6 +173,92 @@ export default function App() {
         setLoading(false);
         console.error(err);
         alert("Failed to connect to backend server!");
+      });
+  };
+
+  // Load specific Sentinel-2 acquisition onto Leaflet map
+  const loadSentinelAcquisition = (acq) => {
+    setSelectedAcquisitionId(acq.id);
+    setSentinelAcquisition(acq);
+    setSentinelLoading(true);
+    setSentinelStatusMsg("Loading Sentinel image...");
+
+    const lat = -3.4653;
+    const lon = -62.2159;
+
+    fetch(`/api/sentinel/preview?acquisition_id=${encodeURIComponent(acq.id)}&lat=${lat}&lon=${lon}&format=json`)
+      .then(res => res.json().then(pData => ({ ok: res.ok, pData })))
+      .then(({ ok, pData }) => {
+        setSentinelLoading(false);
+
+        if (!ok || !pData.success || !pData.image) {
+          setSentinelStatusMsg(pData.error || "Failed to load Sentinel preview image.");
+          return;
+        }
+
+        setSentinelStatusMsg("Sentinel-2 imagery loaded");
+
+        // Display on Leaflet map using existing image overlay mechanism
+        const map = mapInstanceRef.current;
+        if (map) {
+          if (overlayRef.current) map.removeLayer(overlayRef.current);
+          if (boundsRef.current) map.removeLayer(boundsRef.current);
+
+          const bbox = pData.bbox || [-62.2274, -3.4768, -62.2044, -3.4538];
+          const bounds = L.latLngBounds([
+            [bbox[1], bbox[0]],
+            [bbox[3], bbox[2]]
+          ]);
+
+          boundsRef.current = L.rectangle(bounds, {
+            color: "#3b82f6",
+            weight: 2,
+            fill: false,
+            dashArray: "4, 4"
+          }).addTo(map);
+
+          overlayRef.current = L.imageOverlay(pData.image, bounds, { opacity: gisOpacity }).addTo(map);
+          map.fitBounds(bounds, { padding: [30, 30] });
+        }
+      })
+      .catch(err => {
+        setSentinelLoading(false);
+        setSentinelStatusMsg(err.message || "Failed to connect to Sentinel API.");
+      });
+  };
+
+  // Load Sentinel-2 Live Satellite Preview & fetch historical acquisitions
+  const handleLoadSentinelPreview = () => {
+    const lat = -3.4653;
+    const lon = -62.2159;
+    const startDate = '2024-08-01';
+    const endDate = '2024-08-31';
+
+    setSentinelLoading(true);
+    setSentinelStatusMsg("Searching Sentinel imagery...");
+    setSentinelAcquisition(null);
+    setSentinelAcquisitions([]);
+    setSelectedAcquisitionId(null);
+
+    fetch(`/api/sentinel/search?lat=${lat}&lon=${lon}&start_date=${startDate}&end_date=${endDate}`)
+      .then(res => res.json().then(data => ({ ok: res.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok || !data.success || !data.acquisitions || data.acquisitions.length === 0) {
+          setSentinelLoading(false);
+          setSentinelStatusMsg(data.message || data.error || "No matching Sentinel-2 acquisitions found.");
+          return;
+        }
+
+        // Sort acquisitions chronologically (oldest to newest) for timeline display
+        const sorted = [...data.acquisitions].sort((a, b) => (a.datetime || '').localeCompare(b.datetime || ''));
+        setSentinelAcquisitions(sorted);
+
+        // Automatically load the first acquisition into view
+        loadSentinelAcquisition(sorted[0]);
+      })
+      .catch(err => {
+        setSentinelLoading(false);
+        setSentinelStatusMsg(err.message || "Failed to connect to Sentinel API.");
       });
   };
 
@@ -455,6 +548,112 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {/* Sentinel-2 Live Satellite Preview Control */}
+                <div className="glass-card" style={{ marginTop: 16 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <h3 className="panel-heading" style={{ margin: 0, fontSize: '0.95rem' }}>Sentinel Preview</h3>
+                    <span style={{ fontSize: '0.7rem', background: 'rgba(59,130,246,0.12)', color: '#2563eb', padding: '2px 7px', borderRadius: 4, fontWeight: 600 }}>
+                      Sentinel-2 L2A
+                    </span>
+                  </div>
+                  
+                  <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: 12 }}>
+                    Query live optical satellite imagery for Amazon Basin coordinates (-3.4653, -62.2159).
+                  </p>
+
+                  <button 
+                    className="btn btn-primary full-width"
+                    style={{ background: '#2563eb' }}
+                    onClick={handleLoadSentinelPreview}
+                    disabled={sentinelLoading}
+                  >
+                    {sentinelLoading ? (
+                      <span>{sentinelStatusMsg || "Searching Sentinel imagery..."}</span>
+                    ) : (
+                      <>
+                        <Globe size={16} /> Load Sentinel Preview
+                      </>
+                    )}
+                  </button>
+
+                  {sentinelStatusMsg && (
+                    <div style={{ 
+                      marginTop: 10, 
+                      padding: '8px 10px', 
+                      borderRadius: 6, 
+                      fontSize: '0.78rem',
+                      background: sentinelStatusMsg === 'Sentinel-2 imagery loaded' 
+                        ? 'rgba(16,185,129,0.12)' 
+                        : (sentinelLoading ? 'rgba(59,130,246,0.1)' : 'rgba(239,68,68,0.1)'),
+                      color: sentinelStatusMsg === 'Sentinel-2 imagery loaded' 
+                        ? '#059669' 
+                        : (sentinelLoading ? '#2563eb' : '#dc2626'),
+                      fontWeight: 500
+                    }}>
+                      {sentinelStatusMsg}
+                    </div>
+                  )}
+
+                  {/* Horizontal Date Timeline / List */}
+                  {sentinelAcquisitions && sentinelAcquisitions.length > 0 && (
+                    <div style={{ marginTop: 14 }}>
+                      <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-main)', marginBottom: 8 }}>
+                        Sentinel-2 Historical Images
+                      </div>
+                      <div style={{
+                        display: 'flex',
+                        gap: 8,
+                        overflowX: 'auto',
+                        paddingBottom: 6,
+                        scrollbarWidth: 'thin'
+                      }}>
+                        {sentinelAcquisitions.map((acq, index) => {
+                          const dateOnly = acq.datetime ? acq.datetime.slice(0, 10) : (acq.date || `Acq ${index + 1}`);
+                          const cloudStr = acq.cloud_coverage !== undefined && acq.cloud_coverage !== null ? `${acq.cloud_coverage}%` : '';
+                          const isSelected = selectedAcquisitionId === acq.id;
+                          return (
+                            <button
+                              key={acq.id || index}
+                              onClick={() => loadSentinelAcquisition(acq)}
+                              disabled={sentinelLoading && isSelected}
+                              style={{
+                                flexShrink: 0,
+                                padding: '6px 10px',
+                                borderRadius: 8,
+                                border: isSelected ? '2px solid #2563eb' : '1px solid var(--border-color)',
+                                background: isSelected ? '#2563eb' : '#ffffff',
+                                color: isSelected ? '#ffffff' : 'var(--text-main)',
+                                fontSize: '0.76rem',
+                                fontWeight: isSelected ? 600 : 500,
+                                cursor: 'pointer',
+                                transition: 'all 0.15s ease',
+                                boxShadow: isSelected ? '0 2px 6px rgba(37, 99, 235, 0.25)' : 'none',
+                                whiteSpace: 'nowrap'
+                              }}
+                              title={`Acquisition ID: ${acq.id}`}
+                            >
+                              {cloudStr ? `[${dateOnly} | ${cloudStr}]` : `[${dateOnly}]`}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {sentinelAcquisition && (
+                    <div style={{ marginTop: 10, padding: '8px 10px', background: 'var(--bg-main)', borderRadius: 6, fontSize: '0.75rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                      <div><strong>Active Acquisition:</strong></div>
+                      <div><strong>Date:</strong> {sentinelAcquisition.datetime}</div>
+                      {sentinelAcquisition.cloud_coverage !== undefined && (
+                        <div><strong>Cloud Cover:</strong> {sentinelAcquisition.cloud_coverage}%</div>
+                      )}
+                      <div style={{ wordBreak: 'break-all', marginTop: 2 }}>
+                        <strong>ID:</strong> {sentinelAcquisition.id}
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="glass-card map-container">
@@ -469,6 +668,10 @@ export default function App() {
                   <div className="legend-item">
                     <span className="legend-color legend-red"></span>
                     <span>Stage 2: Deforestation Loss</span>
+                  </div>
+                  <div className="legend-item">
+                    <span className="legend-color" style={{ background: '#3b82f6' }}></span>
+                    <span>Sentinel-2 Satellite RGB</span>
                   </div>
                 </div>
               </div>

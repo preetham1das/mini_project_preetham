@@ -7,6 +7,8 @@ __pycache__/
 venv/
 ENV/
 env/
+.env
+.env.local
 
 # System / Tools
 .tokencap/
