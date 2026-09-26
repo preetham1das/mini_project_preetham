@@ -35,6 +35,11 @@ import {
   GitCompare,
   Info,
   AlertTriangle,
+  CheckCircle2,
+  ArrowRight,
+  Activity,
+  Sparkles,
+  Clock,
 } from 'lucide-react';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -160,7 +165,11 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   const [analysisError,   setAnalysisError]   = useState('');
   const [analysisResult,  setAnalysisResult]  = useState(null);
   const [analysisOverlayVisible, setAnalysisOverlayVisible] = useState(true);
+  const [overlayOpacity, setOverlayOpacity] = useState(0.55);
   const analysisLayerRef = useRef(null); // L.imageOverlay for analysis overlay
+  // Layer view mode on the Leaflet map: 'before' | 'after' | 'blend'
+  const [mapViewMode, setMapViewMode] = useState('after');
+  const [previewModalImg, setPreviewModalImg] = useState(null);
 
   // AI overlay
   const [aiLayerVisible, setAiLayerVisible] = useState(true);
@@ -242,8 +251,28 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   // ── Opacity ──────────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(sentinelOpacity);
-  }, [sentinelOpacity]);
+    if (!sentinelVisible) {
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(0);
+      return;
+    }
+    if (mapViewMode === 'before') {
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(sentinelOpacity);
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
+    } else if (mapViewMode === 'after') {
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(sentinelOpacity);
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(0);
+    } else if (mapViewMode === 'blend') {
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(sentinelOpacity * 0.65);
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(sentinelOpacity * 0.65);
+    }
+  }, [mapViewMode, sentinelOpacity, sentinelVisible, fromData, toData]);
+
+  useEffect(() => {
+    if (analysisLayerRef.current) {
+      analysisLayerRef.current.setOpacity(analysisOverlayVisible ? overlayOpacity : 0);
+    }
+  }, [overlayOpacity, analysisOverlayVisible]);
 
   useEffect(() => {
     if (aiLayerRef.current) aiLayerRef.current.setOpacity(aiLayerVisible ? (aiOpacity ?? 0.8) : 0);
@@ -640,7 +669,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
         );
         if (map) {
           analysisLayerRef.current = L.imageOverlay(data.deforestation_overlay, imgBounds, {
-            opacity: 0.75, zIndex: 400,
+            opacity: overlayOpacity, zIndex: 400,
           }).addTo(map);
         }
       }
@@ -651,18 +680,33 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
     } finally {
       setAnalysing(false);
     }
-  }, [fromData, toData, aoiBounds]);
+  }, [fromData, toData, aoiBounds, overlayOpacity]);
 
   // Toggle analysis overlay visibility
   const toggleAnalysisOverlay = useCallback(() => {
-    if (!analysisLayerRef.current) return;
-    if (analysisOverlayVisible) {
-      analysisLayerRef.current.setOpacity(0);
-    } else {
-      analysisLayerRef.current.setOpacity(0.75);
-    }
     setAnalysisOverlayVisible(v => !v);
-  }, [analysisOverlayVisible]);
+  }, []);
+
+  // Toggle sentinel layer visibility
+  const toggleSentinel = useCallback(() => {
+    setSentinelVisible(v => !v);
+  }, []);
+
+  // Clear Sentinel layers and reset selections
+  const clearSentinel = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (sentinelLayerRef.current) { map.removeLayer(sentinelLayerRef.current); sentinelLayerRef.current = null; }
+    if (beforeLayerRef.current)   { map.removeLayer(beforeLayerRef.current);   beforeLayerRef.current = null; }
+    if (analysisLayerRef.current) { map.removeLayer(analysisLayerRef.current); analysisLayerRef.current = null; }
+    setFromIdx(null);
+    setToIdx(null);
+    setFromData(null);
+    setToData(null);
+    setAnalysisResult(null);
+    setAnalysisError('');
+    setPreviewError('');
+  }, []);
 
   // Fit map to AOI
   const fitToAoi = useCallback(() => {
@@ -837,62 +881,440 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
           )}
         </div>
 
-        {/* Sentinel Layer Controls (only when loaded) */}
-        {activeAcqMeta && (
-          <div className="glass-card" style={{ padding: 16 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-              <span style={{ fontWeight: 700, fontSize: '0.88rem' }}>Active Sentinel Layer</span>
-              <div style={{ display: 'flex', gap: 6 }}>
+        {/* Before / After Temporal U-Net Workflow Card */}
+        <div className="glass-card" style={{ padding: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <GitCompare size={15} color="#059669" />
+              <span style={{ fontWeight: 700, fontSize: '0.9rem' }}>Before / After Analysis</span>
+            </div>
+            {(fromData || toData) && (
+              <button
+                onClick={clearSentinel}
+                style={{
+                  background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 6,
+                  padding: '3px 7px', cursor: 'pointer', color: '#dc2626',
+                  fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: 4,
+                }}
+                title="Reset selections"
+              >
+                <X size={12} /> Reset
+              </button>
+            )}
+          </div>
+
+          <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', margin: '0 0 10px 0', lineHeight: 1.4 }}>
+            Choose a <strong>FROM</strong> date and a <strong>TO</strong> date from the timeline to feed into the 9-channel Temporal U-Net.
+          </p>
+
+          {/* Selected FROM / TO Cards */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+            {/* FROM / T1 Card */}
+            <div style={{
+              padding: '10px 10px',
+              borderRadius: 10,
+              border: fromData ? '1.5px solid #f59e0b' : '1.5px dashed var(--border-color)',
+              background: fromData ? '#fffdf7' : 'var(--bg-main)',
+              boxShadow: fromData ? '0 2px 8px rgba(245, 158, 11, 0.12)' : 'none',
+              display: 'flex', flexDirection: 'column', gap: 6,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{
+                  fontSize: '0.72rem', fontWeight: 800, color: '#b45309',
+                  background: '#fef3c7', border: '1px solid #fde68a',
+                  padding: '2px 7px', borderRadius: 4, letterSpacing: '0.3px',
+                }}>
+                  FROM / T1
+                </span>
+                {fromData && (
+                  <span style={{ fontSize: '0.68rem', fontWeight: 600, color: cloudColor(fromData.acq.cloud_coverage) }}>
+                    ☁ {fmtCloud(fromData.acq.cloud_coverage)}
+                  </span>
+                )}
+              </div>
+
+              <div style={{
+                fontSize: fromData ? '0.96rem' : '0.78rem',
+                fontWeight: 800,
+                color: fromData ? 'var(--text-main)' : 'var(--text-muted)',
+                lineHeight: 1.2,
+              }}>
+                {fromData ? formatDate(fromData.acq.datetime) : 'Choose FROM date'}
+              </div>
+
+              {fromData ? (
+                <img
+                  src={fromData.image}
+                  alt="FROM preview"
+                  onClick={() => setPreviewModalImg({ title: `Before Image (T1: ${formatDate(fromData.acq.datetime)})`, image: fromData.image })}
+                  style={{ width: '100%', height: 48, borderRadius: 6, objectFit: 'cover', border: '1px solid #fcd34d', cursor: 'pointer' }}
+                  title="Click to zoom Before image"
+                />
+              ) : (
+                <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', lineHeight: 1.3 }}>
+                  Click "Set FROM" in timeline
+                </div>
+              )}
+            </div>
+
+            {/* TO / T2 Card */}
+            <div style={{
+              padding: '10px 10px',
+              borderRadius: 10,
+              border: toData ? '1.5px solid #2563eb' : '1.5px dashed var(--border-color)',
+              background: toData ? '#f8faff' : 'var(--bg-main)',
+              boxShadow: toData ? '0 2px 8px rgba(37, 99, 235, 0.12)' : 'none',
+              display: 'flex', flexDirection: 'column', gap: 6,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{
+                  fontSize: '0.72rem', fontWeight: 800, color: '#1d4ed8',
+                  background: '#dbeafe', border: '1px solid #bfdbfe',
+                  padding: '2px 7px', borderRadius: 4, letterSpacing: '0.3px',
+                }}>
+                  TO / T2
+                </span>
+                {toData && (
+                  <span style={{ fontSize: '0.68rem', fontWeight: 600, color: cloudColor(toData.acq.cloud_coverage) }}>
+                    ☁ {fmtCloud(toData.acq.cloud_coverage)}
+                  </span>
+                )}
+              </div>
+
+              <div style={{
+                fontSize: toData ? '0.96rem' : '0.78rem',
+                fontWeight: 800,
+                color: toData ? 'var(--text-main)' : 'var(--text-muted)',
+                lineHeight: 1.2,
+              }}>
+                {toData ? formatDate(toData.acq.datetime) : 'Choose TO date'}
+              </div>
+
+              {toData ? (
+                <img
+                  src={toData.image}
+                  alt="TO preview"
+                  onClick={() => setPreviewModalImg({ title: `After Image (T2: ${formatDate(toData.acq.datetime)})`, image: toData.image })}
+                  style={{ width: '100%', height: 48, borderRadius: 6, objectFit: 'cover', border: '1px solid #bfdbfe', cursor: 'pointer' }}
+                  title="Click to zoom After image"
+                />
+              ) : (
+                <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', lineHeight: 1.3 }}>
+                  Click "Set TO" in timeline
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Map Layer View Switcher (when either or both loaded) */}
+          {(fromData || toData) && (
+            <div style={{ marginTop: 6, paddingTop: 8, borderTop: '1px solid var(--border-color)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Satellite Map Display
+                </span>
                 <button
                   onClick={toggleSentinel}
-                  style={{ background: 'none', border: '1px solid var(--border-color)', borderRadius: 6, padding: '4px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
-                  title={sentinelVisible ? 'Hide layer' : 'Show layer'}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}
+                  title={sentinelVisible ? 'Hide satellite layer' : 'Show satellite layer'}
                 >
                   {sentinelVisible ? <Eye size={13} /> : <EyeOff size={13} />}
                 </button>
-                <button
-                  onClick={clearSentinel}
-                  style={{ background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: 6, padding: '4px 8px', cursor: 'pointer', color: '#dc2626', display: 'flex', alignItems: 'center' }}
-                  title="Remove Sentinel layer"
-                >
-                  <X size={13} />
-                </button>
+              </div>
+
+              {fromData && toData && (
+                <div className="toggle-group" style={{ marginBottom: 8 }}>
+                  <button
+                    className={`btn-toggle${mapViewMode === 'before' ? ' active' : ''}`}
+                    onClick={() => setMapViewMode('before')}
+                    style={{ fontSize: '0.72rem', padding: '5px 8px' }}
+                  >
+                    Before (T1)
+                  </button>
+                  <button
+                    className={`btn-toggle${mapViewMode === 'after' ? ' active' : ''}`}
+                    onClick={() => setMapViewMode('after')}
+                    style={{ fontSize: '0.72rem', padding: '5px 8px' }}
+                  >
+                    After (T2)
+                  </button>
+                  <button
+                    className={`btn-toggle${mapViewMode === 'blend' ? ' active' : ''}`}
+                    onClick={() => setMapViewMode('blend')}
+                    style={{ fontSize: '0.72rem', padding: '5px 8px' }}
+                  >
+                    Blend 50/50
+                  </button>
+                </div>
+              )}
+
+              {/* Opacity slider */}
+              <div>
+                <div className="slider-header" style={{ fontSize: '0.72rem' }}>
+                  <span>Satellite Opacity</span>
+                  <span>{Math.round(sentinelOpacity * 100)}%</span>
+                </div>
+                <input
+                  type="range" min="0" max="1" step="0.05"
+                  value={sentinelOpacity}
+                  onChange={e => setSentinelOpacity(parseFloat(e.target.value))}
+                />
               </div>
             </div>
+          )}
 
-            <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-              <div><strong style={{ color: 'var(--text-main)' }}>{formatDate(activeAcqMeta.datetime)}</strong></div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
-                <Cloud size={11} color={cloudColor(activeAcqMeta.cloud_coverage)} />
-                <span style={{ color: cloudColor(activeAcqMeta.cloud_coverage) }}>
-                  {fmtCloud(activeAcqMeta.cloud_coverage)} cloud cover
+          {/* Primary Action Button: Analyze Deforestation */}
+          <button
+            className="btn full-width"
+            style={{
+              padding: '13px 18px',
+              fontSize: '0.92rem',
+              fontWeight: 800,
+              letterSpacing: '0.3px',
+              background: canAnalyze ? 'linear-gradient(135deg, #059669 0%, #047857 100%)' : '#e2e8f0',
+              color: canAnalyze ? '#ffffff' : '#94a3b8',
+              border: canAnalyze ? 'none' : '1px solid var(--border-color)',
+              cursor: canAnalyze ? 'pointer' : 'not-allowed',
+              boxShadow: canAnalyze ? '0 5px 16px rgba(5, 150, 105, 0.4)' : 'none',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              marginTop: 12,
+              borderRadius: 9,
+              transition: 'all 0.2s',
+            }}
+            disabled={!canAnalyze}
+            onClick={runAnalysis}
+          >
+            {analysing ? (
+              <>
+                <Loader size={17} style={{ animation: 'spin 1s linear infinite' }} />
+                Processing Temporal U-Net…
+              </>
+            ) : (
+              <>
+                <Activity size={18} />
+                Analyze Deforestation
+              </>
+            )}
+          </button>
+
+          {/* Validation & helper messages */}
+          {!aoiBounds && (
+            <div style={{ marginTop: 6, fontSize: '0.72rem', color: 'var(--text-muted)', textAlign: 'center' }}>
+              Draw an AOI on the map to begin.
+            </div>
+          )}
+          {aoiBounds && (!fromData || !toData) && (
+            <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#b45309', textAlign: 'center' }}>
+              {!fromData && !toData && 'Select both FROM and TO dates from the timeline below.'}
+              {fromData && !toData && 'Now select a TO date from the timeline.'}
+              {!fromData && toData && 'Now select a FROM date from the timeline.'}
+            </div>
+          )}
+          {fromIdx !== null && toIdx !== null && fromIdx === toIdx && (
+            <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#dc2626', textAlign: 'center', fontWeight: 600 }}>
+              ⚠️ FROM and TO dates must be different.
+            </div>
+          )}
+          {analysisError && (
+            <div style={{ marginTop: 8, padding: '8px 10px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, fontSize: '0.76rem', color: '#b91c1c' }}>
+              {analysisError}
+            </div>
+          )}
+        </div>
+
+        {/* Deforestation Analysis Results Card */}
+        {analysisResult && (
+          <div className="glass-card" style={{ padding: 16, border: '1.5px solid #059669', background: '#f0fdf4' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <CheckCircle2 size={16} color="#059669" />
+                <span style={{ fontWeight: 800, fontSize: '0.92rem', color: '#065f46' }}>
+                  Deforestation Results
                 </span>
               </div>
+              <span style={{ fontSize: '0.68rem', fontWeight: 700, background: '#dcfce7', color: '#166534', padding: '2px 8px', borderRadius: 10, border: '1px solid #86efac' }}>
+                Temporal U-Net
+              </span>
             </div>
 
-            {/* Opacity slider */}
-            <div>
-              <div className="slider-header">
-                <span>Opacity</span>
-                <span>{Math.round(sentinelOpacity * 100)}%</span>
-              </div>
-              <input
-                type="range" min="0" max="1" step="0.05"
-                value={sentinelOpacity}
-                onChange={e => setSentinelOpacity(parseFloat(e.target.value))}
-              />
+            {/* Short Plain-Language Summary */}
+            <div style={{
+              padding: '8px 10px',
+              background: '#ffffff',
+              borderRadius: 8,
+              border: '1px solid #a7f3d0',
+              fontSize: '0.76rem',
+              color: '#065f46',
+              lineHeight: 1.4,
+              marginBottom: 10,
+            }}>
+              <strong>Summary:</strong> Detected forest-cover change between <strong>{analysisResult.date_before}</strong> and <strong>{analysisResult.date_after}</strong> across the selected Area of Interest.
             </div>
 
-            {/* Before/After compare */}
-            {beforeMeta && (
-              <div style={{ marginTop: 12 }}>
-                <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Compare Mode</div>
-                <div className="toggle-group">
-                  <button className={`btn-toggle${compareMode === false ? ' active' : ''}`} onClick={() => activateCompare(false)}>Off</button>
-                  <button className={`btn-toggle${compareMode === 'opacity' ? ' active' : ''}`} onClick={() => activateCompare('opacity')}>Opacity</button>
+            {/* Metrics Grid — 4 Easy to Scan Tiles */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+              {/* Metric 1: Deforestation % */}
+              <div style={{ background: '#fee2e2', borderRadius: 8, padding: '10px 10px', border: '1px solid #fecaca' }}>
+                <div style={{ fontSize: '0.68rem', color: '#991b1b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Deforestation
+                </div>
+                <div style={{ fontSize: '1.45rem', fontWeight: 900, color: '#dc2626', lineHeight: 1.15, marginTop: 2 }}>
+                  {analysisResult.deforestation_pct}%
+                </div>
+                <div style={{ fontSize: '0.68rem', color: '#b91c1c', marginTop: 2 }}>
+                  Canopy Loss Detected
                 </div>
               </div>
-            )}
+
+              {/* Metric 2: Estimated Hectares */}
+              <div style={{ background: '#fff1f2', borderRadius: 8, padding: '10px 10px', border: '1px solid #ffe4e6' }}>
+                <div style={{ fontSize: '0.68rem', color: '#9f1239', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Estimated Area
+                </div>
+                <div style={{ fontSize: '1.45rem', fontWeight: 900, color: '#be123c', lineHeight: 1.15, marginTop: 2 }}>
+                  {analysisResult.deforestation_hectares} <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>ha</span>
+                </div>
+                <div style={{ fontSize: '0.68rem', color: '#9f1239', marginTop: 2 }}>
+                  Physical Forest Loss
+                </div>
+              </div>
+
+              {/* Metric 3: Estimated km² */}
+              <div style={{ background: '#f8fafc', borderRadius: 8, padding: '10px 10px', border: '1px solid #e2e8f0' }}>
+                <div style={{ fontSize: '0.68rem', color: '#475569', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Estimated km²
+                </div>
+                <div style={{ fontSize: '1.45rem', fontWeight: 900, color: '#1e293b', lineHeight: 1.15, marginTop: 2 }}>
+                  {analysisResult.deforestation_sqkm} <span style={{ fontSize: '0.8rem', fontWeight: 700 }}>km²</span>
+                </div>
+                <div style={{ fontSize: '0.68rem', color: '#64748b', marginTop: 2 }}>
+                  Square Kilometers
+                </div>
+              </div>
+
+              {/* Metric 4: Stable Forest % */}
+              <div style={{ background: '#ecfdf5', borderRadius: 8, padding: '10px 10px', border: '1px solid #a7f3d0' }}>
+                <div style={{ fontSize: '0.68rem', color: '#065f46', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Stable Forest
+                </div>
+                <div style={{ fontSize: '1.45rem', fontWeight: 900, color: '#059669', lineHeight: 1.15, marginTop: 2 }}>
+                  {analysisResult.stable_pct}%
+                </div>
+                <div style={{ fontSize: '0.68rem', color: '#047857', marginTop: 2 }}>
+                  Preserved Canopy
+                </div>
+              </div>
+            </div>
+
+            {/* Red Change Overlay Display & Adjustable Opacity */}
+            <div style={{ background: '#ffffff', borderRadius: 8, padding: '10px 12px', border: '1px solid #e2e8f0', marginBottom: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span style={{ fontSize: '0.72rem', fontWeight: 700, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Map Change Overlay
+                </span>
+                <button
+                  onClick={toggleAnalysisOverlay}
+                  style={{
+                    background: analysisOverlayVisible ? '#fee2e2' : '#f1f5f9',
+                    border: analysisOverlayVisible ? '1px solid #fca5a5' : '1px solid var(--border-color)',
+                    borderRadius: 5, padding: '2px 8px', cursor: 'pointer',
+                    color: analysisOverlayVisible ? '#dc2626' : '#64748b',
+                    fontSize: '0.7rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4,
+                  }}
+                  title="Toggle red change mask on map"
+                >
+                  {analysisOverlayVisible ? <Eye size={12} /> : <EyeOff size={12} />}
+                  {analysisOverlayVisible ? 'Overlay Active' : 'Overlay Hidden'}
+                </button>
+              </div>
+
+              {/* Overlay Opacity Slider */}
+              <div>
+                <div className="slider-header" style={{ fontSize: '0.72rem', marginBottom: 3 }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Overlay Opacity</span>
+                  <span style={{ fontWeight: 700, color: '#dc2626' }}>{Math.round(overlayOpacity * 100)}%</span>
+                </div>
+                <input
+                  type="range" min="0.1" max="1.0" step="0.05"
+                  value={overlayOpacity}
+                  onChange={e => setOverlayOpacity(parseFloat(e.target.value))}
+                />
+              </div>
+
+              {/* Legend for the change overlay */}
+              <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid #f1f5f9', display: 'flex', alignItems: 'center', gap: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 10, height: 10, background: '#ef4444', borderRadius: 2 }} />
+                  <span style={{ fontSize: '0.72rem', color: '#dc2626', fontWeight: 700 }}>Red: Deforestation Loss</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <div style={{ width: 10, height: 10, background: '#10b981', borderRadius: 2 }} />
+                  <span style={{ fontSize: '0.72rem', color: '#059669', fontWeight: 700 }}>Green: Stable Forest</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Clean Before / After Previews */}
+            <div style={{ fontSize: '0.72rem', fontWeight: 700, color: '#334155', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Comparison Previews (Click to Zoom)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
+              {/* Before */}
+              <div
+                style={{ textAlign: 'center', cursor: 'pointer', background: '#fff', borderRadius: 8, padding: 6, border: '1px solid #fef3c7' }}
+                onClick={() => setPreviewModalImg({ title: `Before Satellite Image (T1: ${analysisResult.date_before})`, image: analysisResult.before_image })}
+                title="Click to zoom Before image"
+              >
+                <div style={{ fontSize: '0.68rem', fontWeight: 700, color: '#b45309', marginBottom: 4 }}>
+                  Before: {analysisResult.date_before}
+                </div>
+                <img src={analysisResult.before_image} alt="Before" style={{ width: '100%', height: 64, objectFit: 'cover', borderRadius: 6, border: '1px solid #fde68a' }} />
+              </div>
+
+              {/* After */}
+              <div
+                style={{ textAlign: 'center', cursor: 'pointer', background: '#fff', borderRadius: 8, padding: 6, border: '1px solid #dbeafe' }}
+                onClick={() => setPreviewModalImg({ title: `After Satellite Image (T2: ${analysisResult.date_after})`, image: analysisResult.after_image })}
+                title="Click to zoom After image"
+              >
+                <div style={{ fontSize: '0.68rem', fontWeight: 700, color: '#1d4ed8', marginBottom: 4 }}>
+                  After: {analysisResult.date_after}
+                </div>
+                <img src={analysisResult.after_image} alt="After" style={{ width: '100%', height: 64, objectFit: 'cover', borderRadius: 6, border: '1px solid #bfdbfe' }} />
+              </div>
+
+              {/* Change Mask */}
+              <div
+                style={{ textAlign: 'center', cursor: 'pointer', background: '#fff', borderRadius: 8, padding: 6, border: '1px solid #fee2e2' }}
+                onClick={() => setPreviewModalImg({ title: 'Deforestation Binary Mask (Red = Change)', image: analysisResult.deforestation_mask })}
+                title="Click to zoom Deforestation Mask"
+              >
+                <div style={{ fontSize: '0.68rem', fontWeight: 700, color: '#dc2626', marginBottom: 4 }}>
+                  Deforestation Mask
+                </div>
+                <img src={analysisResult.deforestation_mask} alt="Mask" style={{ width: '100%', height: 64, objectFit: 'cover', borderRadius: 6, border: '1px solid #fca5a5' }} />
+              </div>
+
+              {/* Change Overlay */}
+              <div
+                style={{ textAlign: 'center', cursor: 'pointer', background: '#fff', borderRadius: 8, padding: 6, border: '1px solid #fee2e2' }}
+                onClick={() => setPreviewModalImg({ title: 'Deforestation Overlay on Sentinel After Image', image: analysisResult.deforestation_overlay })}
+                title="Click to zoom Change Overlay"
+              >
+                <div style={{ fontSize: '0.68rem', fontWeight: 700, color: '#dc2626', marginBottom: 4 }}>
+                  Change Overlay
+                </div>
+                <img src={analysisResult.deforestation_overlay} alt="Overlay" style={{ width: '100%', height: 64, objectFit: 'cover', borderRadius: 6, border: '1px solid #fca5a5' }} />
+              </div>
+            </div>
+
+            {/* Model note badge */}
+            <div style={{ padding: '6px 8px', background: '#fffbeb', borderRadius: 6, fontSize: '0.7rem', color: '#92400e', lineHeight: 1.35, border: '1px solid #fde68a' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontWeight: 700, marginBottom: 2 }}>
+                <AlertTriangle size={12} /> Model Verification Notice
+              </div>
+              Temporal U-Net 9-channel inference on live Sentinel-2 L2A optical bands (B04, B03, B02). Seasonal differences or clouds may affect change signals.
+            </div>
           </div>
         )}
 
@@ -923,9 +1345,9 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
           <div style={{ fontWeight: 700, fontSize: '0.82rem', marginBottom: 8 }}>Layer Legend</div>
           {[
             { color: '#f59e0b', label: 'AOI Boundary' },
-            { color: '#3b82f6', label: 'Sentinel-2 RGB' },
-            { color: '#059669', label: 'Stage 1: Forest Canopy' },
-            { color: '#dc2626', label: 'Stage 2: Deforestation' },
+            { color: '#3b82f6', label: 'Sentinel-2 RGB Surface' },
+            { color: '#dc2626', label: 'Deforestation Loss (Temporal U-Net)' },
+            { color: '#059669', label: 'Stage 1 Forest Canopy' },
           ].map(({ color, label }) => (
             <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 5 }}>
               <div style={{ width: 12, height: 12, background: color, borderRadius: 3, flexShrink: 0 }} />
@@ -990,39 +1412,61 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
             borderRadius: 14, padding: '14px 18px',
             boxShadow: 'var(--shadow-md)',
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Calendar size={14} color="#2563eb" />
+                <Calendar size={15} color="#2563eb" />
                 <span style={{ fontWeight: 700, fontSize: '0.88rem' }}>Sentinel-2 Historical Acquisitions</span>
-                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', background: 'var(--bg-main)', padding: '2px 8px', borderRadius: 10, border: '1px solid var(--border-color)' }}>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', background: 'var(--bg-main)', padding: '2px 8px', borderRadius: 10, border: '1px solid var(--border-color)' }}>
                   {acquisitions.length} available
                 </span>
               </div>
-              {beforeIdx !== null && selectedIdx !== null && beforeIdx !== selectedIdx && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: '0.75rem', color: '#2563eb', fontWeight: 600 }}>
-                    Compare: {formatDate(acquisitions[beforeIdx]?.datetime)} → {formatDate(acquisitions[selectedIdx]?.datetime)}
+
+              {/* Status Chips */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.75rem' }}>
+                {fromIdx !== null ? (
+                  <span style={{ background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', padding: '2px 8px', borderRadius: 6, fontWeight: 600 }}>
+                    FROM: {formatDate(acquisitions[fromIdx]?.datetime)}
                   </span>
-                  {!compareMode && beforeMeta && (
-                    <button
-                      onClick={() => activateCompare('opacity')}
-                      style={{ fontSize: '0.72rem', padding: '3px 9px', borderRadius: 6, background: '#dbeafe', color: '#1d4ed8', border: '1px solid #bfdbfe', cursor: 'pointer', fontWeight: 600 }}
-                    >
-                      <GitCompare size={11} style={{ display: 'inline', marginRight: 3 }} />Compare
-                    </button>
-                  )}
-                </div>
-              )}
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>FROM: [Choose below]</span>
+                )}
+                <ArrowRight size={12} color="var(--text-muted)" />
+                {toIdx !== null ? (
+                  <span style={{ background: '#dbeafe', color: '#1e40af', border: '1px solid #bfdbfe', padding: '2px 8px', borderRadius: 6, fontWeight: 600 }}>
+                    TO: {formatDate(acquisitions[toIdx]?.datetime)}
+                  </span>
+                ) : (
+                  <span style={{ color: 'var(--text-muted)' }}>TO: [Choose below]</span>
+                )}
+                {canAnalyze && (
+                  <span style={{ background: '#dcfce7', color: '#166534', border: '1px solid #86efac', padding: '2px 8px', borderRadius: 6, fontWeight: 700 }}>
+                    ✓ Ready to Analyze
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* Timeline scroll */}
-            <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 4, scrollbarWidth: 'thin', alignItems: 'stretch' }}>
+            <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4, scrollbarWidth: 'thin', alignItems: 'stretch' }}>
               {acquisitions.map((acq, idx) => {
-                const isSelected = idx === selectedIdx;
-                const isBefore   = idx === beforeIdx;
+                const isFrom = idx === fromIdx;
+                const isTo   = idx === toIdx;
                 const dateStr = formatDate(acq.datetime);
                 const cc = acq.cloud_coverage;
                 const ccColor = cloudColor(cc);
+
+                let cardBorder = '1px solid var(--border-color)';
+                let cardBg = '#fff';
+                if (isFrom && isTo) {
+                  cardBorder = '2px solid #8b5cf6';
+                  cardBg = '#faf5ff';
+                } else if (isFrom) {
+                  cardBorder = '2px solid #f59e0b';
+                  cardBg = '#fffbeb';
+                } else if (isTo) {
+                  cardBorder = '2px solid #2563eb';
+                  cardBg = '#eff6ff';
+                }
 
                 return (
                   <div
@@ -1030,63 +1474,103 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                     style={{
                       flexShrink: 0,
                       borderRadius: 10,
-                      border: isSelected ? '2px solid #2563eb' : isBefore ? '2px solid #f59e0b' : '1px solid var(--border-color)',
-                      background: isSelected ? '#2563eb' : isBefore ? '#fffbeb' : '#fff',
-                      color: isSelected ? '#fff' : 'var(--text-main)',
-                      cursor: 'pointer',
+                      border: cardBorder,
+                      background: cardBg,
+                      color: 'var(--text-main)',
                       transition: 'all 0.15s',
-                      minWidth: 96,
-                      padding: '7px 10px',
-                      display: 'flex', flexDirection: 'column', gap: 3,
+                      minWidth: 108,
+                      padding: '8px 10px',
+                      display: 'flex', flexDirection: 'column', gap: 4,
                     }}
-                    title={`ID: ${acq.id}`}
+                    title={`Acquisition ID: ${acq.id}\nDate: ${dateStr}\nCloud: ${fmtCloud(cc)}`}
                   >
                     {/* Date */}
-                    <div
-                      style={{ fontSize: '0.78rem', fontWeight: 700, cursor: 'pointer' }}
-                      onClick={() => selectAcquisition(idx)}
-                    >
+                    <div style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-main)' }}>
                       {dateStr}
                     </div>
-                    {/* Cloud */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: '0.7rem', color: isSelected ? 'rgba(255,255,255,0.8)' : ccColor }}>
+
+                    {/* Cloud coverage */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.7rem', color: ccColor }}>
                       <Cloud size={10} />
                       {fmtCloud(cc)}
                     </div>
-                    {/* Before button */}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); selectBeforeAcquisition(idx); }}
-                      style={{
-                        marginTop: 3, fontSize: '0.65rem', fontWeight: 600,
-                        padding: '2px 6px', borderRadius: 5, cursor: 'pointer',
-                        background: isBefore ? '#f59e0b' : (isSelected ? 'rgba(255,255,255,0.2)' : 'var(--bg-main)'),
-                        color: isBefore ? '#fff' : (isSelected ? '#fff' : 'var(--text-muted)'),
-                        border: isBefore ? '1px solid #f59e0b' : '1px solid var(--border-color)',
-                      }}
-                    >
-                      {isBefore ? '★ Before' : 'Set Before'}
-                    </button>
+
+                    {/* Action buttons: Set FROM and Set TO */}
+                    <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                      <button
+                        onClick={() => selectFrom(idx)}
+                        style={{
+                          flex: 1, padding: '3px 4px', fontSize: '0.66rem', fontWeight: 700,
+                          borderRadius: 4, cursor: 'pointer',
+                          background: isFrom ? '#f59e0b' : 'var(--bg-main)',
+                          color: isFrom ? '#fff' : 'var(--text-main)',
+                          border: isFrom ? '1px solid #d97706' : '1px solid var(--border-color)',
+                          boxShadow: isFrom ? '0 2px 6px rgba(245,158,11,0.3)' : 'none',
+                        }}
+                        title="Set as Before (T1)"
+                      >
+                        {isFrom ? '★ FROM' : 'Set FROM'}
+                      </button>
+                      <button
+                        onClick={() => selectTo(idx)}
+                        style={{
+                          flex: 1, padding: '3px 4px', fontSize: '0.66rem', fontWeight: 700,
+                          borderRadius: 4, cursor: 'pointer',
+                          background: isTo ? '#2563eb' : 'var(--bg-main)',
+                          color: isTo ? '#fff' : 'var(--text-main)',
+                          border: isTo ? '1px solid #1d4ed8' : '1px solid var(--border-color)',
+                          boxShadow: isTo ? '0 2px 6px rgba(37,99,235,0.3)' : 'none',
+                        }}
+                        title="Set as After (T2)"
+                      >
+                        {isTo ? '★ TO' : 'Set TO'}
+                      </button>
+                    </div>
                   </div>
                 );
               })}
             </div>
-
-            {/* Compare mode instructions */}
-            {beforeIdx !== null && selectedIdx !== null && beforeIdx !== selectedIdx && !compareMode && beforeMeta && (
-              <div style={{ marginTop: 8, fontSize: '0.76rem', color: '#64748b' }}>
-                Two acquisitions selected. Click <strong>Compare</strong> to overlay them with opacity blending.
-              </div>
-            )}
-            {compareMode === 'opacity' && (
-              <div style={{ marginTop: 8, padding: '6px 12px', background: '#eff6ff', borderRadius: 8, fontSize: '0.76rem', color: '#1d4ed8', display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Info size={12} />
-                Opacity blend: <strong>{formatDate(acquisitions[beforeIdx]?.datetime)}</strong> (Before) and <strong>{formatDate(acquisitions[selectedIdx]?.datetime)}</strong> (After) — each at 50% opacity.
-                <button onClick={() => activateCompare(false)} style={{ marginLeft: 'auto', background: 'none', border: '1px solid #bfdbfe', borderRadius: 5, padding: '2px 8px', cursor: 'pointer', color: '#1d4ed8', fontSize: '0.72rem' }}>Off</button>
-              </div>
-            )}
           </div>
         )}
       </div>
+
+      {/* Lightbox / Preview Zoom Modal */}
+      {previewModalImg && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.75)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999, padding: 20, backdropFilter: 'blur(3px)',
+          }}
+          onClick={() => setPreviewModalImg(null)}
+        >
+          <div
+            style={{
+              background: '#fff', borderRadius: 14, padding: 18, maxWidth: 540, width: '100%',
+              boxShadow: 'var(--shadow-xl)', border: '1px solid var(--border-color)',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h4 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 700, color: 'var(--text-main)' }}>
+                {previewModalImg.title}
+              </h4>
+              <button
+                className="btn"
+                style={{ padding: '4px 8px', fontSize: '0.8rem', background: '#fee2e2', color: '#dc2626', border: '1px solid #fca5a5' }}
+                onClick={() => setPreviewModalImg(null)}
+              >
+                ✕ Close
+              </button>
+            </div>
+            <img
+              src={previewModalImg.image}
+              alt={previewModalImg.title}
+              style={{ width: '100%', height: 'auto', borderRadius: 8, border: '1px solid var(--border-color)', display: 'block' }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
