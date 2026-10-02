@@ -110,8 +110,9 @@ function validateBbox(west, south, east, north) {
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
-const BASE_CENTER = [-3.4653, -62.2159];
-const BASE_ZOOM = 13;
+// Neutral world view (global overview) instead of hardcoded Amazon Basin
+const BASE_CENTER = [20.0, 0.0];
+const BASE_ZOOM = 2;
 
 // ── component ─────────────────────────────────────────────────────────────────
 
