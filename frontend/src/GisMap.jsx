@@ -108,6 +108,82 @@ function validateBbox(west, south, east, north) {
   return null;
 }
 
+/**
+ * Generate a transparent PNG data-URL highlighting cloud/obscured pixels in cyan.
+ * Uses image luminance & saturation thresholding scaled to the known AOI cloud_pct.
+ */
+function generateCloudMaskDataUrl(imgSrc, cloudPct) {
+  return new Promise((resolve) => {
+    if (!imgSrc || !cloudPct || cloudPct <= 0) {
+      resolve(null);
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+        const totalPixels = canvas.width * canvas.height;
+
+        const scores = new Float32Array(totalPixels);
+        for (let i = 0; i < totalPixels; i++) {
+          const off = i * 4;
+          const r = data[off];
+          const g = data[off + 1];
+          const b = data[off + 2];
+          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+          const maxDiff = Math.max(Math.abs(r - g), Math.abs(g - b), Math.abs(b - r));
+          scores[i] = lum - maxDiff * 0.6;
+        }
+
+        const sampleSize = Math.min(totalPixels, 4096);
+        const step = Math.max(1, Math.floor(totalPixels / sampleSize));
+        const sampleScores = [];
+        for (let i = 0; i < totalPixels; i += step) {
+          sampleScores.push(scores[i]);
+        }
+        sampleScores.sort((a, b) => b - a);
+
+        const cutoffIdx = Math.min(
+          sampleScores.length - 1,
+          Math.max(0, Math.floor((cloudPct / 100) * sampleScores.length))
+        );
+        const threshold = sampleScores[cutoffIdx];
+
+        for (let i = 0; i < totalPixels; i++) {
+          const off = i * 4;
+          if (scores[i] >= threshold && scores[i] > 90) {
+            // Cloud/obscured: bright cyan/sky-blue
+            data[off]     = 56;   // R
+            data[off + 1] = 189;  // G
+            data[off + 2] = 248;  // B
+            data[off + 3] = 210;  // Alpha
+          } else {
+            // Clear pixel: transparent
+            data[off]     = 0;
+            data[off + 1] = 0;
+            data[off + 2] = 0;
+            data[off + 3] = 0;
+          }
+        }
+
+        ctx.putImageData(imgData, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      } catch (e) {
+        resolve(null);
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = imgSrc;
+  });
+}
+
 // ── constants ─────────────────────────────────────────────────────────────────
 
 // Neutral world view (global overview) instead of hardcoded Amazon Basin
@@ -175,8 +251,21 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   // AI overlay
   const [aiLayerVisible, setAiLayerVisible] = useState(true);
 
+  // SwinIR super-resolution (visualization only)
+  const [srMode,     setSrMode]     = useState('original'); // 'original' | 'swinir'
+  const [srLoading,  setSrLoading]  = useState(false);
+  const [srData,     setSrData]     = useState(null);       // { image, width, height, note }
+  const [srError,    setSrError]    = useState('');
+  const [srAvailable, setSrAvailable] = useState(null);    // true | false | null (unknown)
+  const srLayerRef = useRef(null);   // L.imageOverlay for SR image (replaces sentinel layer visually)
 
-  // ── Map init ────────────────────────────────────────────────────────────────
+  // AOI-specific Cloud Statistics
+  const [fromCloudStats, setFromCloudStats] = useState(null);
+  const [toCloudStats,   setToCloudStats]   = useState(null);
+  const [loadingFromCloud, setLoadingFromCloud] = useState(false);
+  const [loadingToCloud,   setLoadingToCloud]   = useState(false);
+  const [cloudMaskVisible, setCloudMaskVisible] = useState(false);
+  const cloudLayerRef = useRef(null); // L.imageOverlay for cloud mask
 
   useEffect(() => {
     if (!mapDivRef.current || mapRef.current) return;
@@ -255,8 +344,18 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
     if (!sentinelVisible) {
       if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
       if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(0);
+      if (srLayerRef.current)       srLayerRef.current.setOpacity(0);
       return;
     }
+    if (srMode === 'swinir') {
+      // SwinIR replaces the satellite display: show SwinIR layer with sentinelOpacity, hide originals
+      if (srLayerRef.current)       srLayerRef.current.setOpacity(sentinelOpacity);
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(0);
+      return;
+    }
+    // Normal mode: show original satellite layer(s), hide SwinIR
+    if (srLayerRef.current) srLayerRef.current.setOpacity(0);
     if (mapViewMode === 'before') {
       if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(sentinelOpacity);
       if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
@@ -267,7 +366,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
       if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(sentinelOpacity * 0.65);
       if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(sentinelOpacity * 0.65);
     }
-  }, [mapViewMode, sentinelOpacity, sentinelVisible, fromData, toData]);
+  }, [mapViewMode, sentinelOpacity, sentinelVisible, srMode, fromData, toData]);
 
   useEffect(() => {
     if (analysisLayerRef.current) {
@@ -558,11 +657,34 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   }, [aoiBounds]);
 
   /**
+   * Fetch AOI-specific cloud statistics from /api/sentinel/cloud-stats.
+   */
+  const fetchCloudStats = useCallback(async (acq, bbox) => {
+    if (!acq || !bbox) return null;
+    const bboxStr = `${bbox[0].toFixed(6)},${bbox[1].toFixed(6)},${bbox[2].toFixed(6)},${bbox[3].toFixed(6)}`;
+    const params = new URLSearchParams({
+      acquisition_id: acq.id,
+      bbox: bboxStr,
+    });
+    if (acq.datetime) params.append('datetime', acq.datetime);
+    try {
+      const res = await fetch(`/api/sentinel/cloud-stats?${params}`);
+      const data = await res.json();
+      if (data.success) return data;
+      return null;
+    } catch (err) {
+      console.warn('Failed to fetch AOI cloud stats:', err);
+      return null;
+    }
+  }, []);
+
+  /**
    * Select the FROM date (T1 = Before). Loads the image and shows it on the map.
    */
   const selectFrom = useCallback(async (idx) => {
     setFromIdx(idx);
     setFromData(null);
+    setFromCloudStats(null);
     setAnalysisResult(null);
     setAnalysisError('');
     setPreviewError('');
@@ -579,11 +701,18 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
 
       setFromData({ acq: acquisitions[idx], image: data.image, bbox: data.bbox });
       setLoadingPreview(false);
+
+      // Concurrently fetch AOI-specific cloud statistics
+      setLoadingFromCloud(true);
+      fetchCloudStats(acquisitions[idx], data.bbox)
+        .then(stats => setFromCloudStats(stats))
+        .catch(() => setFromCloudStats(null))
+        .finally(() => setLoadingFromCloud(false));
     } catch (err) {
       setPreviewError('FROM image: ' + err.message);
       setLoadingPreview(false);
     }
-  }, [acquisitions, fetchPreview, sentinelOpacity]);
+  }, [acquisitions, fetchPreview, fetchCloudStats, sentinelOpacity]);
 
   /**
    * Select the TO date (T2 = After). Loads the image and shows it on the map.
@@ -591,6 +720,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   const selectTo = useCallback(async (idx) => {
     setToIdx(idx);
     setToData(null);
+    setToCloudStats(null);
     setAnalysisResult(null);
     setAnalysisError('');
     setPreviewError('');
@@ -608,11 +738,18 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
 
       setToData({ acq: acquisitions[idx], image: data.image, bbox: data.bbox });
       setLoadingPreview(false);
+
+      // Concurrently fetch AOI-specific cloud statistics
+      setLoadingToCloud(true);
+      fetchCloudStats(acquisitions[idx], data.bbox)
+        .then(stats => setToCloudStats(stats))
+        .catch(() => setToCloudStats(null))
+        .finally(() => setLoadingToCloud(false));
     } catch (err) {
       setPreviewError('TO image: ' + err.message);
       setLoadingPreview(false);
     }
-  }, [acquisitions, fetchPreview, sentinelOpacity]);
+  }, [acquisitions, fetchPreview, fetchCloudStats, sentinelOpacity]);
 
   // ── Deforestation Analysis ────────────────────────────────────────────────────
 
@@ -707,7 +844,154 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
     setAnalysisResult(null);
     setAnalysisError('');
     setPreviewError('');
+    // Also reset SwinIR state
+    if (srLayerRef.current) { map.removeLayer(srLayerRef.current); srLayerRef.current = null; }
+    setSrMode('original');
+    setSrData(null);
+    setSrError('');
+    // Also reset Cloud Mask state
+    if (cloudLayerRef.current) { map.removeLayer(cloudLayerRef.current); cloudLayerRef.current = null; }
+    setFromCloudStats(null);
+    setToCloudStats(null);
+    setCloudMaskVisible(false);
   }, []);
+
+  // Check SwinIR checkpoint availability on mount
+  useEffect(() => {
+    fetch('/api/sentinel/superresolve/status')
+      .then(r => r.json())
+      .then(d => setSrAvailable(d.available === true))
+      .catch(() => setSrAvailable(false));
+  }, []);
+
+  // Run SwinIR 4x super-resolution on the currently active Sentinel image
+  const runSuperResolve = useCallback(async () => {
+    // Determine which image to SR — matches the active map view (Before or After)
+    const activeData = mapViewMode === 'before' ? fromData : (toData || fromData);
+    if (!activeData) return;
+
+    setSrLoading(true);
+    setSrError('');
+    setSrData(null);
+
+    try {
+      const res = await fetch('/api/sentinel/superresolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image: activeData.image,
+          bbox:  activeData.bbox,
+        }),
+      });
+      const data = await res.json();
+
+      if (!data.success) {
+        setSrError(data.error || 'Super-resolution failed.');
+        setSrMode('original');
+        setSrLoading(false);
+        return;
+      }
+
+      setSrData(data);
+      setSrMode('swinir');
+
+      // Replace the Leaflet satellite layer with the SR image
+      // (same bbox, just 4x more pixels — visualization only)
+      const map = mapRef.current;
+      if (map && activeData.bbox) {
+        const imgBounds = L.latLngBounds(
+          [activeData.bbox[1], activeData.bbox[0]],
+          [activeData.bbox[3], activeData.bbox[2]]
+        );
+        if (srLayerRef.current) { map.removeLayer(srLayerRef.current); srLayerRef.current = null; }
+        srLayerRef.current = L.imageOverlay(data.image, imgBounds, {
+          opacity: sentinelOpacity, zIndex: 201,
+        }).addTo(map);
+
+        // Hide original layers so they don't blend underneath the SR layer
+        if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
+        if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(0);
+      }
+    } catch (err) {
+      setSrError('Network error: ' + err.message);
+      setSrMode('original');
+    } finally {
+      setSrLoading(false);
+    }
+  }, [toData, fromData, mapViewMode, sentinelOpacity]);
+
+  // Revert to original (remove SR overlay)
+  const revertToOriginal = useCallback(() => {
+    const map = mapRef.current;
+    if (srLayerRef.current && map) { map.removeLayer(srLayerRef.current); srLayerRef.current = null; }
+    setSrMode('original');
+    setSrData(null);
+    setSrError('');
+    // Restore original satellite layer opacity
+    if (mapViewMode === 'before') {
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(sentinelVisible ? sentinelOpacity : 0);
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(0);
+    } else if (mapViewMode === 'after') {
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(sentinelVisible ? sentinelOpacity : 0);
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(0);
+    } else if (mapViewMode === 'blend') {
+      if (sentinelLayerRef.current) sentinelLayerRef.current.setOpacity(sentinelVisible ? sentinelOpacity * 0.65 : 0);
+      if (beforeLayerRef.current)   beforeLayerRef.current.setOpacity(sentinelVisible ? sentinelOpacity * 0.65 : 0);
+    }
+  }, [mapViewMode, sentinelOpacity, sentinelVisible]);
+
+  // Toggle Cloud Mask overlay on/off
+  const toggleCloudMask = useCallback(() => {
+    setCloudMaskVisible(v => !v);
+  }, []);
+
+  // Sync Cloud Mask overlay with map when active acquisition or cloudMaskVisible changes
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (!cloudMaskVisible) {
+      if (cloudLayerRef.current) {
+        map.removeLayer(cloudLayerRef.current);
+        cloudLayerRef.current = null;
+      }
+      return;
+    }
+
+    const activeData = mapViewMode === 'before' ? fromData : (toData || fromData);
+    const activeStats = mapViewMode === 'before' ? fromCloudStats : (toCloudStats || fromCloudStats);
+
+    if (!activeData || !activeData.image || !activeData.bbox) {
+      if (cloudLayerRef.current) {
+        map.removeLayer(cloudLayerRef.current);
+        cloudLayerRef.current = null;
+      }
+      return;
+    }
+
+    const cloudPct = activeStats?.cloud_pct ?? 0;
+    generateCloudMaskDataUrl(activeData.image, cloudPct).then((maskUrl) => {
+      if (!maskUrl) {
+        if (cloudLayerRef.current) {
+          map.removeLayer(cloudLayerRef.current);
+          cloudLayerRef.current = null;
+        }
+        return;
+      }
+      const imgBounds = L.latLngBounds(
+        [activeData.bbox[1], activeData.bbox[0]],
+        [activeData.bbox[3], activeData.bbox[2]]
+      );
+      if (cloudLayerRef.current) {
+        map.removeLayer(cloudLayerRef.current);
+        cloudLayerRef.current = null;
+      }
+      cloudLayerRef.current = L.imageOverlay(maskUrl, imgBounds, {
+        opacity: 0.75,
+        zIndex: 250,
+      }).addTo(map);
+    });
+  }, [cloudMaskVisible, mapViewMode, toData, fromData, toCloudStats, fromCloudStats]);
 
   // Fit map to AOI
   const fitToAoi = useCallback(() => {
@@ -721,6 +1005,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   const canAnalyze = fromData !== null && toData !== null &&
     fromIdx !== toIdx && !analysing && !loadingPreview;
   const bothSelected = fromIdx !== null && toIdx !== null;
+  const activeCloudStats = (mapViewMode === 'before' ? fromCloudStats : toCloudStats) || toCloudStats || fromCloudStats;
 
   return (
     <div style={{ display: 'flex', height: '100%', gap: 16, minHeight: 0 }}>
@@ -928,8 +1213,11 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                   FROM / T1
                 </span>
                 {fromData && (
-                  <span style={{ fontSize: '0.68rem', fontWeight: 600, color: cloudColor(fromData.acq.cloud_coverage) }}>
-                    ☁ {fmtCloud(fromData.acq.cloud_coverage)}
+                  <span
+                    style={{ fontSize: '0.66rem', fontWeight: 600, color: cloudColor(fromData.acq.cloud_coverage) }}
+                    title="Scene-level tile cloud coverage (100x100 km tile)"
+                  >
+                    Scene: ☁ {fmtCloud(fromData.acq.cloud_coverage)}
                   </span>
                 )}
               </div>
@@ -944,13 +1232,49 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
               </div>
 
               {fromData ? (
-                <img
-                  src={fromData.image}
-                  alt="FROM preview"
-                  onClick={() => setPreviewModalImg({ title: `Before Image (T1: ${formatDate(fromData.acq.datetime)})`, image: fromData.image })}
-                  style={{ width: '100%', height: 48, borderRadius: 6, objectFit: 'cover', border: '1px solid #fcd34d', cursor: 'pointer' }}
-                  title="Click to zoom Before image"
-                />
+                <>
+                  <img
+                    src={fromData.image}
+                    alt="FROM preview"
+                    onClick={() => setPreviewModalImg({ title: `Before Image (T1: ${formatDate(fromData.acq.datetime)})`, image: fromData.image })}
+                    style={{ width: '100%', height: 48, borderRadius: 6, objectFit: 'cover', border: '1px solid #fcd34d', cursor: 'pointer' }}
+                    title="Click to zoom Before image"
+                  />
+                  {/* AOI-Specific Cloud Statistics */}
+                  <div style={{
+                    padding: '5px 7px',
+                    borderRadius: 6,
+                    background: fromCloudStats && fromCloudStats.cloud_pct > 20 ? '#fff1f2' : '#f8fafc',
+                    border: `1px solid ${fromCloudStats && fromCloudStats.cloud_pct > 20 ? '#fecaca' : '#e2e8f0'}`,
+                    fontSize: '0.67rem',
+                  }}>
+                    <div style={{ fontWeight: 700, color: '#475569', marginBottom: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <span>Cloud / Obscured Coverage in AOI</span>
+                      {loadingFromCloud && <Loader size={9} style={{ animation: 'spin 1s linear infinite' }} />}
+                    </div>
+                    {fromCloudStats ? (
+                      <>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ color: fromCloudStats.cloud_pct > 20 ? '#dc2626' : '#64748b' }}>
+                            Obscured: <strong>{fromCloudStats.cloud_pct}%</strong>
+                          </span>
+                          <span style={{ color: '#16a34a' }}>
+                            Usable: <strong>{fromCloudStats.clear_pct}%</strong>
+                          </span>
+                        </div>
+                        {fromCloudStats.cloud_pct > 20 && (
+                          <div style={{ marginTop: 3, color: '#b91c1c', fontWeight: 600, fontSize: '0.62rem', display: 'flex', alignItems: 'center', gap: 3 }}>
+                            <AlertTriangle size={10} /> High cloud cover in AOI
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
+                        {loadingFromCloud ? 'Calculating AOI cloud stats…' : 'AOI stats pending'}
+                      </div>
+                    )}
+                  </div>
+                </>
               ) : (
                 <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', lineHeight: 1.3 }}>
                   Click "Set FROM" in timeline
@@ -976,8 +1300,11 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                   TO / T2
                 </span>
                 {toData && (
-                  <span style={{ fontSize: '0.68rem', fontWeight: 600, color: cloudColor(toData.acq.cloud_coverage) }}>
-                    ☁ {fmtCloud(toData.acq.cloud_coverage)}
+                  <span
+                    style={{ fontSize: '0.66rem', fontWeight: 600, color: cloudColor(toData.acq.cloud_coverage) }}
+                    title="Scene-level tile cloud coverage (100x100 km tile)"
+                  >
+                    Scene: ☁ {fmtCloud(toData.acq.cloud_coverage)}
                   </span>
                 )}
               </div>
@@ -992,13 +1319,49 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
               </div>
 
               {toData ? (
-                <img
-                  src={toData.image}
-                  alt="TO preview"
-                  onClick={() => setPreviewModalImg({ title: `After Image (T2: ${formatDate(toData.acq.datetime)})`, image: toData.image })}
-                  style={{ width: '100%', height: 48, borderRadius: 6, objectFit: 'cover', border: '1px solid #bfdbfe', cursor: 'pointer' }}
-                  title="Click to zoom After image"
-                />
+                <>
+                  <img
+                    src={toData.image}
+                    alt="TO preview"
+                    onClick={() => setPreviewModalImg({ title: `After Image (T2: ${formatDate(toData.acq.datetime)})`, image: toData.image })}
+                    style={{ width: '100%', height: 48, borderRadius: 6, objectFit: 'cover', border: '1px solid #bfdbfe', cursor: 'pointer' }}
+                    title="Click to zoom After image"
+                  />
+                  {/* AOI-Specific Cloud Statistics */}
+                  <div style={{
+                    padding: '5px 7px',
+                    borderRadius: 6,
+                    background: toCloudStats && toCloudStats.cloud_pct > 20 ? '#fff1f2' : '#f8fafc',
+                    border: `1px solid ${toCloudStats && toCloudStats.cloud_pct > 20 ? '#fecaca' : '#e2e8f0'}`,
+                    fontSize: '0.67rem',
+                  }}>
+                    <div style={{ fontWeight: 700, color: '#475569', marginBottom: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <span>Cloud / Obscured Coverage in AOI</span>
+                      {loadingToCloud && <Loader size={9} style={{ animation: 'spin 1s linear infinite' }} />}
+                    </div>
+                    {toCloudStats ? (
+                      <>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ color: toCloudStats.cloud_pct > 20 ? '#dc2626' : '#64748b' }}>
+                            Obscured: <strong>{toCloudStats.cloud_pct}%</strong>
+                          </span>
+                          <span style={{ color: '#16a34a' }}>
+                            Usable: <strong>{toCloudStats.clear_pct}%</strong>
+                          </span>
+                        </div>
+                        {toCloudStats.cloud_pct > 20 && (
+                          <div style={{ marginTop: 3, color: '#b91c1c', fontWeight: 600, fontSize: '0.62rem', display: 'flex', alignItems: 'center', gap: 3 }}>
+                            <AlertTriangle size={10} /> High cloud cover in AOI
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
+                        {loadingToCloud ? 'Calculating AOI cloud stats…' : 'AOI stats pending'}
+                      </div>
+                    )}
+                  </div>
+                </>
               ) : (
                 <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', lineHeight: 1.3 }}>
                   Click "Set TO" in timeline
@@ -1060,6 +1423,103 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                   value={sentinelOpacity}
                   onChange={e => setSentinelOpacity(parseFloat(e.target.value))}
                 />
+              </div>
+
+              {/* Cloud Mask Toggle */}
+              <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px dashed var(--border-color)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <Cloud size={13} color="#0284c7" />
+                    <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      Cloud Mask
+                    </span>
+                  </div>
+                  <button
+                    onClick={toggleCloudMask}
+                    style={{
+                      background: cloudMaskVisible ? '#e0f2fe' : '#f1f5f9',
+                      border: `1px solid ${cloudMaskVisible ? '#7dd3fc' : 'var(--border-color)'}`,
+                      borderRadius: 5, padding: '2px 8px', cursor: 'pointer',
+                      color: cloudMaskVisible ? '#0369a1' : '#64748b',
+                      fontSize: '0.7rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4,
+                    }}
+                    title="Toggle cloud/obscured pixel mask overlay on map"
+                  >
+                    {cloudMaskVisible ? <Eye size={12} /> : <EyeOff size={12} />}
+                    {cloudMaskVisible ? 'Mask Active' : 'Mask Off'}
+                  </button>
+                </div>
+                {cloudMaskVisible && (
+                  <div style={{ marginTop: 4, fontSize: '0.66rem', color: '#0369a1', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ width: 9, height: 9, background: '#38bdf8', borderRadius: 2, display: 'inline-block' }}></span>
+                    <span>
+                      Cyan overlay marks {activeCloudStats ? `${activeCloudStats.cloud_pct}%` : ''} obscured pixels in AOI
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* SwinIR 4x Super-Resolution Toggle */}
+          {(fromData || toData) && (
+            <div style={{ marginTop: 8, paddingTop: 10, borderTop: '1px solid var(--border-color)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Sparkles size={13} color="#7c3aed" />
+                  <span style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    SwinIR Super-Resolution
+                  </span>
+                </div>
+                {srAvailable === false && (
+                  <span style={{ fontSize: '0.65rem', color: '#9ca3af', background: '#f3f4f6', border: '1px solid #e5e7eb', borderRadius: 4, padding: '1px 6px' }}>
+                    No checkpoint
+                  </span>
+                )}
+              </div>
+
+              <div className="toggle-group" style={{ marginBottom: 6 }}>
+                <button
+                  className={`btn-toggle${srMode === 'original' ? ' active' : ''}`}
+                  onClick={revertToOriginal}
+                  style={{ fontSize: '0.72rem', padding: '5px 8px' }}
+                  disabled={srLoading}
+                >
+                  Original 10m
+                </button>
+                <button
+                  className={`btn-toggle${srMode === 'swinir' ? ' active' : ''}`}
+                  onClick={srMode === 'swinir' ? undefined : runSuperResolve}
+                  style={{
+                    fontSize: '0.72rem', padding: '5px 8px',
+                    opacity: (srAvailable === false || srLoading) ? 0.5 : 1,
+                    cursor: (srAvailable === false || srLoading) ? 'not-allowed' : 'pointer',
+                  }}
+                  disabled={srAvailable === false || srLoading}
+                  title={srAvailable === false ? 'SwinIR checkpoint not found. See note below.' : 'Run SwinIR 4x super-resolution'}
+                >
+                  {srLoading ? (
+                    <><Loader size={11} style={{ animation: 'spin 1s linear infinite' }} /> Running...</>
+                  ) : 'SwinIR 4x'}
+                </button>
+              </div>
+
+              {srMode === 'swinir' && srData && (
+                <div style={{ fontSize: '0.7rem', color: '#7c3aed', background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 5, padding: '4px 8px', marginBottom: 4 }}>
+                  SwinIR 4x Super-Resolved Visualization
+                  <br />
+                  <span style={{ color: '#6d28d9' }}>{srData.orig_width}x{srData.orig_height} px to {srData.width}x{srData.height} px</span>
+                </div>
+              )}
+
+              {srError && (
+                <div style={{ fontSize: '0.7rem', color: '#b91c1c', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 5, padding: '4px 8px', marginBottom: 4 }}>
+                  {srError}
+                </div>
+              )}
+
+              <div style={{ fontSize: '0.67rem', color: 'var(--text-muted)', lineHeight: 1.35 }}>
+                SwinIR increases image pixel density for visualization; it does not create true 2.5 m satellite measurements.
               </div>
             </div>
           )}
