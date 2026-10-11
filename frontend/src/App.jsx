@@ -1,18 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Globe, 
-  Trees, 
-  Layers, 
-  GitCompare, 
-  BarChart3, 
-  Play, 
-  Upload, 
-  Sliders, 
-  Activity, 
+import {
+  Globe,
+  Trees,
+  Layers,
+  GitCompare,
+  BarChart3,
+  Play,
+  Upload,
+  Sliders,
+  Activity,
   FileText,
   MapPin
 } from 'lucide-react';
-import L from 'leaflet';
+import GisMap from './GisMap.jsx';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('gis-map');
@@ -21,11 +21,13 @@ export default function App() {
 
   // Samples Data
   const [samples, setSamples] = useState({ stage1_samples: [], stage2_samples: [] });
+
+  // GIS / AI overlay state (passed into GisMap)
   const [gisMode, setGisMode] = useState('stage1');
   const [selectedGisSample, setSelectedGisSample] = useState('');
   const [gisThreshold, setGisThreshold] = useState(0.5);
   const [gisOpacity, setGisOpacity] = useState(0.8);
-  const [gisMetrics, setGisMetrics] = useState(null);
+  const [aiOverlayData, setAiOverlayData] = useState(null);
 
   // Stage 1 State
   const [s1Sample, setS1Sample] = useState('');
@@ -35,6 +37,8 @@ export default function App() {
 
   // Stage 2 State
   const [s2Sample, setS2Sample] = useState('');
+  const [s2FileT1, setS2FileT1] = useState(null);
+  const [s2FileT2, setS2FileT2] = useState(null);
   const [s2Threshold, setS2Threshold] = useState(0.5);
   const [s2Results, setS2Results] = useState(null);
 
@@ -45,12 +49,6 @@ export default function App() {
 
   // Metrics State
   const [analytics, setAnalytics] = useState(null);
-
-  // Map refs
-  const mapRef = useRef(null);
-  const mapInstanceRef = useRef(null);
-  const overlayRef = useRef(null);
-  const boundsRef = useRef(null);
 
   // Fetch samples on load
   useEffect(() => {
@@ -71,46 +69,7 @@ export default function App() {
       .catch(err => console.error("Metrics fetch error:", err));
   }, []);
 
-  // Initialize Leaflet Map
-  useEffect(() => {
-    if (activeTab === 'gis-map' && mapRef.current && !mapInstanceRef.current) {
-      const esriTile = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
-        maxZoom: 18,
-        attribution: "Esri Satellite"
-      });
-
-      const osmTile = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19,
-        attribution: "OpenStreetMap"
-      });
-
-      const map = L.map(mapRef.current, {
-        center: [-3.4653, -62.2159],
-        zoom: 13,
-        layers: [esriTile]
-      });
-
-      L.control.layers({
-        "Satellite (Esri)": esriTile,
-        "Street Map (OSM)": osmTile
-      }).addTo(map);
-
-      mapInstanceRef.current = map;
-    }
-
-    if (activeTab === 'gis-map' && mapInstanceRef.current) {
-      setTimeout(() => mapInstanceRef.current.invalidateSize(), 150);
-    }
-  }, [activeTab]);
-
-  // Update Opacity live
-  useEffect(() => {
-    if (overlayRef.current) {
-      overlayRef.current.setOpacity(gisOpacity);
-    }
-  }, [gisOpacity]);
-
-  // Run GIS Spatial Analysis
+  // Run GIS Spatial Analysis (AI overlay on the map)
   const handleRunGis = () => {
     if (!selectedGisSample) {
       alert("Please select a sample satellite tile from the dropdown.");
@@ -136,28 +95,8 @@ export default function App() {
         setLoading(false);
         if (data.error) { alert(data.error); return; }
 
-        setGisMetrics(data);
-
-        // Render Leaflet Overlay
-        const map = mapInstanceRef.current;
-        if (map && data.gis) {
-          if (overlayRef.current) map.removeLayer(overlayRef.current);
-          if (boundsRef.current) map.removeLayer(boundsRef.current);
-
-          const bounds = L.latLngBounds(data.gis.bounds);
-
-          boundsRef.current = L.rectangle(bounds, {
-            color: "#10b981",
-            weight: 2,
-            fill: false,
-            dashArray: "4, 4"
-          }).addTo(map);
-
-          const overlayImg = (gisMode === 'stage1') ? data.overlay_image : data.deforestation_overlay;
-          overlayRef.current = L.imageOverlay(overlayImg, bounds, { opacity: gisOpacity }).addTo(map);
-
-          map.fitBounds(bounds, { padding: [30, 30] });
-        }
+        const overlayImg = (gisMode === 'stage1') ? data.overlay_image : data.deforestation_overlay;
+        setAiOverlayData({ image: overlayImg, gis: data.gis, mode: gisMode, metrics: data });
       })
       .catch(err => {
         setLoading(false);
@@ -196,16 +135,26 @@ export default function App() {
 
   // Run Stage 2
   const handleRunStage2 = () => {
-    if (!s2Sample) {
-      alert("Please select a temporal pair.");
+    const formData = new FormData();
+    formData.append("threshold", s2Threshold);
+
+    if (s2FileT1 && s2FileT2) {
+      formData.append("file_t1", s2FileT1);
+      formData.append("file_t2", s2FileT2);
+    } else if (s2Sample) {
+      const sampleObj = JSON.parse(s2Sample);
+      formData.append("sample_id", sampleObj.id);
+      formData.append("split", sampleObj.split);
+    } else {
+      if (s2FileT1 && !s2FileT2) {
+        alert("Please also upload the After Image (T2).");
+      } else if (!s2FileT1 && s2FileT2) {
+        alert("Please also upload the Before Image (T1).");
+      } else {
+        alert("Please select a sample pair or upload both Before (T1) and After (T2) images.");
+      }
       return;
     }
-
-    const sampleObj = JSON.parse(s2Sample);
-    const formData = new FormData();
-    formData.append("sample_id", sampleObj.id);
-    formData.append("split", sampleObj.split);
-    formData.append("threshold", s2Threshold);
 
     setLoading(true);
     fetch("/api/predict/stage2", { method: "POST", body: formData })
@@ -288,31 +237,31 @@ export default function App() {
           </div>
 
           <nav className="nav-menu">
-            <button 
+            <button
               className={`nav-item ${activeTab === 'gis-map' ? 'active' : ''}`}
               onClick={() => setActiveTab('gis-map')}
             >
               <Globe size={18} /> Interactive GIS Map
             </button>
-            <button 
+            <button
               className={`nav-item ${activeTab === 'stage1' ? 'active' : ''}`}
               onClick={() => setActiveTab('stage1')}
             >
               <Trees size={18} /> Stage 1: Forest Cover
             </button>
-            <button 
+            <button
               className={`nav-item ${activeTab === 'stage2' ? 'active' : ''}`}
               onClick={() => setActiveTab('stage2')}
             >
               <Layers size={18} /> Stage 2: Change Detection
             </button>
-            <button 
+            <button
               className={`nav-item ${activeTab === 'swipe' ? 'active' : ''}`}
               onClick={() => setActiveTab('swipe')}
             >
               <GitCompare size={18} /> Timeline Comparison
             </button>
-            <button 
+            <button
               className={`nav-item ${activeTab === 'metrics' ? 'active' : ''}`}
               onClick={() => setActiveTab('metrics')}
             >
@@ -334,14 +283,14 @@ export default function App() {
       <main className="main-content">
         <header className="top-header">
           <h1>
-            {activeTab === 'gis-map' && 'Interactive GIS Satellite Map Viewer'}
+            {activeTab === 'gis-map' && 'Historical Satellite & Forest Change Map'}
             {activeTab === 'stage1' && 'Stage 1: Binary Forest Cover Segmentation'}
             {activeTab === 'stage2' && 'Stage 2: Temporal Deforestation Change Detection'}
             {activeTab === 'swipe' && 'Temporal Timeline Comparison'}
             {activeTab === 'metrics' && 'Model Performance Analytics & Validation Reports'}
           </h1>
           <p>
-            {activeTab === 'gis-map' && 'Geospatial analysis of Amazon basin canopy cover & loss using Leaflet.js and PyTorch U-Net.'}
+            {activeTab === 'gis-map' && 'Draw an AOI, search Sentinel-2 acquisitions, explore historical imagery with before/after comparison.'}
             {activeTab === 'stage1' && 'Extracting pixel-level forest canopy coverage with physical area calculations in Hectares.'}
             {activeTab === 'stage2' && 'Detecting forest loss (deforestation) between T1 and T2 satellite image pairs.'}
             {activeTab === 'swipe' && 'Scrub through an earlier image, later image, and predicted forest-loss overlay for one paired sample.'}
@@ -349,127 +298,104 @@ export default function App() {
           </p>
         </header>
 
-        {/* TAB 1: GIS MAP */}
+        {/* TAB 1: GIS MAP — fully redesigned */}
         {activeTab === 'gis-map' && (
-          <div className="tab-content">
-            <div className="gis-layout">
-              <div className="gis-sidebar">
-                <div className="glass-card">
-                  <h3 className="panel-heading">GIS Control Panel</h3>
-                  
-                  <div className="panel-section" style={{ marginTop: 12 }}>
-                    <label className="section-label">Analysis Pipeline</label>
-                    <div className="toggle-group">
-                      <button 
-                        className={`btn-toggle ${gisMode === 'stage1' ? 'active' : ''}`}
-                        onClick={() => setGisMode('stage1')}
-                      >
-                        Stage 1 (Canopy)
-                      </button>
-                      <button 
-                        className={`btn-toggle ${gisMode === 'stage2' ? 'active' : ''}`}
-                        onClick={() => setGisMode('stage2')}
-                      >
-                        Stage 2 (Deforestation)
-                      </button>
-                    </div>
-                  </div>
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
 
-                  <div className="panel-section" style={{ marginTop: 14 }}>
-                    <label className="section-label">Satellite Tile Selection</label>
-                    <select 
-                      className="custom-select"
-                      value={selectedGisSample}
-                      onChange={(e) => setSelectedGisSample(e.target.value)}
+            {/* AI Analysis control strip */}
+            <div className="glass-card" style={{ padding: '14px 20px', marginBottom: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                <div>
+                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>AI Pipeline</span>
+                  <div className="toggle-group" style={{ marginTop: 4, width: 260 }}>
+                    <button
+                      className={`btn-toggle ${gisMode === 'stage1' ? 'active' : ''}`}
+                      onClick={() => setGisMode('stage1')}
                     >
-                      <option value="">-- Choose Sample Satellite Tile --</option>
-                      {gisMode === 'stage1' ? (
-                        samples.stage1_samples.map((s, idx) => (
-                          <option key={idx} value={JSON.stringify(s)}>[{s.split}] {s.name}</option>
-                        ))
-                      ) : (
-                        samples.stage2_samples.map((s, idx) => (
-                          <option key={idx} value={JSON.stringify(s)}>{s.name}</option>
-                        ))
-                      )}
-                    </select>
+                      Stage 1 (Canopy)
+                    </button>
+                    <button
+                      className={`btn-toggle ${gisMode === 'stage2' ? 'active' : ''}`}
+                      onClick={() => setGisMode('stage2')}
+                    >
+                      Stage 2 (Deforestation)
+                    </button>
                   </div>
-
-                  <div className="panel-section" style={{ marginTop: 14 }}>
-                    <div className="slider-header">
-                      <span>Probability Threshold</span>
-                      <span>{gisThreshold.toFixed(2)}</span>
-                    </div>
-                    <input 
-                      type="range" 
-                      min="0.1" 
-                      max="0.9" 
-                      step="0.05"
-                      value={gisThreshold} 
-                      onChange={(e) => setGisThreshold(parseFloat(e.target.value))}
-                    />
-                  </div>
-
-                  <div className="panel-section" style={{ marginTop: 14 }}>
-                    <div className="slider-header">
-                      <span>Map Layer Opacity</span>
-                      <span>{Math.round(gisOpacity * 100)}%</span>
-                    </div>
-                    <input 
-                      type="range" 
-                      min="0.1" 
-                      max="1.0" 
-                      step="0.05"
-                      value={gisOpacity} 
-                      onChange={(e) => setGisOpacity(parseFloat(e.target.value))}
-                    />
-                  </div>
-
-                  <button 
-                    className="btn btn-primary full-width" 
-                    style={{ marginTop: 18 }}
-                    onClick={handleRunGis}
-                  >
-                    <Play size={16} /> Run Spatial Analysis
-                  </button>
                 </div>
 
-                {gisMetrics && (
-                  <div className="gis-metrics-box">
-                    <span className="m-card-title">Spatial Land Area Metrics</span>
-                    <div className="gis-stat-row">
-                      <span>Total Tile Area:</span>
-                      <strong>{gisMetrics.total_hectares || "655.36"} ha</strong>
-                    </div>
-                    <div className="gis-stat-row">
-                      <span>{gisMode === 'stage1' ? 'Forest Canopy:' : 'Deforestation Loss:'}</span>
-                      <strong className={gisMode === 'stage1' ? 'text-green' : 'text-red'}>
-                        {gisMode === 'stage1' ? `${gisMetrics.forest_hectares} ha (${gisMetrics.forest_pct}%)` : `${gisMetrics.deforestation_hectares} ha (${gisMetrics.deforestation_pct}%)`}
-                      </strong>
-                    </div>
-                    <div className="gis-stat-row">
-                      <span>Coordinates:</span>
-                      <small>{gisMetrics.gis.center[0]}, {gisMetrics.gis.center[1]}</small>
-                    </div>
+                <div style={{ flex: 1, minWidth: 200 }}>
+                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Sample Tile</span>
+                  <select
+                    className="custom-select"
+                    style={{ marginTop: 4 }}
+                    value={selectedGisSample}
+                    onChange={(e) => setSelectedGisSample(e.target.value)}
+                  >
+                    <option value="">-- Choose Sample Satellite Tile --</option>
+                    {gisMode === 'stage1' ? (
+                      samples.stage1_samples.map((s, idx) => (
+                        <option key={idx} value={JSON.stringify(s)}>[{s.split}] {s.name}</option>
+                      ))
+                    ) : (
+                      samples.stage2_samples.map((s, idx) => (
+                        <option key={idx} value={JSON.stringify(s)}>{s.name}</option>
+                      ))
+                    )}
+                  </select>
+                </div>
+
+                <div style={{ minWidth: 160 }}>
+                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Threshold: {gisThreshold.toFixed(2)}
+                  </span>
+                  <input
+                    type="range" min="0.1" max="0.9" step="0.05"
+                    value={gisThreshold}
+                    onChange={(e) => setGisThreshold(parseFloat(e.target.value))}
+                    style={{ marginTop: 8, display: 'block', width: '100%' }}
+                  />
+                </div>
+
+                <div style={{ minWidth: 140 }}>
+                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Opacity: {Math.round(gisOpacity * 100)}%
+                  </span>
+                  <input
+                    type="range" min="0.1" max="1.0" step="0.05"
+                    value={gisOpacity}
+                    onChange={(e) => setGisOpacity(parseFloat(e.target.value))}
+                    style={{ marginTop: 8, display: 'block', width: '100%' }}
+                  />
+                </div>
+
+                <button
+                  className="btn btn-primary"
+                  style={{ alignSelf: 'flex-end', whiteSpace: 'nowrap' }}
+                  onClick={handleRunGis}
+                >
+                  <Play size={15} /> Run AI Analysis
+                </button>
+
+                {aiOverlayData?.metrics && (
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', alignSelf: 'flex-end', paddingBottom: 2 }}>
+                    {gisMode === 'stage1'
+                      ? <><span style={{ color: 'var(--primary-green)', fontWeight: 700 }}>{aiOverlayData.metrics.forest_hectares} ha</span> forest canopy</>
+                      : <><span style={{ color: 'var(--accent-red)', fontWeight: 700 }}>{aiOverlayData.metrics.deforestation_hectares} ha</span> deforestation</>
+                    }
+                    <span style={{ marginLeft: 6, fontSize: '0.7rem', color: '#94a3b8' }}>(est. 10m GSD)</span>
                   </div>
                 )}
               </div>
+            </div>
 
-              <div className="glass-card map-container">
-                <div id="react-leaflet-map" ref={mapRef}></div>
-                
-                <div className="map-legend-overlay">
-                  <div className="legend-title">GIS Layer Legend</div>
-                  <div className="legend-item">
-                    <span className="legend-color legend-green"></span>
-                    <span>Stage 1: Forest Canopy</span>
-                  </div>
-                  <div className="legend-item">
-                    <span className="legend-color legend-red"></span>
-                    <span>Stage 2: Deforestation Loss</span>
-                  </div>
-                </div>
-              </div>
+            {/* GIS Map Component — takes remaining height */}
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <GisMap
+                samples={samples}
+                aiMode={gisMode}
+                aiOpacity={gisOpacity}
+                aiOverlayData={aiOverlayData}
+              />
             </div>
           </div>
         )}
@@ -480,7 +406,7 @@ export default function App() {
             <div className="glass-card control-panel">
               <div className="panel-section">
                 <label className="section-label">Select Sample Satellite Image</label>
-                <select 
+                <select
                   className="custom-select"
                   value={s1Sample}
                   onChange={(e) => { setS1Sample(e.target.value); setS1File(null); }}
@@ -496,8 +422,8 @@ export default function App() {
                 <label className="section-label">Or Upload Custom Image</label>
                 <div className="file-dropzone">
                   <span>{s1File ? `Selected: ${s1File.name}` : 'Click to Upload TIFF/PNG'}</span>
-                  <input 
-                    type="file" 
+                  <input
+                    type="file"
                     accept="image/*"
                     onChange={(e) => {
                       if (e.target.files.length > 0) {
@@ -514,10 +440,10 @@ export default function App() {
                   <span>Confidence Threshold</span>
                   <span>{s1Threshold.toFixed(2)}</span>
                 </div>
-                <input 
-                  type="range" 
-                  min="0.1" 
-                  max="0.9" 
+                <input
+                  type="range"
+                  min="0.1"
+                  max="0.9"
                   step="0.05"
                   value={s1Threshold}
                   onChange={(e) => setS1Threshold(parseFloat(e.target.value))}
@@ -545,7 +471,7 @@ export default function App() {
                   <div className="glass-card stat-card">
                     <span className="stat-label">Total Tile Area</span>
                     <span className="stat-value text-accent">{s1Results.total_hectares} ha</span>
-                    <span className="stat-sub">Ground Sample Distance: 10m/px</span>
+                    <span className="stat-sub">Ground Sample Distance: 10m/px (est.)</span>
                   </div>
                 </div>
 
@@ -578,12 +504,16 @@ export default function App() {
         {activeTab === 'stage2' && (
           <div className="tab-content">
             <div className="glass-card control-panel">
-              <div className="panel-section" style={{ minWidth: 300 }}>
-                <label className="section-label">Select Temporal Image Pair (T1 vs T2)</label>
-                <select 
+              <div className="panel-section" style={{ minWidth: 260 }}>
+                <label className="section-label">Select Pre-loaded Temporal Pair</label>
+                <select
                   className="custom-select"
                   value={s2Sample}
-                  onChange={(e) => setS2Sample(e.target.value)}
+                  onChange={(e) => {
+                    setS2Sample(e.target.value);
+                    setS2FileT1(null);
+                    setS2FileT2(null);
+                  }}
                 >
                   <option value="">-- Choose Sample Pair --</option>
                   {samples.stage2_samples.map((s, i) => (
@@ -592,15 +522,49 @@ export default function App() {
                 </select>
               </div>
 
+              <div className="panel-section">
+                <label className="section-label">Or Upload T1 (Before Image)</label>
+                <div className="file-dropzone">
+                  <span>{s2FileT1 ? `T1: ${s2FileT1.name}` : 'Click to Upload Before (T1)'}</span>
+                  <input
+                    type="file"
+                    accept="image/*,.tif,.tiff"
+                    onChange={(e) => {
+                      if (e.target.files.length > 0) {
+                        setS2FileT1(e.target.files[0]);
+                        setS2Sample('');
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="panel-section">
+                <label className="section-label">And Upload T2 (After Image)</label>
+                <div className="file-dropzone">
+                  <span>{s2FileT2 ? `T2: ${s2FileT2.name}` : 'Click to Upload After (T2)'}</span>
+                  <input
+                    type="file"
+                    accept="image/*,.tif,.tiff"
+                    onChange={(e) => {
+                      if (e.target.files.length > 0) {
+                        setS2FileT2(e.target.files[0]);
+                        setS2Sample('');
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
               <div className="panel-section threshold-box">
                 <div className="slider-header">
                   <span>Deforestation Threshold</span>
                   <span>{s2Threshold.toFixed(2)}</span>
                 </div>
-                <input 
-                  type="range" 
-                  min="0.1" 
-                  max="0.9" 
+                <input
+                  type="range"
+                  min="0.1"
+                  max="0.9"
                   step="0.05"
                   value={s2Threshold}
                   onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
@@ -671,7 +635,7 @@ export default function App() {
             <div className="glass-card control-panel" style={{ justifyContent: 'center' }}>
               <div style={{ width: 350 }}>
                 <label className="section-label">Select Temporal Image Pair</label>
-                <select 
+                <select
                   className="custom-select"
                   value={swipeSample}
                   onChange={(e) => {
@@ -705,14 +669,18 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="timeline-frame">
-                  <span className="timeline-frame-label">{selectedTimelineFrame.label}</span>
-                  <img
-                    src={selectedTimelineFrame.image}
-                    className="timeline-image"
-                    alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name}`}
-                  />
-                </div>
+                <div 
+                  className="swipe-slider-box"
+                  onMouseDown={() => setIsDragging(true)}
+                  onMouseUp={() => setIsDragging(false)}
+                  onMouseLeave={() => setIsDragging(false)}
+                  onMouseMove={handleMouseMove}
+                >
+                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
+                  
+                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
+                    <img src={swipeData.t1_image} alt="Before" />
+                  </div>
 
                 <div className="timeline-control">
                   <input
