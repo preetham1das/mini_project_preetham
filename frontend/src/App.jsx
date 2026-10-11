@@ -41,8 +41,7 @@ export default function App() {
   // Swipe State
   const [swipeSample, setSwipeSample] = useState('');
   const [swipeData, setSwipeData] = useState(null);
-  const [swipePos, setSwipePos] = useState(50);
-  const [isDragging, setIsDragging] = useState(false);
+  const [timelineStep, setTimelineStep] = useState(0);
 
   // Metrics State
   const [analytics, setAnalytics] = useState(null);
@@ -222,7 +221,7 @@ export default function App() {
       });
   };
 
-  // Load Swipe
+  // Load temporal timeline
   const handleLoadSwipe = () => {
     if (!swipeSample) {
       alert("Please select a temporal pair.");
@@ -241,6 +240,7 @@ export default function App() {
         setLoading(false);
         if (data.error) { alert(data.error); return; }
         setSwipeData(data);
+        setTimelineStep(0);
       })
       .catch(err => {
         setLoading(false);
@@ -248,14 +248,24 @@ export default function App() {
       });
   };
 
-  const handleMouseMove = (e) => {
-    if (!isDragging) return;
-    const box = e.currentTarget.getBoundingClientRect();
-    let posX = e.clientX - box.left;
-    if (posX < 0) posX = 0;
-    if (posX > box.width) posX = box.width;
-    setSwipePos((posX / box.width) * 100);
-  };
+  const timelineFrames = swipeData ? [
+    {
+      label: 'T1 · Earlier',
+      description: 'Original satellite image for this paired sample.',
+      image: swipeData.t1_image
+    },
+    {
+      label: 'T2 · Later',
+      description: 'Later image of the same paired sample.',
+      image: swipeData.t2_image
+    },
+    {
+      label: 'Predicted forest loss',
+      description: 'Red pixels show forest loss predicted between T1 and T2.',
+      image: swipeData.deforestation_overlay
+    }
+  ] : [];
+  const selectedTimelineFrame = timelineFrames[timelineStep];
 
   return (
     <div className="app-container">
@@ -300,7 +310,7 @@ export default function App() {
               className={`nav-item ${activeTab === 'swipe' ? 'active' : ''}`}
               onClick={() => setActiveTab('swipe')}
             >
-              <GitCompare size={18} /> Swipe Comparison
+              <GitCompare size={18} /> Timeline Comparison
             </button>
             <button 
               className={`nav-item ${activeTab === 'metrics' ? 'active' : ''}`}
@@ -327,14 +337,14 @@ export default function App() {
             {activeTab === 'gis-map' && 'Interactive GIS Satellite Map Viewer'}
             {activeTab === 'stage1' && 'Stage 1: Binary Forest Cover Segmentation'}
             {activeTab === 'stage2' && 'Stage 2: Temporal Deforestation Change Detection'}
-            {activeTab === 'swipe' && 'Temporal Swipe Comparison Viewer'}
+            {activeTab === 'swipe' && 'Temporal Timeline Comparison'}
             {activeTab === 'metrics' && 'Model Performance Analytics & Validation Reports'}
           </h1>
           <p>
             {activeTab === 'gis-map' && 'Geospatial analysis of Amazon basin canopy cover & loss using Leaflet.js and PyTorch U-Net.'}
             {activeTab === 'stage1' && 'Extracting pixel-level forest canopy coverage with physical area calculations in Hectares.'}
             {activeTab === 'stage2' && 'Detecting forest loss (deforestation) between T1 and T2 satellite image pairs.'}
-            {activeTab === 'swipe' && 'Interactive split-screen swipe tool comparing Before (T1) vs. After (T2 + Deforestation Overlay).'}
+            {activeTab === 'swipe' && 'Scrub through an earlier image, later image, and predicted forest-loss overlay for one paired sample.'}
             {activeTab === 'metrics' && 'Quantitative evaluation metrics (IoU, Dice, Precision, Recall) across dataset splits.'}
           </p>
         </header>
@@ -664,7 +674,11 @@ export default function App() {
                 <select 
                   className="custom-select"
                   value={swipeSample}
-                  onChange={(e) => setSwipeSample(e.target.value)}
+                  onChange={(e) => {
+                    setSwipeSample(e.target.value);
+                    setSwipeData(null);
+                    setTimelineStep(0);
+                  }}
                 >
                   <option value="">-- Choose Sample Pair --</option>
                   {samples.stage2_samples.map((s, i) => (
@@ -673,34 +687,58 @@ export default function App() {
                 </select>
               </div>
               <button className="btn btn-primary" onClick={handleLoadSwipe}>
-                <Play size={16} /> Load Swipe Comparer
+                <Play size={16} /> Analyze Pair
               </button>
             </div>
 
             {swipeData && (
-              <div className="glass-card swipe-container">
-                <div className="swipe-labels">
-                  <span className="label-before">◀ Before (T1 Satellite Image)</span>
-                  <span className="label-after">After + AI Deforestation Overlay ▶</span>
-                </div>
-
-                <div 
-                  className="swipe-slider-box"
-                  onMouseDown={() => setIsDragging(true)}
-                  onMouseUp={() => setIsDragging(false)}
-                  onMouseLeave={() => setIsDragging(false)}
-                  onMouseMove={handleMouseMove}
-                >
-                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
-                  
-                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
-                    <img src={swipeData.t1_image} alt="Before" />
+              <div className="glass-card timeline-container">
+                <div className="timeline-summary">
+                  <div>
+                    <span className="timeline-kicker">Selected paired area</span>
+                    <strong>{swipeData.pair_name}</strong>
                   </div>
-
-                  <div className="swipe-handle" style={{ left: `${swipePos}%` }}>
-                    <div className="swipe-button">↔</div>
+                  <div className="timeline-loss">
+                    <span>Estimated loss</span>
+                    <strong>{swipeData.deforestation_pct}%</strong>
+                    <span>{swipeData.deforestation_pixels.toLocaleString()} pixels</span>
                   </div>
                 </div>
+
+                <div className="timeline-frame">
+                  <span className="timeline-frame-label">{selectedTimelineFrame.label}</span>
+                  <img
+                    src={selectedTimelineFrame.image}
+                    className="timeline-image"
+                    alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name}`}
+                  />
+                </div>
+
+                <div className="timeline-control">
+                  <input
+                    type="range"
+                    min="0"
+                    max="2"
+                    step="1"
+                    value={timelineStep}
+                    aria-label="Timeline timepoint"
+                    aria-valuetext={selectedTimelineFrame.label}
+                    onChange={(event) => setTimelineStep(Number(event.target.value))}
+                  />
+                  <div className="timeline-ticks" aria-hidden="true">
+                    {timelineFrames.map((frame, index) => (
+                      <button
+                        key={frame.label}
+                        type="button"
+                        className={timelineStep === index ? 'active' : ''}
+                        onClick={() => setTimelineStep(index)}
+                      >
+                        {frame.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="timeline-description">{selectedTimelineFrame.description}</p>
               </div>
             )}
           </div>
