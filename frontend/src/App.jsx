@@ -656,11 +656,31 @@ export default function App() {
             </div>
 
             {swipeData && (
+<<<<<<< HEAD
               <div className="glass-card timeline-container">
                 <div className="timeline-summary">
                   <div>
                     <span className="timeline-kicker">Selected paired area</span>
                     <strong>{swipeData.pair_name}</strong>
+=======
+              <div className="glass-card swipe-container">
+                <div className="swipe-labels">
+                  <span className="label-before">◀ Before (T1 Satellite Image)</span>
+                  <span className="label-after">After + AI Deforestation Overlay ▶</span>
+                </div>
+
+                <div
+                  className="swipe-slider-box"
+                  onMouseDown={() => setIsDragging(true)}
+                  onMouseUp={() => setIsDragging(false)}
+                  onMouseLeave={() => setIsDragging(false)}
+                  onMouseMove={handleMouseMove}
+                >
+                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
+
+                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
+                    <img src={swipeData.t1_image} alt="Before" />
+>>>>>>> d37e8448b949b0da6f204f14365c3f6c438a9934
                   </div>
                   <div className="timeline-loss">
                     <span>Estimated loss</span>
@@ -669,18 +689,14 @@ export default function App() {
                   </div>
                 </div>
 
-                <div 
-                  className="swipe-slider-box"
-                  onMouseDown={() => setIsDragging(true)}
-                  onMouseUp={() => setIsDragging(false)}
-                  onMouseLeave={() => setIsDragging(false)}
-                  onMouseMove={handleMouseMove}
-                >
-                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
-                  
-                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
-                    <img src={swipeData.t1_image} alt="Before" />
-                  </div>
+                <div className="timeline-frame">
+                  <span className="timeline-frame-label">{selectedTimelineFrame.label}</span>
+                  <img
+                    src={selectedTimelineFrame.image}
+                    className="timeline-image"
+                    alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name}`}
+                  />
+                </div>
 
                 <div className="timeline-control">
                   <input
