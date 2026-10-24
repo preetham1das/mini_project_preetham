@@ -17,3 +17,7 @@ Thumbs.db
 
 # Generated / temporary files
 # (Keep project outputs and models tracked if you want them pushed)
+frontend/.vite/
+frontend/dist/
+data/SEN2NAIP/
+data/*.zip

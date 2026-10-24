@@ -677,19 +677,6 @@ export default function App() {
                     alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name}`}
                   />
                 </div>
-                <div
-                  className="swipe-slider-box"
-                  onMouseDown={() => setIsDragging(true)}
-                  onMouseUp={() => setIsDragging(false)}
-                  onMouseLeave={() => setIsDragging(false)}
-                  onMouseMove={handleMouseMove}
-                >
-                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
-
-                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
-                    <img src={swipeData.t1_image} alt="Before" />
-                  </div>
-
                 <div className="timeline-control">
                   <input
                     type="range"

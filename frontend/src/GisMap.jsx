@@ -535,6 +535,35 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   }, [cancelDrawing]);
 
 
+  const loadAmazonPreset = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const south = -3.515;
+    const north = -3.415;
+    const west = -62.265;
+    const east = -62.165;
+    const bounds = L.latLngBounds([[south, west], [north, east]]);
+
+    if (drawRectRef.current) { map.removeLayer(drawRectRef.current); drawRectRef.current = null; }
+    if (aoiLayerRef.current) { map.removeLayer(aoiLayerRef.current); aoiLayerRef.current = null; }
+
+    aoiLayerRef.current = L.rectangle(bounds, {
+      color: '#f59e0b', weight: 2.5, fillColor: '#fbbf24', fillOpacity: 0.08,
+      dashArray: '6 4',
+    }).addTo(map);
+
+    setAoiBounds(bounds);
+    setAcquisitions([]);
+    setFromIdx(null);
+    setToIdx(null);
+    setFromData(null);
+    setToData(null);
+    setAnalysisResult(null);
+    setAnalysisError('');
+    setSearchError('');
+    map.fitBounds(bounds, { padding: [20, 20] });
+  }, []);
+
   // ── Sentinel Search ──────────────────────────────────────────────────────────
 
   const runSearch = useCallback(async () => {
@@ -1041,13 +1070,23 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Area of Interest (AOI)</div>
             <div style={{ display: 'flex', gap: 8 }}>
               {!isDrawing ? (
-                <button
-                  className="btn btn-primary"
-                  style={{ flex: 1, padding: '9px 12px', fontSize: '0.82rem', background: '#f59e0b', boxShadow: '0 4px 12px rgba(245,158,11,0.3)' }}
-                  onClick={startDrawing}
-                >
-                  <Square size={14} /> Draw AOI
-                </button>
+                <>
+                  <button
+                    className="btn btn-primary"
+                    style={{ flex: 1, padding: '9px 12px', fontSize: '0.82rem', background: '#f59e0b', boxShadow: '0 4px 12px rgba(245,158,11,0.3)' }}
+                    onClick={startDrawing}
+                  >
+                    <Square size={14} /> Draw AOI
+                  </button>
+                  <button
+                    className="btn"
+                    style={{ flex: 1, padding: '9px 12px', fontSize: '0.82rem', background: '#2563eb', color: '#fff', border: 'none', boxShadow: '0 4px 12px rgba(37,99,235,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                    onClick={loadAmazonPreset}
+                    title="Load Amazon Deforestation Hotspot Preset (-3.465, -62.215)"
+                  >
+                    <MapPin size={14} /> Amazon Preset
+                  </button>
+                </>
               ) : (
                 <button
                   className="btn"
