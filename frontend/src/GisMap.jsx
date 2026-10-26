@@ -19,6 +19,7 @@ import React, {
   useEffect,
   useRef,
   useCallback,
+  useMemo,
 } from 'react';
 import L from 'leaflet';
 import {
@@ -221,6 +222,25 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
   const [acquisitions, setAcquisitions] = useState([]);  // [{id, datetime, cloud_coverage}]
+  const [selectedYear, setSelectedYear] = useState('all');
+  const [hasSearched, setHasSearched] = useState(false);
+
+  // Available unique years in acquisitions for filtering
+  const availableYears = useMemo(() => {
+    const years = new Set();
+    acquisitions.forEach(a => {
+      if (a.datetime) {
+        years.add(a.datetime.substring(0, 4));
+      }
+    });
+    return Array.from(years).sort();
+  }, [acquisitions]);
+
+  // Filtered acquisitions based on selected year tab
+  const displayedAcquisitions = useMemo(() => {
+    if (selectedYear === 'all') return acquisitions;
+    return acquisitions.filter(a => a.datetime && a.datetime.startsWith(selectedYear));
+  }, [acquisitions, selectedYear]);
 
   // Sentinel preview — Before/After workflow
   // fromIdx = FROM date (T1, older image = "Before")
@@ -535,6 +555,35 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   }, [cancelDrawing]);
 
 
+  const loadAmazonPreset = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const south = -3.515;
+    const north = -3.415;
+    const west = -62.265;
+    const east = -62.165;
+    const bounds = L.latLngBounds([[south, west], [north, east]]);
+
+    if (drawRectRef.current) { map.removeLayer(drawRectRef.current); drawRectRef.current = null; }
+    if (aoiLayerRef.current) { map.removeLayer(aoiLayerRef.current); aoiLayerRef.current = null; }
+
+    aoiLayerRef.current = L.rectangle(bounds, {
+      color: '#f59e0b', weight: 2.5, fillColor: '#fbbf24', fillOpacity: 0.08,
+      dashArray: '6 4',
+    }).addTo(map);
+
+    setAoiBounds(bounds);
+    setAcquisitions([]);
+    setFromIdx(null);
+    setToIdx(null);
+    setFromData(null);
+    setToData(null);
+    setAnalysisResult(null);
+    setAnalysisError('');
+    setSearchError('');
+    map.fitBounds(bounds, { padding: [20, 20] });
+  }, []);
+
   // ── Sentinel Search ──────────────────────────────────────────────────────────
 
   const runSearch = useCallback(async () => {
@@ -563,6 +612,8 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
     setSearching(true);
     setSearchError('');
     setAcquisitions([]);
+    setSelectedYear('all');
+    setHasSearched(false);
     setFromIdx(null);
     setToIdx(null);
     setFromData(null);
@@ -576,12 +627,13 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
       start_date: startDate,
       end_date:   endDate,
       bbox:       `${west.toFixed(6)},${south.toFixed(6)},${east.toFixed(6)},${north.toFixed(6)}`,
-      limit:      100,
+      limit:      1000,
     });
 
     try {
       const res = await fetch(`/api/sentinel/search?${params}`);
       const data = await res.json();
+      setHasSearched(true);
       if (!data.success) {
         setSearchError(data.error || 'Search failed.');
       } else if (!data.acquisitions?.length) {
@@ -594,6 +646,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
         setAcquisitions(sorted);
       }
     } catch (err) {
+      setHasSearched(true);
       setSearchError('Network error: ' + err.message);
     } finally {
       setSearching(false);
@@ -680,9 +733,13 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
 
   /**
    * Select the FROM date (T1 = Before). Loads the image and shows it on the map.
+   * Accepts either an acquisition object or an index in acquisitions.
    */
-  const selectFrom = useCallback(async (idx) => {
-    setFromIdx(idx);
+  const selectFrom = useCallback(async (target) => {
+    const acq = (typeof target === 'object' && target !== null) ? target : acquisitions[target];
+    if (!acq) return;
+    const realIdx = acquisitions.findIndex(a => a.id === acq.id);
+    setFromIdx(realIdx >= 0 ? realIdx : 0);
     setFromData(null);
     setFromCloudStats(null);
     setAnalysisResult(null);
@@ -690,7 +747,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
     setPreviewError('');
     setLoadingPreview(true);
     try {
-      const data = await fetchPreview(acquisitions[idx]);
+      const data = await fetchPreview(acq);
       if (!data) { setPreviewError('Failed to load FROM image.'); setLoadingPreview(false); return; }
 
       // Show FROM (before) on map
@@ -699,12 +756,12 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
       if (beforeLayerRef.current) { map.removeLayer(beforeLayerRef.current); beforeLayerRef.current = null; }
       beforeLayerRef.current = L.imageOverlay(data.image, imgBounds, { opacity: sentinelOpacity, zIndex: 198 }).addTo(map);
 
-      setFromData({ acq: acquisitions[idx], image: data.image, bbox: data.bbox });
+      setFromData({ acq, image: data.image, bbox: data.bbox });
       setLoadingPreview(false);
 
       // Concurrently fetch AOI-specific cloud statistics
       setLoadingFromCloud(true);
-      fetchCloudStats(acquisitions[idx], data.bbox)
+      fetchCloudStats(acq, data.bbox)
         .then(stats => setFromCloudStats(stats))
         .catch(() => setFromCloudStats(null))
         .finally(() => setLoadingFromCloud(false));
@@ -716,9 +773,13 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
 
   /**
    * Select the TO date (T2 = After). Loads the image and shows it on the map.
+   * Accepts either an acquisition object or an index in acquisitions.
    */
-  const selectTo = useCallback(async (idx) => {
-    setToIdx(idx);
+  const selectTo = useCallback(async (target) => {
+    const acq = (typeof target === 'object' && target !== null) ? target : acquisitions[target];
+    if (!acq) return;
+    const realIdx = acquisitions.findIndex(a => a.id === acq.id);
+    setToIdx(realIdx >= 0 ? realIdx : 0);
     setToData(null);
     setToCloudStats(null);
     setAnalysisResult(null);
@@ -726,7 +787,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
     setPreviewError('');
     setLoadingPreview(true);
     try {
-      const data = await fetchPreview(acquisitions[idx]);
+      const data = await fetchPreview(acq);
       if (!data) { setPreviewError('Failed to load TO image.'); setLoadingPreview(false); return; }
 
       // Show TO (after) on map (on top of FROM)
@@ -736,12 +797,12 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
       sentinelLayerRef.current = L.imageOverlay(data.image, imgBounds, { opacity: sentinelOpacity, zIndex: 200 }).addTo(map);
       map.fitBounds(imgBounds, { padding: [20, 20] });
 
-      setToData({ acq: acquisitions[idx], image: data.image, bbox: data.bbox });
+      setToData({ acq, image: data.image, bbox: data.bbox });
       setLoadingPreview(false);
 
       // Concurrently fetch AOI-specific cloud statistics
       setLoadingToCloud(true);
-      fetchCloudStats(acquisitions[idx], data.bbox)
+      fetchCloudStats(acq, data.bbox)
         .then(stats => setToCloudStats(stats))
         .catch(() => setToCloudStats(null))
         .finally(() => setLoadingToCloud(false));
@@ -1003,8 +1064,8 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   // ── Render ───────────────────────────────────────────────────────────────────
 
   const canAnalyze = fromData !== null && toData !== null &&
-    fromIdx !== toIdx && !analysing && !loadingPreview;
-  const bothSelected = fromIdx !== null && toIdx !== null;
+    fromData?.acq?.id !== toData?.acq?.id && !analysing && !loadingPreview;
+  const bothSelected = (fromData !== null || fromIdx !== null) && (toData !== null || toIdx !== null);
   const activeCloudStats = (mapViewMode === 'before' ? fromCloudStats : toCloudStats) || toCloudStats || fromCloudStats;
 
   return (
@@ -1041,13 +1102,23 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
             <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Area of Interest (AOI)</div>
             <div style={{ display: 'flex', gap: 8 }}>
               {!isDrawing ? (
-                <button
-                  className="btn btn-primary"
-                  style={{ flex: 1, padding: '9px 12px', fontSize: '0.82rem', background: '#f59e0b', boxShadow: '0 4px 12px rgba(245,158,11,0.3)' }}
-                  onClick={startDrawing}
-                >
-                  <Square size={14} /> Draw AOI
-                </button>
+                <>
+                  <button
+                    className="btn btn-primary"
+                    style={{ flex: 1, padding: '9px 12px', fontSize: '0.82rem', background: '#f59e0b', boxShadow: '0 4px 12px rgba(245,158,11,0.3)' }}
+                    onClick={startDrawing}
+                  >
+                    <Square size={14} /> Draw AOI
+                  </button>
+                  <button
+                    className="btn"
+                    style={{ flex: 1, padding: '9px 12px', fontSize: '0.82rem', background: '#2563eb', color: '#fff', border: 'none', boxShadow: '0 4px 12px rgba(37,99,235,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                    onClick={loadAmazonPreset}
+                    title="Load Amazon Deforestation Hotspot Preset (-3.465, -62.215)"
+                  >
+                    <MapPin size={14} /> Amazon Preset
+                  </button>
+                </>
               ) : (
                 <button
                   className="btn"
@@ -1571,7 +1642,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
               {!fromData && toData && 'Now select a FROM date from the timeline.'}
             </div>
           )}
-          {fromIdx !== null && toIdx !== null && fromIdx === toIdx && (
+          {((fromData?.acq?.id && toData?.acq?.id && fromData.acq.id === toData.acq.id) || (fromIdx !== null && toIdx !== null && fromIdx === toIdx)) && (
             <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#dc2626', textAlign: 'center', fontWeight: 600 }}>
               ⚠️ FROM and TO dates must be different.
             </div>
@@ -1865,6 +1936,28 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
           )}
         </div>
 
+        {/* Empty state when search completed with 0 results */}
+        {hasSearched && !searching && acquisitions.length === 0 && (
+          <div style={{
+            marginTop: 12,
+            background: '#fff', border: '1px solid var(--border-color)',
+            borderRadius: 14, padding: '22px 24px',
+            boxShadow: 'var(--shadow-md)', textAlign: 'center',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 6 }}>
+              <Calendar size={18} color="#64748b" />
+              <span style={{ fontWeight: 700, fontSize: '0.92rem', color: 'var(--text-main)' }}>
+                No Sentinel-2 Acquisitions Found
+              </span>
+            </div>
+            <p style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              No satellite imagery was captured between <strong>{startDate}</strong> and <strong>{endDate}</strong> for this Area of Interest.
+              <br />
+              Tip: Sentinel-2 operational catalog starts from mid-2015. Try broadening the date range or redrawing the AOI.
+            </p>
+          </div>
+        )}
+
         {/* ─── TIMELINE ──────────────────────────────────── */}
         {acquisitions.length > 0 && (
           <div style={{
@@ -1873,18 +1966,22 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
             borderRadius: 14, padding: '14px 18px',
             boxShadow: 'var(--shadow-md)',
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: availableYears.length > 1 ? 8 : 10, flexWrap: 'wrap', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <Calendar size={15} color="#2563eb" />
                 <span style={{ fontWeight: 700, fontSize: '0.88rem' }}>Sentinel-2 Historical Acquisitions</span>
                 <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', background: 'var(--bg-main)', padding: '2px 8px', borderRadius: 10, border: '1px solid var(--border-color)' }}>
-                  {acquisitions.length} available
+                  Showing {displayedAcquisitions.length} of {acquisitions.length} acquisitions
                 </span>
               </div>
 
               {/* Status Chips */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.75rem' }}>
-                {fromIdx !== null ? (
+                {fromData?.acq?.datetime ? (
+                  <span style={{ background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', padding: '2px 8px', borderRadius: 6, fontWeight: 600 }}>
+                    FROM: {formatDate(fromData.acq.datetime)}
+                  </span>
+                ) : fromIdx !== null && acquisitions[fromIdx]?.datetime ? (
                   <span style={{ background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d', padding: '2px 8px', borderRadius: 6, fontWeight: 600 }}>
                     FROM: {formatDate(acquisitions[fromIdx]?.datetime)}
                   </span>
@@ -1892,7 +1989,11 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                   <span style={{ color: 'var(--text-muted)' }}>FROM: [Choose below]</span>
                 )}
                 <ArrowRight size={12} color="var(--text-muted)" />
-                {toIdx !== null ? (
+                {toData?.acq?.datetime ? (
+                  <span style={{ background: '#dbeafe', color: '#1e40af', border: '1px solid #bfdbfe', padding: '2px 8px', borderRadius: 6, fontWeight: 600 }}>
+                    TO: {formatDate(toData.acq.datetime)}
+                  </span>
+                ) : toIdx !== null && acquisitions[toIdx]?.datetime ? (
                   <span style={{ background: '#dbeafe', color: '#1e40af', border: '1px solid #bfdbfe', padding: '2px 8px', borderRadius: 6, fontWeight: 600 }}>
                     TO: {formatDate(acquisitions[toIdx]?.datetime)}
                   </span>
@@ -1907,11 +2008,51 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
               </div>
             </div>
 
+            {/* Year Filter Chips (shown when results span multiple years) */}
+            {availableYears.length > 1 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 10, paddingTop: 4, borderTop: '1px solid var(--border-color)' }}>
+                <span style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-muted)', marginRight: 2 }}>
+                  Filter Year:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedYear('all')}
+                  style={{
+                    padding: '2px 8px', borderRadius: 12, fontSize: '0.7rem', fontWeight: 600, cursor: 'pointer',
+                    background: selectedYear === 'all' ? '#2563eb' : 'var(--bg-main)',
+                    color: selectedYear === 'all' ? '#fff' : 'var(--text-main)',
+                    border: selectedYear === 'all' ? '1px solid #1d4ed8' : '1px solid var(--border-color)',
+                  }}
+                >
+                  All ({acquisitions.length})
+                </button>
+                {availableYears.map(yr => {
+                  const yrCount = acquisitions.filter(a => a.datetime && a.datetime.startsWith(yr)).length;
+                  const isYrActive = selectedYear === yr;
+                  return (
+                    <button
+                      type="button"
+                      key={yr}
+                      onClick={() => setSelectedYear(yr)}
+                      style={{
+                        padding: '2px 8px', borderRadius: 12, fontSize: '0.7rem', fontWeight: 600, cursor: 'pointer',
+                        background: isYrActive ? '#2563eb' : 'var(--bg-main)',
+                        color: isYrActive ? '#fff' : 'var(--text-main)',
+                        border: isYrActive ? '1px solid #1d4ed8' : '1px solid var(--border-color)',
+                      }}
+                    >
+                      {yr} ({yrCount})
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
             {/* Timeline scroll */}
             <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4, scrollbarWidth: 'thin', alignItems: 'stretch' }}>
-              {acquisitions.map((acq, idx) => {
-                const isFrom = idx === fromIdx;
-                const isTo   = idx === toIdx;
+              {displayedAcquisitions.map((acq, idx) => {
+                const isFrom = fromData?.acq?.id ? fromData.acq.id === acq.id : (fromIdx !== null && acquisitions[fromIdx]?.id === acq.id);
+                const isTo   = toData?.acq?.id   ? toData.acq.id === acq.id   : (toIdx !== null && acquisitions[toIdx]?.id === acq.id);
                 const dateStr = formatDate(acq.datetime);
                 const cc = acq.cloud_coverage;
                 const ccColor = cloudColor(cc);
@@ -1959,7 +2100,8 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                     {/* Action buttons: Set FROM and Set TO */}
                     <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
                       <button
-                        onClick={() => selectFrom(idx)}
+                        type="button"
+                        onClick={() => selectFrom(acq)}
                         style={{
                           flex: 1, padding: '3px 4px', fontSize: '0.66rem', fontWeight: 700,
                           borderRadius: 4, cursor: 'pointer',
@@ -1973,7 +2115,8 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                         {isFrom ? '★ FROM' : 'Set FROM'}
                       </button>
                       <button
-                        onClick={() => selectTo(idx)}
+                        type="button"
+                        onClick={() => selectTo(acq)}
                         style={{
                           flex: 1, padding: '3px 4px', fontSize: '0.66rem', fontWeight: 700,
                           borderRadius: 4, cursor: 'pointer',

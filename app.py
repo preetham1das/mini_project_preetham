@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -331,64 +331,128 @@ def search_sentinel():
             round(lat + delta_deg, 6),
         ]
 
-    # 7. Query Copernicus Data Space / Sentinel Hub STAC Catalog
+    # 7. Query Copernicus Data Space / Sentinel Hub STAC Catalog with pagination
     base_url = os.environ.get("SENTINEL_BASE_URL", SENTINEL_BASE_URL).rstrip("/")
     catalog_url = f"{base_url}/catalog/1.0.0/search"
 
-    limit_val = 50
+    # Copernicus STAC maximum allowed limit per page is 100
+    stac_page_limit = 100
+
+    # Max total acquisitions to return across all pages (default 1000, covers ~10+ years)
+    max_acquisitions = 1000
     if request.args.get("limit"):
         try:
-            limit_val = min(max(1, int(request.args.get("limit"))), 100)
+            max_acquisitions = min(max(1, int(request.args.get("limit"))), 2000)
         except ValueError:
             pass
+
+    # Inclusive UTC boundaries for filtering
+    start_dt_utc = start_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    end_dt_utc = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
 
     search_payload = {
         "collections": ["sentinel-2-l2a"],
         "datetime": f"{start_date_raw.strip()}T00:00:00Z/{end_date_raw.strip()}T23:59:59Z",
         "bbox": search_bbox,
-        "limit": limit_val
+        "limit": stac_page_limit
     }
 
-    try:
-        cat_resp = requests.post(
-            catalog_url,
-            json=search_payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            },
-            timeout=25
-        )
-    except requests.exceptions.RequestException as e:
-        return jsonify({
-            "success": False,
-            "error": f"Network error connecting to Sentinel-2 catalog: {str(e)}"
-        }), 503
+    all_features = []
+    seen_ids = set()
+    next_token = None
+    page_count = 0
+    max_pages = 25
+    has_more = False
 
-    if cat_resp.status_code != 200:
-        err_detail = cat_resp.text[:300]
+    while page_count < max_pages:
+        page_count += 1
+        if next_token:
+            search_payload["next"] = next_token
+        elif "next" in search_payload:
+            del search_payload["next"]
+
         try:
-            err_json = cat_resp.json()
-            err_detail = err_json.get("description") or err_json.get("error") or err_detail
+            cat_resp = requests.post(
+                catalog_url,
+                json=search_payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                timeout=25
+            )
+        except requests.exceptions.RequestException as e:
+            if not all_features:
+                return jsonify({
+                    "success": False,
+                    "error": f"Network error connecting to Sentinel-2 catalog: {str(e)}"
+                }), 503
+            break
+
+        if cat_resp.status_code != 200:
+            if not all_features:
+                err_detail = cat_resp.text[:300]
+                try:
+                    err_json = cat_resp.json()
+                    err_detail = err_json.get("description") or err_json.get("error") or err_detail
+                except Exception:
+                    pass
+                return jsonify({
+                    "success": False,
+                    "error": f"Sentinel catalog search failed (HTTP {cat_resp.status_code}): {err_detail}"
+                }), cat_resp.status_code
+            break
+
+        try:
+            cat_data = cat_resp.json()
         except Exception:
-            pass
-        return jsonify({
-            "success": False,
-            "error": f"Sentinel catalog search failed (HTTP {cat_resp.status_code}): {err_detail}"
-        }), cat_resp.status_code
+            if not all_features:
+                return jsonify({"success": False, "error": "Invalid JSON received from Sentinel catalog service."}), 502
+            break
 
-    try:
-        cat_data = cat_resp.json()
-    except Exception:
-        return jsonify({"success": False, "error": "Invalid JSON received from Sentinel catalog service."}), 502
+        features = cat_data.get("features", [])
+        if not features:
+            break
 
-    features = cat_data.get("features", [])
+        for item in features:
+            item_id = item.get("id")
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                all_features.append(item)
+                if len(all_features) >= max_acquisitions:
+                    break
+
+        next_token = cat_data.get("context", {}).get("next")
+        if not next_token:
+            for link in cat_data.get("links", []):
+                if link.get("rel") == "next":
+                    body = link.get("body", {})
+                    next_token = body.get("next")
+                    break
+
+        if len(all_features) >= max_acquisitions:
+            if next_token:
+                has_more = True
+            break
+
+        if not next_token:
+            break
 
     acquisitions = []
-    for item in features:
+    for item in all_features:
         item_id = item.get("id")
         props = item.get("properties", {})
         dt_str = props.get("datetime")
+
+        # Strictly enforce requested date range
+        if dt_str:
+            try:
+                item_dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                if not (start_dt_utc <= item_dt <= end_dt_utc):
+                    continue
+            except Exception:
+                pass
+
         cloud = props.get("eo:cloud_cover")
         if cloud is None:
             cloud = props.get("cloudCover")
@@ -404,12 +468,14 @@ def search_sentinel():
             "cloud_coverage": cloud
         })
 
-    # Sort acquisitions newest first
-    acquisitions.sort(key=lambda x: x.get("datetime") or "", reverse=True)
+    # Sort acquisitions chronologically, oldest first, so the timeline flows left-to-right
+    acquisitions.sort(key=lambda x: x.get("datetime") or "")
 
     resp_payload = {
         "success": True,
         "count": len(acquisitions),
+        "total_count": len(acquisitions),
+        "has_more": has_more,
         "query": {
             "latitude": lat,
             "longitude": lon,

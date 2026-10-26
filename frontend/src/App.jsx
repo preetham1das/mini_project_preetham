@@ -657,11 +657,15 @@ export default function App() {
 
             {swipeData && (
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 5f1356d9a9eaa7986a8fcc30de3285842ae48d6d
               <div className="glass-card timeline-container">
                 <div className="timeline-summary">
                   <div>
                     <span className="timeline-kicker">Selected paired area</span>
                     <strong>{swipeData.pair_name}</strong>
+<<<<<<< HEAD
 =======
               <div className="glass-card swipe-container">
                 <div className="swipe-labels">
@@ -681,6 +685,8 @@ export default function App() {
                   <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
                     <img src={swipeData.t1_image} alt="Before" />
 >>>>>>> d37e8448b949b0da6f204f14365c3f6c438a9934
+=======
+>>>>>>> 5f1356d9a9eaa7986a8fcc30de3285842ae48d6d
                   </div>
                   <div className="timeline-loss">
                     <span>Estimated loss</span>
@@ -697,7 +703,6 @@ export default function App() {
                     alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name}`}
                   />
                 </div>
-
                 <div className="timeline-control">
                   <input
                     type="range"
