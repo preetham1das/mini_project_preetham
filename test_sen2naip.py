@@ -28,6 +28,8 @@ from src.swinir.network_swinir import SwinIR
 DEVICE = torch.device("cpu")
 
 
+skip_sen2naip = not (PROJECT_ROOT / "data" / "SEN2NAIP" / "cross-sensor").exists()
+@unittest.skipIf(skip_sen2naip, "SEN2NAIP dataset not available")
 class TestSEN2NAIPDataset(unittest.TestCase):
     def test_split_counts_and_shapes(self):
         train_loader, val_loader, test_loader = get_sen2naip_dataloaders(

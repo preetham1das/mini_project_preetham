@@ -629,92 +629,90 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 4: SWIPE COMPARISON */}
+        {/* TAB 4: TIMELINE COMPARISON */}
         {activeTab === 'swipe' && (
           <div className="tab-content">
-            <div className="glass-card control-panel" style={{ justifyContent: 'center' }}>
+            <div
+              className="glass-card control-panel"
+              style={{ justifyContent: 'center' }}
+            >
               <div style={{ width: 350 }}>
-                <label className="section-label">Select Temporal Image Pair</label>
+                <label className="section-label">
+                  Select Temporal Image Pair
+                </label>
                 <select
                   className="custom-select"
                   value={swipeSample}
-                  onChange={(e) => {
-                    setSwipeSample(e.target.value);
+                  onChange={(event) => {
+                    setSwipeSample(event.target.value);
                     setSwipeData(null);
                     setTimelineStep(0);
                   }}
                 >
                   <option value="">-- Choose Sample Pair --</option>
-                  {samples.stage2_samples.map((s, i) => (
-                    <option key={i} value={JSON.stringify(s)}>{s.name}</option>
+                  {samples.stage2_samples.map((sample, index) => (
+                    <option key={index} value={JSON.stringify(sample)}>
+                      {sample.name}
+                    </option>
                   ))}
                 </select>
               </div>
+
               <button className="btn btn-primary" onClick={handleLoadSwipe}>
                 <Play size={16} /> Analyze Pair
               </button>
             </div>
 
             {swipeData && (
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 5f1356d9a9eaa7986a8fcc30de3285842ae48d6d
               <div className="glass-card timeline-container">
                 <div className="timeline-summary">
                   <div>
-                    <span className="timeline-kicker">Selected paired area</span>
+                    <span className="timeline-kicker">
+                      Selected paired area
+                    </span>
                     <strong>{swipeData.pair_name}</strong>
-<<<<<<< HEAD
-=======
-              <div className="glass-card swipe-container">
-                <div className="swipe-labels">
-                  <span className="label-before">◀ Before (T1 Satellite Image)</span>
-                  <span className="label-after">After + AI Deforestation Overlay ▶</span>
-                </div>
-
-                <div
-                  className="swipe-slider-box"
-                  onMouseDown={() => setIsDragging(true)}
-                  onMouseUp={() => setIsDragging(false)}
-                  onMouseLeave={() => setIsDragging(false)}
-                  onMouseMove={handleMouseMove}
-                >
-                  <img src={swipeData.deforestation_overlay} className="swipe-img" alt="After" />
-
-                  <div className="swipe-img-before-wrapper" style={{ width: `${swipePos}%` }}>
-                    <img src={swipeData.t1_image} alt="Before" />
->>>>>>> d37e8448b949b0da6f204f14365c3f6c438a9934
-=======
->>>>>>> 5f1356d9a9eaa7986a8fcc30de3285842ae48d6d
                   </div>
+
                   <div className="timeline-loss">
                     <span>Estimated loss</span>
                     <strong>{swipeData.deforestation_pct}%</strong>
-                    <span>{swipeData.deforestation_pixels.toLocaleString()} pixels</span>
+                    <span>
+                      {Number(
+                        swipeData.deforestation_pixels ?? 0
+                      ).toLocaleString()} pixels
+                    </span>
                   </div>
                 </div>
 
-                <div className="timeline-frame">
-                  <span className="timeline-frame-label">{selectedTimelineFrame.label}</span>
-                  <img
-                    src={selectedTimelineFrame.image}
-                    className="timeline-image"
-                    alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name}`}
-                  />
-                </div>
+                {selectedTimelineFrame && (
+                  <div className="timeline-frame">
+                    <span className="timeline-frame-label">
+                      {selectedTimelineFrame.label}
+                    </span>
+                    <img
+                      src={selectedTimelineFrame.image}
+                      className="timeline-image"
+                      alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name || 'selected satellite pair'
+                        }`}
+                    />
+                  </div>
+                )}
+
                 <div className="timeline-control">
                   <input
                     type="range"
                     min="0"
-                    max="2"
+                    max={Math.max(timelineFrames.length - 1, 0)}
                     step="1"
                     value={timelineStep}
                     aria-label="Timeline timepoint"
-                    aria-valuetext={selectedTimelineFrame.label}
-                    onChange={(event) => setTimelineStep(Number(event.target.value))}
+                    aria-valuetext={selectedTimelineFrame?.label || ''}
+                    onChange={(event) =>
+                      setTimelineStep(Number(event.target.value))
+                    }
                   />
-                  <div className="timeline-ticks" aria-hidden="true">
+
+                  <div className="timeline-ticks">
                     {timelineFrames.map((frame, index) => (
                       <button
                         key={frame.label}
@@ -727,7 +725,10 @@ export default function App() {
                     ))}
                   </div>
                 </div>
-                <p className="timeline-description">{selectedTimelineFrame.description}</p>
+
+                <p className="timeline-description">
+                  {selectedTimelineFrame?.description}
+                </p>
               </div>
             )}
           </div>
@@ -740,15 +741,44 @@ export default function App() {
               {analytics?.stage1 && (
                 <div className="glass-card metric-group">
                   <div className="group-title">
-                    <h3>Stage 1 U-Net Model (Forest Canopy Segmentation)</h3>
-                    <span className="badge badge-success">Validation Set Evaluation</span>
+                    <h3>
+                      Stage 1 U-Net Model (Forest Canopy Segmentation)
+                    </h3>
+                    <span className="badge badge-success">
+                      Validation Set Evaluation
+                    </span>
                   </div>
                   <div className="metric-row">
-                    <div className="m-box"><span className="m-val text-green">{analytics.stage1.val_iou?.toFixed(4) || "0.8412"}</span><span className="m-lbl">Mean IoU</span></div>
-                    <div className="m-box"><span className="m-val text-green">{analytics.stage1.val_dice?.toFixed(4) || "0.9137"}</span><span className="m-lbl">Dice Score</span></div>
-                    <div className="m-box"><span className="m-val">{analytics.stage1.val_precision?.toFixed(4) || "0.9240"}</span><span className="m-lbl">Precision</span></div>
-                    <div className="m-box"><span className="m-val">{analytics.stage1.val_recall?.toFixed(4) || "0.9036"}</span><span className="m-lbl">Recall</span></div>
-                    <div className="m-box"><span className="m-val">{analytics.stage1.val_accuracy?.toFixed(4) || "0.9582"}</span><span className="m-lbl">Pixel Accuracy</span></div>
+                    <div className="m-box">
+                      <span className="m-val text-green">
+                        {analytics.stage1.val_iou?.toFixed(4) || '0.8412'}
+                      </span>
+                      <span className="m-lbl">Mean IoU</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val text-green">
+                        {analytics.stage1.val_dice?.toFixed(4) || '0.9137'}
+                      </span>
+                      <span className="m-lbl">Dice Score</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val">
+                        {analytics.stage1.val_precision?.toFixed(4) || '0.9240'}
+                      </span>
+                      <span className="m-lbl">Precision</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val">
+                        {analytics.stage1.val_recall?.toFixed(4) || '0.9036'}
+                      </span>
+                      <span className="m-lbl">Recall</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val">
+                        {analytics.stage1.val_accuracy?.toFixed(4) || '0.9582'}
+                      </span>
+                      <span className="m-lbl">Pixel Accuracy</span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -756,15 +786,44 @@ export default function App() {
               {analytics?.stage2 && (
                 <div className="glass-card metric-group">
                   <div className="group-title">
-                    <h3>Stage 2 Temporal U-Net (Deforestation Change Detection)</h3>
-                    <span className="badge badge-warning">Held-Out Test Set (33 Image Pairs)</span>
+                    <h3>
+                      Stage 2 Temporal U-Net (Deforestation Change Detection)
+                    </h3>
+                    <span className="badge badge-warning">
+                      Held-Out Test Set (33 Image Pairs)
+                    </span>
                   </div>
                   <div className="metric-row">
-                    <div className="m-box"><span className="m-val text-red">{analytics.stage2.global_iou?.toFixed(4) || "0.5043"}</span><span className="m-lbl">Global Test IoU</span></div>
-                    <div className="m-box"><span className="m-val text-red">{analytics.stage2.global_dice?.toFixed(4) || "0.6705"}</span><span className="m-lbl">Global Dice Score</span></div>
-                    <div className="m-box"><span className="m-val">{analytics.stage2.global_precision?.toFixed(4) || "0.6812"}</span><span className="m-lbl">Precision</span></div>
-                    <div className="m-box"><span className="m-val">{analytics.stage2.global_recall?.toFixed(4) || "0.6601"}</span><span className="m-lbl">Recall</span></div>
-                    <div className="m-box"><span className="m-val">{analytics.stage2.total_test_pairs || "33"}</span><span className="m-lbl">Test Image Pairs</span></div>
+                    <div className="m-box">
+                      <span className="m-val text-red">
+                        {analytics.stage2.global_iou?.toFixed(4) || '0.5043'}
+                      </span>
+                      <span className="m-lbl">Global Test IoU</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val text-red">
+                        {analytics.stage2.global_dice?.toFixed(4) || '0.6705'}
+                      </span>
+                      <span className="m-lbl">Global Dice Score</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val">
+                        {analytics.stage2.global_precision?.toFixed(4) || '0.6812'}
+                      </span>
+                      <span className="m-lbl">Precision</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val">
+                        {analytics.stage2.global_recall?.toFixed(4) || '0.6601'}
+                      </span>
+                      <span className="m-lbl">Recall</span>
+                    </div>
+                    <div className="m-box">
+                      <span className="m-val">
+                        {analytics.stage2.total_test_pairs || '33'}
+                      </span>
+                      <span className="m-lbl">Test Image Pairs</span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -774,4 +833,6 @@ export default function App() {
       </main>
     </div>
   );
+
 }
+
