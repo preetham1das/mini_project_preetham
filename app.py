@@ -217,6 +217,23 @@ def array_to_base64_png(np_img):
     return f"data:image/png;base64,{b64_str}"
 
 
+def decode_stage2_upload_pair(file_t1, file_t2):
+    """Decode uploaded T1/T2 images and ensure they use the same pixel grid."""
+    try:
+        image_t1 = Image.open(file_t1.stream).convert("RGB")
+        image_t2 = Image.open(file_t2.stream).convert("RGB")
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Could not read both uploaded images: {exc}") from exc
+
+    if image_t1.size != image_t2.size:
+        raise ValueError(
+            "Uploaded T1 and T2 images must have identical dimensions and be "
+            "co-registered to the same geographic footprint."
+        )
+
+    return image_t1, image_t2
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -1392,6 +1409,11 @@ def analyze_sentinel_deforestation():
     pil_after, err = decode_b64_image(img_after_b64, "image_after")
     if err:
         return jsonify({"success": False, "error": err}), 400
+    if pil_before.size != pil_after.size:
+        return jsonify({
+            "success": False,
+            "error": "Before and after images must have identical dimensions and cover the same AOI."
+        }), 400
 
     # -- Preprocessing: identical to temporal_dataset.py TemporalForestDataset -
     # Step 1: Resize to 256x256 (BILINEAR, same as training)
@@ -1779,8 +1801,10 @@ def predict_stage2():
     if "file_t1" in request.files and "file_t2" in request.files:
         f_a = request.files["file_t1"]
         f_b = request.files["file_t2"]
-        pil_a = Image.open(f_a.stream).convert("RGB")
-        pil_b = Image.open(f_b.stream).convert("RGB")
+        try:
+            pil_a, pil_b = decode_stage2_upload_pair(f_a, f_b)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
     elif sample_id:
         t1_path = temporal_root / split / "A" / f"{sample_id}.png"
         t2_path = temporal_root / split / "B" / f"{sample_id}.png"

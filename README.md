@@ -426,7 +426,13 @@ SENTINEL_BASE_URL="https://sh.dataspace.copernicus.eu/api/v1"
 SENTINEL_TOKEN_URL="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 ```
 
-*Note: Free Copernicus credentials can be created at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/). If credentials are not configured, the local Stage 1 and Stage 2 dataset features remain fully operational.*
+*Note: Free Copernicus credentials can be created at [dataspace.copernicus.eu](https://dataspace.copernicus.eu/). Without configured credentials and network access, live Sentinel-2 search and imagery are unavailable; Stage 1, Stage 2 sample pairs, and image uploads remain available.*
+
+### Stage 2: Live Sentinel-2 or Local Imagery
+
+In the Stage 2 workbench, choose **Choose AOI and dates on GIS Map** to open the existing Interactive GIS Map. Draw an AOI, search Sentinel-2 acquisitions over a date range, set an earlier acquisition as **FROM / T1** and a later one as **TO / T2**, then run **Analyze Deforestation**. The map retrieves both images for the same AOI and sends them to the existing `/api/sentinel/analyze` endpoint, which runs the trained 9-channel Temporal U-Net. AOI cloud statistics are shown when available; scenes with substantial cloud cover should be avoided. Missing credentials, acquisitions, or network access are reported as unavailable rather than replaced with sample imagery.
+
+Pre-loaded temporal pairs and manual T1/T2 uploads remain alternatives in Stage 2. Uploaded images must be co-registered to the same geographic footprint and have identical dimensions; the application can validate dimensions, but cannot infer geospatial alignment from ordinary image files. Inference resizes both images to 256 × 256, converts RGB values to [0, 1], and constructs `[T1 RGB, T2 RGB, |T1 - T2|]`. Live Sentinel-2 results are indicative: the model was trained on a different dataset and has a domain gap, as disclosed with the result.
 
 ---
 

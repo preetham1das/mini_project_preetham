@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Globe,
   Trees,
@@ -18,6 +18,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('gis-map');
   const [loading, setLoading] = useState(false);
   const [backendStatus, setBackendStatus] = useState('connecting');
+  const [sentinelStatus, setSentinelStatus] = useState('checking');
 
   // Samples Data
   const [samples, setSamples] = useState({ stage1_samples: [], stage2_samples: [] });
@@ -67,6 +68,34 @@ export default function App() {
       .then(res => res.json())
       .then(data => setAnalytics(data))
       .catch(err => console.error("Metrics fetch error:", err));
+
+    fetch('/api/sentinel/status')
+      .then(res => {
+        if (!res.ok) throw new Error(`Sentinel status returned ${res.status}`);
+        return res.json();
+      })
+      .then(data => setSentinelStatus(data.configured ? 'configured' : 'missing'))
+      .catch(err => {
+        console.error("Sentinel status error:", err);
+        setSentinelStatus('unknown');
+      });
+  }, []);
+
+  const handleLiveStage2Result = useCallback((data) => {
+    const deforestationPct = data.deforestation_pct ?? data.deforestation_percentage;
+    const deforestationPixels = data.defor_pixels ?? data.changed_pixels;
+    setS2Results({
+      ...data,
+      pair_name: `Sentinel-2 ${data.date_before || 'T1'} → ${data.date_after || 'T2'}`,
+      deforestation_pct: deforestationPct,
+      deforestation_pixels: deforestationPixels,
+      stable_pixels: data.stable_pixels ?? (data.total_pixels - deforestationPixels),
+      stable_pct: data.stable_pct ?? (100 - deforestationPct),
+      t1_image: data.before_image ?? data.t1_image,
+      t2_image: data.after_image ?? data.t2_image,
+      live_source: true,
+    });
+    setActiveTab('stage2');
   }, []);
 
   // Run GIS Spatial Analysis (AI overlay on the map)
@@ -395,6 +424,8 @@ export default function App() {
                 aiMode={gisMode}
                 aiOpacity={gisOpacity}
                 aiOverlayData={aiOverlayData}
+                stage2Threshold={s2Threshold}
+                onStage2Result={handleLiveStage2Result}
               />
             </div>
           </div>
@@ -505,7 +536,38 @@ export default function App() {
           <div className="tab-content">
             <div className="glass-card control-panel">
               <div className="panel-section" style={{ minWidth: 260 }}>
-                <label className="section-label">Select Pre-loaded Temporal Pair</label>
+                <label className="section-label">Live Sentinel-2 Analysis</label>
+                <p style={{ margin: '0 0 10px', color: 'var(--text-muted)', fontSize: '0.82rem', lineHeight: 1.5 }}>
+                  Choose an AOI and before/after acquisition dates on the GIS map. Both images are fetched for the same area and analyzed by the trained Temporal U-Net.
+                </p>
+                {sentinelStatus === 'configured' ? (
+                  <p style={{ margin: '0 0 10px', color: 'var(--primary-green)', fontSize: '0.78rem' }}>
+                    Copernicus credentials are configured. Imagery still depends on network access and suitable acquisitions.
+                  </p>
+                ) : (
+                  <p style={{ margin: '0 0 10px', color: '#b45309', fontSize: '0.78rem', lineHeight: 1.5 }}>
+                    {sentinelStatus === 'checking'
+                      ? 'Checking Sentinel-2 service configuration…'
+                      : sentinelStatus === 'missing'
+                        ? 'Live imagery is unavailable until SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET are configured in the project .env file and the backend is restarted. Sample pairs and uploads remain available.'
+                        : 'Sentinel-2 service status could not be checked. Confirm the backend and Copernicus credentials before relying on live imagery.'}
+                  </p>
+                )}
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ background: '#2563eb', color: '#fff', border: 'none' }}
+                  onClick={() => {
+                    setGisMode('stage2');
+                    setActiveTab('gis-map');
+                  }}
+                >
+                  <MapPin size={16} /> Choose AOI and dates on GIS Map
+                </button>
+              </div>
+
+              <div className="panel-section" style={{ minWidth: 260 }}>
+                <label className="section-label">Optional: Use a Pre-loaded Temporal Pair</label>
                 <select
                   className="custom-select"
                   value={s2Sample}
@@ -515,7 +577,7 @@ export default function App() {
                     setS2FileT2(null);
                   }}
                 >
-                  <option value="">-- Choose Sample Pair --</option>
+                  <option value="">-- No sample selected --</option>
                   {samples.stage2_samples.map((s, i) => (
                     <option key={i} value={JSON.stringify(s)}>{s.name}</option>
                   ))}
@@ -524,6 +586,9 @@ export default function App() {
 
               <div className="panel-section">
                 <label className="section-label">Or Upload T1 (Before Image)</label>
+                <p style={{ margin: '0 0 8px', color: 'var(--text-muted)', fontSize: '0.72rem' }}>
+                  Upload co-registered images covering the same footprint and with identical dimensions.
+                </p>
                 <div className="file-dropzone">
                   <span>{s2FileT1 ? `T1: ${s2FileT1.name}` : 'Click to Upload Before (T1)'}</span>
                   <input
@@ -578,6 +643,11 @@ export default function App() {
 
             {s2Results && (
               <>
+                {s2Results.live_source && (
+                  <div className="glass-card" style={{ padding: 14, color: 'var(--text-muted)', fontSize: '0.8rem', lineHeight: 1.5 }}>
+                    {s2Results.pair_name} · Live Sentinel-2 imagery analyzed with the existing Temporal U-Net.
+                  </div>
+                )}
                 <div className="stats-grid">
                   <div className="glass-card stat-card">
                     <span className="stat-label">Deforestation Loss Area</span>
@@ -624,6 +694,11 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+                {s2Results.model_note && (
+                  <div className="glass-card" style={{ padding: 14, color: 'var(--text-muted)', fontSize: '0.8rem', lineHeight: 1.5 }}>
+                    {s2Results.model_note}
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -835,4 +910,3 @@ export default function App() {
   );
 
 }
-

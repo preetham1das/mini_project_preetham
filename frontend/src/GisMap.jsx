@@ -193,7 +193,15 @@ const BASE_ZOOM = 2;
 
 // ── component ─────────────────────────────────────────────────────────────────
 
-export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOverlayData }) {
+export default function GisMap({
+  samples = [],
+  aiMode,
+  aiOpacity,
+  onAiRun,
+  aiOverlayData,
+  stage2Threshold = 0.5,
+  onStage2Result,
+}) {
   // Map refs
   const mapDivRef   = useRef(null);
   const mapRef      = useRef(null);
@@ -819,6 +827,28 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
       setAnalysisError('Select both a FROM date and a TO date before running analysis.');
       return;
     }
+    if (!aoiBounds) {
+      setAnalysisError('Draw an AOI and search for Sentinel-2 acquisitions before running analysis.');
+      return;
+    }
+    if (new Date(fromData.acq.datetime) >= new Date(toData.acq.datetime)) {
+      setAnalysisError('The FROM / T1 acquisition must be earlier than the TO / T2 acquisition.');
+      return;
+    }
+    if (
+      !Array.isArray(fromData.bbox) ||
+      !Array.isArray(toData.bbox) ||
+      fromData.bbox.length !== 4 ||
+      toData.bbox.length !== 4 ||
+      fromData.bbox.some((coordinate, index) =>
+        !Number.isFinite(coordinate) ||
+        !Number.isFinite(toData.bbox[index]) ||
+        Math.abs(coordinate - toData.bbox[index]) > 1e-8
+      )
+    ) {
+      setAnalysisError('The Sentinel-2 images do not share the same area. Select both dates from the same AOI search.');
+      return;
+    }
 
     setAnalysing(true);
     setAnalysisError('');
@@ -849,12 +879,12 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
           date_before:  fromData.acq.datetime ? fromData.acq.datetime.slice(0, 10) : 'Unknown',
           date_after:   toData.acq.datetime   ? toData.acq.datetime.slice(0, 10)   : 'Unknown',
           bbox:         [west, south, east, north],
-          threshold:    0.5,
+          threshold:    stage2Threshold,
         }),
       });
       const data = await res.json();
 
-      if (!data.success) {
+      if (!res.ok || !data.success) {
         setAnalysisError(data.error || 'Analysis failed.');
         setAnalysing(false);
         return;
@@ -874,12 +904,13 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
       }
 
       setAnalysisResult(data);
+      onStage2Result?.(data);
     } catch (err) {
       setAnalysisError('Network error: ' + err.message);
     } finally {
       setAnalysing(false);
     }
-  }, [fromData, toData, aoiBounds, overlayOpacity]);
+  }, [fromData, toData, aoiBounds, overlayOpacity, stage2Threshold, onStage2Result]);
 
   // Toggle analysis overlay visibility
   const toggleAnalysisOverlay = useCallback(() => {
@@ -1064,7 +1095,9 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
   // ── Render ───────────────────────────────────────────────────────────────────
 
   const canAnalyze = fromData !== null && toData !== null &&
-    fromData?.acq?.id !== toData?.acq?.id && !analysing && !loadingPreview;
+    fromData?.acq?.id !== toData?.acq?.id &&
+    new Date(fromData.acq.datetime) < new Date(toData.acq.datetime) &&
+    !analysing && !loadingPreview;
   const bothSelected = (fromData !== null || fromIdx !== null) && (toData !== null || toIdx !== null);
   const activeCloudStats = (mapViewMode === 'before' ? fromCloudStats : toCloudStats) || toCloudStats || fromCloudStats;
 
@@ -1341,7 +1374,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                       </>
                     ) : (
                       <div style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
-                        {loadingFromCloud ? 'Calculating AOI cloud stats…' : 'AOI stats pending'}
+                        {loadingFromCloud ? 'Calculating AOI cloud stats…' : 'AOI cloud statistics unavailable'}
                       </div>
                     )}
                   </div>
@@ -1428,7 +1461,7 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
                       </>
                     ) : (
                       <div style={{ color: 'var(--text-muted)', fontSize: '0.62rem' }}>
-                        {loadingToCloud ? 'Calculating AOI cloud stats…' : 'AOI stats pending'}
+                        {loadingToCloud ? 'Calculating AOI cloud stats…' : 'AOI cloud statistics unavailable'}
                       </div>
                     )}
                   </div>
@@ -1647,6 +1680,13 @@ export default function GisMap({ samples = [], aiMode, aiOpacity, onAiRun, aiOve
               ⚠️ FROM and TO dates must be different.
             </div>
           )}
+          {fromData && toData &&
+            fromData.acq.id !== toData.acq.id &&
+            new Date(fromData.acq.datetime) > new Date(toData.acq.datetime) && (
+              <div style={{ marginTop: 6, fontSize: '0.72rem', color: '#dc2626', textAlign: 'center', fontWeight: 600 }}>
+                FROM / T1 must be earlier than TO / T2.
+              </div>
+            )}
           {analysisError && (
             <div style={{ marginTop: 8, padding: '8px 10px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, fontSize: '0.76rem', color: '#b91c1c' }}>
               {analysisError}
