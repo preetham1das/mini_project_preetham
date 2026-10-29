@@ -712,6 +712,7 @@ export default function InteractiveMap({
       height: imgH,
     });
     if (acq.datetime) params.append('datetime', acq.datetime);
+    if (acq.collection) params.append('collection', acq.collection);
 
     const res  = await fetch(`/api/sentinel/preview?${params}`);
     const data = await res.json();
@@ -770,6 +771,7 @@ export default function InteractiveMap({
       beforeLayerRef.current = L.imageOverlay(data.image, imgBounds, { opacity: sentinelOpacity, zIndex: 198 }).addTo(map);
 
       setFromData({ acq, image: data.image, bbox: data.bbox });
+      setMapViewMode('before');
       setLoadingPreview(false);
 
       // Concurrently fetch AOI-specific cloud statistics
@@ -811,6 +813,7 @@ export default function InteractiveMap({
       map.fitBounds(imgBounds, { padding: [20, 20] });
 
       setToData({ acq, image: data.image, bbox: data.bbox });
+      setMapViewMode('after');
       setLoadingPreview(false);
 
       // Concurrently fetch AOI-specific cloud statistics

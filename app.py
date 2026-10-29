@@ -1,3 +1,4 @@
+import time
 import base64
 import io
 import json
@@ -85,11 +86,23 @@ def is_sentinel_configured():
     return bool(cid and sec)
 
 
+_sentinel_token_cache = {
+    "token": None,
+    "expires_at": 0.0
+}
+
+
 def get_sentinel_token():
     """
     Retrieves an OAuth2 access token from Copernicus Data Space / Sentinel Hub.
+    Uses in-memory caching to avoid repeated auth handshakes and rate limiting.
     Returns (token_str, error_dict, http_status_code).
     """
+    global _sentinel_token_cache
+    now = time.time()
+    if _sentinel_token_cache["token"] and now < _sentinel_token_cache["expires_at"] - 60:
+        return _sentinel_token_cache["token"], None, 200
+
     # Re-check env or fallback in case .env was added during runtime
     if not (os.environ.get("SENTINEL_CLIENT_ID") and os.environ.get("SENTINEL_CLIENT_SECRET")):
         _load_env_fallback()
@@ -117,11 +130,15 @@ def get_sentinel_token():
                 "client_secret": client_secret,
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=15
+            timeout=20
         )
         if resp.status_code == 200:
             token_data = resp.json()
-            return token_data.get("access_token"), None, 200
+            access_tok = token_data.get("access_token")
+            exp_sec = float(token_data.get("expires_in", 600))
+            _sentinel_token_cache["token"] = access_tok
+            _sentinel_token_cache["expires_at"] = time.time() + exp_sec
+            return access_tok, None, 200
         else:
             err_msg = "Invalid client or client credentials"
             try:
@@ -355,6 +372,15 @@ def search_sentinel():
     # Copernicus STAC maximum allowed limit per page is 100
     stac_page_limit = 100
 
+    # Support optional collection parameter: sentinel-2-l2a (default), sentinel-2-l1c, or all
+    coll_param = (request.args.get("collection") or "sentinel-2-l2a").strip().lower()
+    if coll_param in ("sentinel-2-l1c", "l1c"):
+        target_collections = ["sentinel-2-l1c"]
+    elif coll_param in ("all", "both"):
+        target_collections = ["sentinel-2-l2a", "sentinel-2-l1c"]
+    else:
+        target_collections = ["sentinel-2-l2a"]
+
     # Max total acquisitions to return across all pages (default 1000, covers ~10+ years)
     max_acquisitions = 1000
     if request.args.get("limit"):
@@ -367,8 +393,10 @@ def search_sentinel():
     start_dt_utc = start_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
     end_dt_utc = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
 
+    print(f"[Sentinel Search] Query: range={start_date_raw.strip()} to {end_date_raw.strip()} | bbox={search_bbox} | collections={target_collections}")
+
     search_payload = {
-        "collections": ["sentinel-2-l2a"],
+        "collections": target_collections,
         "datetime": f"{start_date_raw.strip()}T00:00:00Z/{end_date_raw.strip()}T23:59:59Z",
         "bbox": search_bbox,
         "limit": stac_page_limit
@@ -479,14 +507,25 @@ def search_sentinel():
             except (ValueError, TypeError):
                 pass
 
+        coll_name = item.get("collection")
+        if not coll_name:
+            coll_name = "sentinel-2-l1c" if ("_MSIL1C_" in str(item_id) or str(item_id).startswith(("S2A_MSIL1C", "S2B_MSIL1C"))) else "sentinel-2-l2a"
+        is_l1c = (coll_name == "sentinel-2-l1c")
+        
         acquisitions.append({
             "id": item_id,
             "datetime": dt_str,
-            "cloud_coverage": cloud
+            "cloud_coverage": cloud,
+            "collection": coll_name,
+            "level": "L1C" if is_l1c else "L2A"
         })
 
     # Sort acquisitions chronologically, oldest first, so the timeline flows left-to-right
     acquisitions.sort(key=lambda x: x.get("datetime") or "")
+
+    earliest_dt = acquisitions[0]["datetime"] if acquisitions else "None"
+    latest_dt = acquisitions[-1]["datetime"] if acquisitions else "None"
+    print(f"[Sentinel Search] Completed: returned {len(acquisitions)} item(s) in {page_count} page(s). Earliest: {earliest_dt} | Latest: {latest_dt}")
 
     resp_payload = {
         "success": True,
@@ -498,7 +537,8 @@ def search_sentinel():
             "longitude": lon,
             "start_date": start_date_raw.strip(),
             "end_date": end_date_raw.strip(),
-            "search_bbox": search_bbox
+            "search_bbox": search_bbox,
+            "collections": target_collections
         },
         "acquisitions": acquisitions
     }
@@ -688,7 +728,14 @@ def preview_sentinel():
     except (ValueError, TypeError):
         out_height = 512
 
-    # 5. Request 512x512 RGB from Sentinel Hub Process API
+    # 5. Determine collection type (sentinel-2-l2a vs sentinel-2-l1c)
+    proc_type = "sentinel-2-l2a"
+    coll_hint = (request.args.get("collection") or "").lower()
+    if coll_hint in ("sentinel-2-l1c", "l1c") or "_MSIL1C_" in acquisition_id or acquisition_id.startswith(("S2A_MSIL1C", "S2B_MSIL1C")):
+        proc_type = "sentinel-2-l1c"
+
+    print(f"[Sentinel Preview] Rendering: id={acquisition_id} | timeRange={time_from} to {time_to} | type={proc_type} | bbox={bbox}")
+
     process_url = f"{base_url}/process"
 
     evalscript = """//VERSION=3
@@ -714,7 +761,7 @@ function evaluatePixel(sample) {
             },
             "data": [
                 {
-                    "type": "sentinel-2-l2a",
+                    "type": proc_type,
                     "dataFilter": {
                         "timeRange": {
                             "from": time_from,
@@ -789,6 +836,8 @@ function evaluatePixel(sample) {
         return jsonify({
             "success": True,
             "acquisition_id": acquisition_id,
+            "collection": proc_type,
+            "level": "L1C" if proc_type == "sentinel-2-l1c" else "L2A",
             "latitude": lat,
             "longitude": lon,
             "bbox": bbox,
