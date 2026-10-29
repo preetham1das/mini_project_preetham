@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Globe,
   Trees,
@@ -7,76 +7,95 @@ import {
   BarChart3,
   Play,
   Upload,
-  Sliders,
+  MapPin,
+  Radar,
+  ScanLine,
+  Satellite,
+  RefreshCw,
+  Cpu,
   Activity,
-  FileText,
-  MapPin
+  ShieldCheck,
+  ChevronRight,
 } from 'lucide-react';
-import GisMap from './GisMap.jsx';
+import InteractiveMap from './InteractiveMap.jsx';
+import EvaluationPanel from './EvaluationPanel.jsx';
+
+/* Benchmark figures from the recorded evaluation artefacts (outputs/).
+   Stage 1 → validation IoU; Stage 2 → best validation IoU during training. */
+const FALLBACK_S1_IOU = 0.8386;
+const S2_VAL_IOU = 0.5043;
+
+const MANUAL_TABS = [
+  { id: 'stage1', label: 'Stage 1 · Canopy', icon: Trees },
+  { id: 'stage2', label: 'Stage 2 · Change', icon: Layers },
+  { id: 'timeline', label: 'Timeline', icon: GitCompare },
+  { id: 'benchmarks', label: 'Benchmarks', icon: BarChart3 },
+];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('gis-map');
+  const [view, setView] = useState('map'); // 'map' | 'manual'
+  const [manualTab, setManualTab] = useState('stage1');
+
   const [loading, setLoading] = useState(false);
   const [backendStatus, setBackendStatus] = useState('connecting');
   const [sentinelStatus, setSentinelStatus] = useState('checking');
 
-  // Samples Data
+  // Samples
   const [samples, setSamples] = useState({ stage1_samples: [], stage2_samples: [] });
 
-  // GIS / AI overlay state (passed into GisMap)
+  // GIS / AI overlay state (passed into the map)
   const [gisMode, setGisMode] = useState('stage1');
   const [selectedGisSample, setSelectedGisSample] = useState('');
   const [gisThreshold, setGisThreshold] = useState(0.5);
   const [gisOpacity, setGisOpacity] = useState(0.8);
   const [aiOverlayData, setAiOverlayData] = useState(null);
 
-  // Stage 1 State
+  // Stage 1 state
   const [s1Sample, setS1Sample] = useState('');
   const [s1File, setS1File] = useState(null);
   const [s1Threshold, setS1Threshold] = useState(0.5);
   const [s1Results, setS1Results] = useState(null);
 
-  // Stage 2 State
+  // Stage 2 state
   const [s2Sample, setS2Sample] = useState('');
   const [s2FileT1, setS2FileT1] = useState(null);
   const [s2FileT2, setS2FileT2] = useState(null);
   const [s2Threshold, setS2Threshold] = useState(0.5);
   const [s2Results, setS2Results] = useState(null);
 
-  // Swipe State
+  // Timeline state
   const [swipeSample, setSwipeSample] = useState('');
   const [swipeData, setSwipeData] = useState(null);
   const [timelineStep, setTimelineStep] = useState(0);
 
-  // Metrics State
+  // Benchmarks
   const [analytics, setAnalytics] = useState(null);
 
-  // Fetch samples on load
   useEffect(() => {
     fetch('/api/samples')
-      .then(res => res.json())
-      .then(data => {
+      .then((res) => res.json())
+      .then((data) => {
         setSamples(data);
         setBackendStatus('online');
       })
-      .catch(err => {
-        console.error("Backend error:", err);
+      .catch((err) => {
+        console.error('Backend error:', err);
         setBackendStatus('offline');
       });
 
     fetch('/api/metrics')
-      .then(res => res.json())
-      .then(data => setAnalytics(data))
-      .catch(err => console.error("Metrics fetch error:", err));
+      .then((res) => res.json())
+      .then((data) => setAnalytics(data))
+      .catch((err) => console.error('Metrics fetch error:', err));
 
     fetch('/api/sentinel/status')
-      .then(res => {
+      .then((res) => {
         if (!res.ok) throw new Error(`Sentinel status returned ${res.status}`);
         return res.json();
       })
-      .then(data => setSentinelStatus(data.configured ? 'configured' : 'missing'))
-      .catch(err => {
-        console.error("Sentinel status error:", err);
+      .then((data) => setSentinelStatus(data.configured ? 'configured' : 'missing'))
+      .catch((err) => {
+        console.error('Sentinel status error:', err);
         setSentinelStatus('unknown');
       });
   }, []);
@@ -95,818 +114,903 @@ export default function App() {
       t2_image: data.after_image ?? data.t2_image,
       live_source: true,
     });
-    setActiveTab('stage2');
+    // Stay on the map so the new overlay is visible; the manual Stage 2 tab
+    // already holds the same result if the user switches over.
+    setManualTab('stage2');
   }, []);
 
-  // Run GIS Spatial Analysis (AI overlay on the map)
+  /* Run the model on a pre-loaded sample tile and overlay the mask on the map. */
   const handleRunGis = () => {
     if (!selectedGisSample) {
-      alert("Please select a sample satellite tile from the dropdown.");
+      alert('Please select a sample satellite tile from the dropdown.');
       return;
     }
 
     const sampleObj = JSON.parse(selectedGisSample);
     const formData = new FormData();
-    formData.append("threshold", gisThreshold);
+    formData.append('threshold', gisThreshold);
     setLoading(true);
 
-    const endpoint = (gisMode === 'stage1') ? '/api/predict/stage1' : '/api/predict/stage2';
+    const endpoint = gisMode === 'stage1' ? '/api/predict/stage1' : '/api/predict/stage2';
     if (gisMode === 'stage1') {
-      formData.append("sample_path", sampleObj.path);
+      formData.append('sample_path', sampleObj.path);
     } else {
-      formData.append("sample_id", sampleObj.id);
-      formData.append("split", sampleObj.split);
+      formData.append('sample_id', sampleObj.id);
+      formData.append('split', sampleObj.split);
     }
 
-    fetch(endpoint, { method: "POST", body: formData })
-      .then(res => res.json())
-      .then(data => {
+    fetch(endpoint, { method: 'POST', body: formData })
+      .then((res) => res.json())
+      .then((data) => {
         setLoading(false);
-        if (data.error) { alert(data.error); return; }
-
-        const overlayImg = (gisMode === 'stage1') ? data.overlay_image : data.deforestation_overlay;
+        if (data.error) {
+          alert(data.error);
+          return;
+        }
+        const overlayImg = gisMode === 'stage1' ? data.overlay_image : data.deforestation_overlay;
         setAiOverlayData({ image: overlayImg, gis: data.gis, mode: gisMode, metrics: data });
       })
-      .catch(err => {
+      .catch((err) => {
         setLoading(false);
         console.error(err);
-        alert("Failed to connect to backend server!");
+        alert('Failed to connect to backend server!');
       });
   };
 
-  // Run Stage 1
   const handleRunStage1 = () => {
     const formData = new FormData();
-    formData.append("threshold", s1Threshold);
+    formData.append('threshold', s1Threshold);
 
     if (s1File) {
-      formData.append("file", s1File);
+      formData.append('file', s1File);
     } else if (s1Sample) {
-      formData.append("sample_path", s1Sample);
+      formData.append('sample_path', s1Sample);
     } else {
-      alert("Please select a sample or upload a file.");
+      alert('Please select a sample or upload a file.');
       return;
     }
 
     setLoading(true);
-    fetch("/api/predict/stage1", { method: "POST", body: formData })
-      .then(res => res.json())
-      .then(data => {
+    fetch('/api/predict/stage1', { method: 'POST', body: formData })
+      .then((res) => res.json())
+      .then((data) => {
         setLoading(false);
-        if (data.error) { alert(data.error); return; }
+        if (data.error) {
+          alert(data.error);
+          return;
+        }
         setS1Results(data);
       })
-      .catch(err => {
+      .catch(() => {
         setLoading(false);
-        alert("Backend connection error.");
+        alert('Backend connection error.');
       });
   };
 
-  // Run Stage 2
   const handleRunStage2 = () => {
     const formData = new FormData();
-    formData.append("threshold", s2Threshold);
+    formData.append('threshold', s2Threshold);
 
     if (s2FileT1 && s2FileT2) {
-      formData.append("file_t1", s2FileT1);
-      formData.append("file_t2", s2FileT2);
+      formData.append('file_t1', s2FileT1);
+      formData.append('file_t2', s2FileT2);
     } else if (s2Sample) {
       const sampleObj = JSON.parse(s2Sample);
-      formData.append("sample_id", sampleObj.id);
-      formData.append("split", sampleObj.split);
+      formData.append('sample_id', sampleObj.id);
+      formData.append('split', sampleObj.split);
     } else {
       if (s2FileT1 && !s2FileT2) {
-        alert("Please also upload the After Image (T2).");
+        alert('Please also upload the After Image (T2).');
       } else if (!s2FileT1 && s2FileT2) {
-        alert("Please also upload the Before Image (T1).");
+        alert('Please also upload the Before Image (T1).');
       } else {
-        alert("Please select a sample pair or upload both Before (T1) and After (T2) images.");
+        alert('Please select a sample pair or upload both Before (T1) and After (T2) images.');
       }
       return;
     }
 
     setLoading(true);
-    fetch("/api/predict/stage2", { method: "POST", body: formData })
-      .then(res => res.json())
-      .then(data => {
+    fetch('/api/predict/stage2', { method: 'POST', body: formData })
+      .then((res) => res.json())
+      .then((data) => {
         setLoading(false);
-        if (data.error) { alert(data.error); return; }
+        if (data.error) {
+          alert(data.error);
+          return;
+        }
         setS2Results(data);
       })
-      .catch(err => {
+      .catch(() => {
         setLoading(false);
-        alert("Backend connection error.");
+        alert('Backend connection error.');
       });
   };
 
-  // Load temporal timeline
   const handleLoadSwipe = () => {
     if (!swipeSample) {
-      alert("Please select a temporal pair.");
+      alert('Please select a temporal pair.');
       return;
     }
     const sampleObj = JSON.parse(swipeSample);
     const formData = new FormData();
-    formData.append("sample_id", sampleObj.id);
-    formData.append("split", sampleObj.split);
-    formData.append("threshold", 0.5);
+    formData.append('sample_id', sampleObj.id);
+    formData.append('split', sampleObj.split);
+    formData.append('threshold', 0.5);
 
     setLoading(true);
-    fetch("/api/predict/stage2", { method: "POST", body: formData })
-      .then(res => res.json())
-      .then(data => {
+    fetch('/api/predict/stage2', { method: 'POST', body: formData })
+      .then((res) => res.json())
+      .then((data) => {
         setLoading(false);
-        if (data.error) { alert(data.error); return; }
+        if (data.error) {
+          alert(data.error);
+          return;
+        }
         setSwipeData(data);
         setTimelineStep(0);
       })
-      .catch(err => {
+      .catch(() => {
         setLoading(false);
-        alert("Backend connection error.");
+        alert('Backend connection error.');
       });
   };
 
-  const timelineFrames = swipeData ? [
-    {
-      label: 'T1 · Earlier',
-      description: 'Original satellite image for this paired sample.',
-      image: swipeData.t1_image
-    },
-    {
-      label: 'T2 · Later',
-      description: 'Later image of the same paired sample.',
-      image: swipeData.t2_image
-    },
-    {
-      label: 'Predicted forest loss',
-      description: 'Red pixels show forest loss predicted between T1 and T2.',
-      image: swipeData.deforestation_overlay
-    }
-  ] : [];
+  const timelineFrames = swipeData
+    ? [
+        {
+          label: 'T1 · Earlier',
+          description: 'Original satellite image for this paired sample.',
+          image: swipeData.t1_image,
+        },
+        {
+          label: 'T2 · Later',
+          description: 'Later image of the same paired sample.',
+          image: swipeData.t2_image,
+        },
+        {
+          label: 'Predicted forest loss',
+          description: 'Red pixels show forest loss predicted between T1 and T2.',
+          image: swipeData.deforestation_overlay,
+        },
+      ]
+    : [];
   const selectedTimelineFrame = timelineFrames[timelineStep];
 
-  return (
-    <div className="app-container">
-      {loading && (
-        <div className="loading-overlay">
-          <div className="spinner"></div>
-          <p style={{ marginTop: 16, fontWeight: 600 }}>Executing Deep Neural Network Inference...</p>
+  const s1Iou = analytics?.stage1?.iou ?? FALLBACK_S1_IOU;
+
+  /* Model overlay controls rendered inside the map drawer. */
+  const overlayControls = (
+    <div className="block">
+      <div className="block__head">
+        <div className="block__title">
+          <ScanLine size={14} color="var(--cyan-bright)" /> Model Overlay
+        </div>
+        {aiOverlayData && <span className="badge badge--green">Active</span>}
+      </div>
+
+      <div className="seg" style={{ width: '100%', marginBottom: 9 }}>
+        <button
+          type="button"
+          className={`seg__btn ${gisMode === 'stage1' ? 'is-active' : ''}`}
+          style={{ flex: 1, justifyContent: 'center' }}
+          onClick={() => setGisMode('stage1')}
+        >
+          Stage 1 · Canopy
+        </button>
+        <button
+          type="button"
+          className={`seg__btn ${gisMode === 'stage2' ? 'is-active' : ''}`}
+          style={{ flex: 1, justifyContent: 'center' }}
+          onClick={() => setGisMode('stage2')}
+        >
+          Stage 2 · Loss
+        </button>
+      </div>
+
+      <div className="field">
+        <label htmlFor="gis-sample">Sample tile</label>
+        <select
+          id="gis-sample"
+          className="select"
+          value={selectedGisSample}
+          onChange={(e) => setSelectedGisSample(e.target.value)}
+        >
+          <option value="">— Choose a sample tile —</option>
+          {gisMode === 'stage1'
+            ? samples.stage1_samples.map((s, idx) => (
+                <option key={idx} value={JSON.stringify(s)}>
+                  [{s.split}] {s.name}
+                </option>
+              ))
+            : samples.stage2_samples.map((s, idx) => (
+                <option key={idx} value={JSON.stringify(s)}>
+                  {s.name}
+                </option>
+              ))}
+        </select>
+      </div>
+
+      <div className="slider-block" style={{ marginTop: 9 }}>
+        <div className="slider-row">
+          <span>Threshold</span>
+          <span className="slider-value">{gisThreshold.toFixed(2)}</span>
+        </div>
+        <input
+          type="range"
+          min="0.1"
+          max="0.9"
+          step="0.05"
+          value={gisThreshold}
+          onChange={(e) => setGisThreshold(parseFloat(e.target.value))}
+          aria-label="Prediction threshold"
+        />
+      </div>
+
+      <div className="slider-block">
+        <div className="slider-row">
+          <span>Mask opacity</span>
+          <span className="slider-value">{Math.round(gisOpacity * 100)}%</span>
+        </div>
+        <input
+          type="range"
+          min="0.1"
+          max="1"
+          step="0.05"
+          value={gisOpacity}
+          onChange={(e) => setGisOpacity(parseFloat(e.target.value))}
+          aria-label="Mask opacity"
+        />
+      </div>
+
+      <button
+        type="button"
+        className="btn btn--cyan btn--block btn--sm"
+        style={{ marginTop: 9 }}
+        onClick={handleRunGis}
+        disabled={loading}
+      >
+        {loading ? <span className="btn__spinner" /> : <Play size={13} />}
+        Run on sample tile
+      </button>
+
+      {aiOverlayData?.metrics && (
+        <div className="note note--ok" style={{ marginTop: 8 }}>
+          {gisMode === 'stage1' ? (
+            <>
+              <strong>{aiOverlayData.metrics.forest_hectares} ha</strong> canopy ·{' '}
+              {aiOverlayData.metrics.forest_pct}% cover
+            </>
+          ) : (
+            <>
+              <strong>{aiOverlayData.metrics.deforestation_hectares} ha</strong> forest loss
+            </>
+          )}
+          <span style={{ color: 'var(--text-faint)' }}>(est. 10 m GSD)</span>
         </div>
       )}
+    </div>
+  );
 
-      {/* Sidebar */}
-      <aside className="sidebar">
-        <div>
-          <div className="brand">
-            <Globe className="brand-icon" />
-            <div className="brand-text">
-              <h2>EcoVision GIS</h2>
-              <p>Deforestation Intelligence</p>
-            </div>
+  return (
+    <div className="app-shell">
+      {/* ── Top navigation bar ─────────────────────────────────── */}
+      <header className="topbar">
+        <div className="topbar__brand">
+          <div className="brand-mark">
+            <Radar size={20} strokeWidth={2.4} />
           </div>
-
-          <nav className="nav-menu">
-            <button
-              className={`nav-item ${activeTab === 'gis-map' ? 'active' : ''}`}
-              onClick={() => setActiveTab('gis-map')}
-            >
-              <Globe size={18} /> Interactive GIS Map
-            </button>
-            <button
-              className={`nav-item ${activeTab === 'stage1' ? 'active' : ''}`}
-              onClick={() => setActiveTab('stage1')}
-            >
-              <Trees size={18} /> Stage 1: Forest Cover
-            </button>
-            <button
-              className={`nav-item ${activeTab === 'stage2' ? 'active' : ''}`}
-              onClick={() => setActiveTab('stage2')}
-            >
-              <Layers size={18} /> Stage 2: Change Detection
-            </button>
-            <button
-              className={`nav-item ${activeTab === 'swipe' ? 'active' : ''}`}
-              onClick={() => setActiveTab('swipe')}
-            >
-              <GitCompare size={18} /> Timeline Comparison
-            </button>
-            <button
-              className={`nav-item ${activeTab === 'metrics' ? 'active' : ''}`}
-              onClick={() => setActiveTab('metrics')}
-            >
-              <BarChart3 size={18} /> Model Analytics
-            </button>
-          </nav>
-        </div>
-
-        <div className="system-status">
-          <span className={`status-indicator ${backendStatus}`}></span>
-          <div>
-            <span className="status-title">PyTorch REST API</span>
-            <span className="status-sub">{backendStatus === 'online' ? 'Connected (Port 5000)' : 'Offline'}</span>
+          <div className="brand-text">
+            <span className="brand-title">
+              Forest<span>Watch</span> GIS
+            </span>
+            <span className="brand-sub">Satellite Deforestation Intelligence</span>
           </div>
         </div>
-      </aside>
 
-      {/* Main Content */}
-      <main className="main-content">
-        <header className="top-header">
-          <h1>
-            {activeTab === 'gis-map' && 'Historical Satellite & Forest Change Map'}
-            {activeTab === 'stage1' && 'Stage 1: Binary Forest Cover Segmentation'}
-            {activeTab === 'stage2' && 'Stage 2: Temporal Deforestation Change Detection'}
-            {activeTab === 'swipe' && 'Temporal Timeline Comparison'}
-            {activeTab === 'metrics' && 'Model Performance Analytics & Validation Reports'}
-          </h1>
-          <p>
-            {activeTab === 'gis-map' && 'Draw an AOI, search Sentinel-2 acquisitions, explore historical imagery with before/after comparison.'}
-            {activeTab === 'stage1' && 'Extracting pixel-level forest canopy coverage with physical area calculations in Hectares.'}
-            {activeTab === 'stage2' && 'Detecting forest loss (deforestation) between T1 and T2 satellite image pairs.'}
-            {activeTab === 'swipe' && 'Scrub through an earlier image, later image, and predicted forest-loss overlay for one paired sample.'}
-            {activeTab === 'metrics' && 'Quantitative evaluation metrics (IoU, Dice, Precision, Recall) across dataset splits.'}
-          </p>
-        </header>
-
-        {/* TAB 1: GIS MAP — fully redesigned */}
-        {activeTab === 'gis-map' && (
-          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
-
-            {/* AI Analysis control strip */}
-            <div className="glass-card" style={{ padding: '14px 20px', marginBottom: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
-                <div>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>AI Pipeline</span>
-                  <div className="toggle-group" style={{ marginTop: 4, width: 260 }}>
-                    <button
-                      className={`btn-toggle ${gisMode === 'stage1' ? 'active' : ''}`}
-                      onClick={() => setGisMode('stage1')}
-                    >
-                      Stage 1 (Canopy)
-                    </button>
-                    <button
-                      className={`btn-toggle ${gisMode === 'stage2' ? 'active' : ''}`}
-                      onClick={() => setGisMode('stage2')}
-                    >
-                      Stage 2 (Deforestation)
-                    </button>
-                  </div>
-                </div>
-
-                <div style={{ flex: 1, minWidth: 200 }}>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Sample Tile</span>
-                  <select
-                    className="custom-select"
-                    style={{ marginTop: 4 }}
-                    value={selectedGisSample}
-                    onChange={(e) => setSelectedGisSample(e.target.value)}
-                  >
-                    <option value="">-- Choose Sample Satellite Tile --</option>
-                    {gisMode === 'stage1' ? (
-                      samples.stage1_samples.map((s, idx) => (
-                        <option key={idx} value={JSON.stringify(s)}>[{s.split}] {s.name}</option>
-                      ))
-                    ) : (
-                      samples.stage2_samples.map((s, idx) => (
-                        <option key={idx} value={JSON.stringify(s)}>{s.name}</option>
-                      ))
-                    )}
-                  </select>
-                </div>
-
-                <div style={{ minWidth: 160 }}>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                    Threshold: {gisThreshold.toFixed(2)}
-                  </span>
-                  <input
-                    type="range" min="0.1" max="0.9" step="0.05"
-                    value={gisThreshold}
-                    onChange={(e) => setGisThreshold(parseFloat(e.target.value))}
-                    style={{ marginTop: 8, display: 'block', width: '100%' }}
-                  />
-                </div>
-
-                <div style={{ minWidth: 140 }}>
-                  <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                    Opacity: {Math.round(gisOpacity * 100)}%
-                  </span>
-                  <input
-                    type="range" min="0.1" max="1.0" step="0.05"
-                    value={gisOpacity}
-                    onChange={(e) => setGisOpacity(parseFloat(e.target.value))}
-                    style={{ marginTop: 8, display: 'block', width: '100%' }}
-                  />
-                </div>
-
-                <button
-                  className="btn btn-primary"
-                  style={{ alignSelf: 'flex-end', whiteSpace: 'nowrap' }}
-                  onClick={handleRunGis}
-                >
-                  <Play size={15} /> Run AI Analysis
-                </button>
-
-                {aiOverlayData?.metrics && (
-                  <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', alignSelf: 'flex-end', paddingBottom: 2 }}>
-                    {gisMode === 'stage1'
-                      ? <><span style={{ color: 'var(--primary-green)', fontWeight: 700 }}>{aiOverlayData.metrics.forest_hectares} ha</span> forest canopy</>
-                      : <><span style={{ color: 'var(--accent-red)', fontWeight: 700 }}>{aiOverlayData.metrics.deforestation_hectares} ha</span> deforestation</>
-                    }
-                    <span style={{ marginLeft: 6, fontSize: '0.7rem', color: '#94a3b8' }}>(est. 10m GSD)</span>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* GIS Map Component — takes remaining height */}
-            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-              <GisMap
-                samples={samples}
-                aiMode={gisMode}
-                aiOpacity={gisOpacity}
-                aiOverlayData={aiOverlayData}
-                stage2Threshold={s2Threshold}
-                onStage2Result={handleLiveStage2Result}
-              />
-            </div>
+        <div className="topbar__meta">
+          <div className={`status-chip ${sentinelStatus === 'configured' ? 'is-live' : sentinelStatus === 'missing' ? 'is-warn' : 'is-off'}`}>
+            <span className="status-dot" />
+            {sentinelStatus === 'configured' && 'Connected to Sentinel-2 STAC API'}
+            {sentinelStatus === 'checking' && 'Checking Sentinel-2 STAC…'}
+            {sentinelStatus === 'missing' && 'Sentinel-2 credentials missing'}
+            {sentinelStatus === 'unknown' && 'STAC status unknown'}
           </div>
-        )}
 
-        {/* TAB 2: STAGE 1 */}
-        {activeTab === 'stage1' && (
-          <div className="tab-content">
-            <div className="glass-card control-panel">
-              <div className="panel-section">
-                <label className="section-label">Select Sample Satellite Image</label>
-                <select
-                  className="custom-select"
-                  value={s1Sample}
-                  onChange={(e) => { setS1Sample(e.target.value); setS1File(null); }}
-                >
-                  <option value="">-- Choose Pre-loaded Sample --</option>
-                  {samples.stage1_samples.map((s, i) => (
-                    <option key={i} value={s.path}>[{s.split}] {s.name}</option>
-                  ))}
-                </select>
+          <div className={`status-chip ${backendStatus === 'online' ? 'is-live' : backendStatus === 'offline' ? 'is-off' : 'is-warn'}`}>
+            <span className="status-dot" />
+            {backendStatus === 'online' && 'Inference API online'}
+            {backendStatus === 'connecting' && 'Connecting to inference API…'}
+            {backendStatus === 'offline' && 'Inference API offline'}
+          </div>
+
+          <div className="bench-row" style={{ padding: '4px 8px', background: 'transparent', border: '1px dashed var(--border)' }}>
+            <span className="bench-badge" title="Stage 1 U-Net validation IoU">
+              <Trees size={11} /> Forest U-Net <strong>{s1Iou.toFixed(3)}</strong>
+            </span>
+            <span className="bench-badge bench-badge--warn" title="Stage 2 Temporal U-Net best validation IoU">
+              <Layers size={11} /> Temporal U-Net <strong>{S2_VAL_IOU.toFixed(3)}</strong>
+            </span>
+          </div>
+        </div>
+
+        <div className="mode-switch" role="tablist" aria-label="Application mode">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === 'map'}
+            className={`mode-switch__btn ${view === 'map' ? 'is-active' : ''}`}
+            onClick={() => setView('map')}
+          >
+            <Globe size={14} /> Interactive GIS Map
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === 'manual'}
+            className={`mode-switch__btn ${view === 'manual' ? 'is-active' : ''}`}
+            onClick={() => setView('manual')}
+          >
+            <Upload size={14} /> Manual Upload (Fallback)
+          </button>
+        </div>
+      </header>
+
+      <main className="app-main">
+        {view === 'map' ? (
+          <div className="view" style={{ gap: 0 }}>
+            <InteractiveMap
+              samples={samples}
+              aiMode={gisMode}
+              aiOpacity={gisOpacity}
+              aiOverlayData={aiOverlayData}
+              stage2Threshold={s2Threshold}
+              onStage2Result={handleLiveStage2Result}
+              sidebarTop={overlayControls}
+            />
+          </div>
+        ) : (
+          <div className="view">
+            <div className="view-head">
+              <div>
+                <h1 className="view-head__title">Manual Image Upload</h1>
+                <p className="view-head__sub">
+                  Fallback workbench for offline analysis. Upload a single tile for canopy segmentation, or a
+                  co-registered before/after pair for change detection — no live Sentinel-2 access required.
+                </p>
               </div>
-
-              <div className="panel-section">
-                <label className="section-label">Or Upload Custom Image</label>
-                <div className="file-dropzone">
-                  <span>{s1File ? `Selected: ${s1File.name}` : 'Click to Upload TIFF/PNG'}</span>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => {
-                      if (e.target.files.length > 0) {
-                        setS1File(e.target.files[0]);
-                        setS1Sample('');
-                      }
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="panel-section threshold-box">
-                <div className="slider-header">
-                  <span>Confidence Threshold</span>
-                  <span>{s1Threshold.toFixed(2)}</span>
-                </div>
-                <input
-                  type="range"
-                  min="0.1"
-                  max="0.9"
-                  step="0.05"
-                  value={s1Threshold}
-                  onChange={(e) => setS1Threshold(parseFloat(e.target.value))}
-                />
-              </div>
-
-              <button className="btn btn-primary" onClick={handleRunStage1}>
-                <Play size={16} /> Run Forest Segmentation
+              <button type="button" className="btn btn--ghost" onClick={() => setView('map')}>
+                <MapPin size={13} /> Back to map
               </button>
             </div>
 
-            {s1Results && (
-              <>
-                <div className="stats-grid">
-                  <div className="glass-card stat-card">
-                    <span className="stat-label">Forest Canopy Area</span>
-                    <span className="stat-value text-green">{s1Results.forest_hectares} ha</span>
-                    <span className="stat-sub">{s1Results.forest_pct}% of total land cover</span>
-                  </div>
-                  <div className="glass-card stat-card">
-                    <span className="stat-label">Non-Forest Area</span>
-                    <span className="stat-value text-gray">{s1Results.non_forest_pct}%</span>
-                    <span className="stat-sub">{s1Results.non_forest_pixels.toLocaleString()} pixels</span>
-                  </div>
-                  <div className="glass-card stat-card">
-                    <span className="stat-label">Total Tile Area</span>
-                    <span className="stat-value text-accent">{s1Results.total_hectares} ha</span>
-                    <span className="stat-sub">Ground Sample Distance: 10m/px (est.)</span>
-                  </div>
-                </div>
-
-                <div className="visuals-grid">
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Original Satellite RGB</div>
-                    <div className="img-wrapper">
-                      <img src={s1Results.original_image} alt="Original" />
-                    </div>
-                  </div>
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Binary Forest Mask</div>
-                    <div className="img-wrapper">
-                      <img src={s1Results.mask_image} alt="Mask" />
-                    </div>
-                  </div>
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Canopy Overlay (Emerald)</div>
-                    <div className="img-wrapper">
-                      <img src={s1Results.overlay_image} alt="Overlay" />
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
-        )}
-
-        {/* TAB 3: STAGE 2 */}
-        {activeTab === 'stage2' && (
-          <div className="tab-content">
-            <div className="glass-card control-panel">
-              <div className="panel-section" style={{ minWidth: 260 }}>
-                <label className="section-label">Live Sentinel-2 Analysis</label>
-                <p style={{ margin: '0 0 10px', color: 'var(--text-muted)', fontSize: '0.82rem', lineHeight: 1.5 }}>
-                  Choose an AOI and before/after acquisition dates on the GIS map. Both images are fetched for the same area and analyzed by the trained Temporal U-Net.
-                </p>
-                {sentinelStatus === 'configured' ? (
-                  <p style={{ margin: '0 0 10px', color: 'var(--primary-green)', fontSize: '0.78rem' }}>
-                    Copernicus credentials are configured. Imagery still depends on network access and suitable acquisitions.
-                  </p>
-                ) : (
-                  <p style={{ margin: '0 0 10px', color: '#b45309', fontSize: '0.78rem', lineHeight: 1.5 }}>
-                    {sentinelStatus === 'checking'
-                      ? 'Checking Sentinel-2 service configuration…'
-                      : sentinelStatus === 'missing'
-                        ? 'Live imagery is unavailable until SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET are configured in the project .env file and the backend is restarted. Sample pairs and uploads remain available.'
-                        : 'Sentinel-2 service status could not be checked. Confirm the backend and Copernicus credentials before relying on live imagery.'}
-                  </p>
-                )}
+            <div className="manual-tabs" role="tablist" aria-label="Manual workbench">
+              {MANUAL_TABS.map(({ id, label, icon: Icon }) => (
                 <button
+                  key={id}
                   type="button"
-                  className="btn"
-                  style={{ background: '#2563eb', color: '#fff', border: 'none' }}
-                  onClick={() => {
-                    setGisMode('stage2');
-                    setActiveTab('gis-map');
-                  }}
+                  role="tab"
+                  aria-selected={manualTab === id}
+                  className={`manual-tab ${manualTab === id ? 'is-active' : ''}`}
+                  onClick={() => setManualTab(id)}
                 >
-                  <MapPin size={16} /> Choose AOI and dates on GIS Map
+                  <Icon size={13} /> {label}
                 </button>
-              </div>
+              ))}
+            </div>
 
-              <div className="panel-section" style={{ minWidth: 260 }}>
-                <label className="section-label">Optional: Use a Pre-loaded Temporal Pair</label>
-                <select
-                  className="custom-select"
-                  value={s2Sample}
-                  onChange={(e) => {
-                    setS2Sample(e.target.value);
-                    setS2FileT1(null);
-                    setS2FileT2(null);
-                  }}
-                >
-                  <option value="">-- No sample selected --</option>
-                  {samples.stage2_samples.map((s, i) => (
-                    <option key={i} value={JSON.stringify(s)}>{s.name}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="panel-section">
-                <label className="section-label">Or Upload T1 (Before Image)</label>
-                <p style={{ margin: '0 0 8px', color: 'var(--text-muted)', fontSize: '0.72rem' }}>
-                  Upload co-registered images covering the same footprint and with identical dimensions.
-                </p>
-                <div className="file-dropzone">
-                  <span>{s2FileT1 ? `T1: ${s2FileT1.name}` : 'Click to Upload Before (T1)'}</span>
-                  <input
-                    type="file"
-                    accept="image/*,.tif,.tiff"
-                    onChange={(e) => {
-                      if (e.target.files.length > 0) {
-                        setS2FileT1(e.target.files[0]);
-                        setS2Sample('');
-                      }
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="panel-section">
-                <label className="section-label">And Upload T2 (After Image)</label>
-                <div className="file-dropzone">
-                  <span>{s2FileT2 ? `T2: ${s2FileT2.name}` : 'Click to Upload After (T2)'}</span>
-                  <input
-                    type="file"
-                    accept="image/*,.tif,.tiff"
-                    onChange={(e) => {
-                      if (e.target.files.length > 0) {
-                        setS2FileT2(e.target.files[0]);
-                        setS2Sample('');
-                      }
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="panel-section threshold-box">
-                <div className="slider-header">
-                  <span>Deforestation Threshold</span>
-                  <span>{s2Threshold.toFixed(2)}</span>
-                </div>
-                <input
-                  type="range"
-                  min="0.1"
-                  max="0.9"
-                  step="0.05"
-                  value={s2Threshold}
-                  onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
+            <div className="manual-scroll">
+              {manualTab === 'stage1' && (
+                <Stage1View
+                  samples={samples}
+                  s1Sample={s1Sample}
+                  setS1Sample={setS1Sample}
+                  s1File={s1File}
+                  setS1File={setS1File}
+                  s1Threshold={s1Threshold}
+                  setS1Threshold={setS1Threshold}
+                  s1Results={s1Results}
+                  loading={loading}
+                  onRun={handleRunStage1}
                 />
-              </div>
+              )}
 
-              <button className="btn btn-primary" onClick={handleRunStage2}>
-                <Play size={16} /> Detect Deforestation
-              </button>
-            </div>
-
-            {s2Results && (
-              <>
-                {s2Results.live_source && (
-                  <div className="glass-card" style={{ padding: 14, color: 'var(--text-muted)', fontSize: '0.8rem', lineHeight: 1.5 }}>
-                    {s2Results.pair_name} · Live Sentinel-2 imagery analyzed with the existing Temporal U-Net.
-                  </div>
-                )}
-                <div className="stats-grid">
-                  <div className="glass-card stat-card">
-                    <span className="stat-label">Deforestation Loss Area</span>
-                    <span className="stat-value text-red">{s2Results.deforestation_hectares} ha</span>
-                    <span className="stat-sub">{s2Results.deforestation_pct}% tree cover lost</span>
-                  </div>
-                  <div className="glass-card stat-card">
-                    <span className="stat-label">Stable Land Area</span>
-                    <span className="stat-value text-gray">{s2Results.stable_pct}%</span>
-                    <span className="stat-sub">{s2Results.stable_pixels.toLocaleString()} pixels</span>
-                  </div>
-                  {s2Results.metrics && (
-                    <div className="glass-card stat-card">
-                      <span className="stat-label">Sample IoU / Dice</span>
-                      <span className="stat-value text-green">{s2Results.metrics.sample_iou} / {s2Results.metrics.sample_dice}</span>
-                      <span className="stat-sub">Ground Truth: {s2Results.metrics.gt_defor_hectares} ha</span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="visuals-grid stage2-grid">
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Time 1 (Before)</div>
-                    <div className="img-wrapper">
-                      <img src={s2Results.t1_image} alt="T1" />
-                    </div>
-                  </div>
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Time 2 (After)</div>
-                    <div className="img-wrapper">
-                      <img src={s2Results.t2_image} alt="T2" />
-                    </div>
-                  </div>
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Deforestation Mask</div>
-                    <div className="img-wrapper">
-                      <img src={s2Results.deforestation_mask} alt="Mask" />
-                    </div>
-                  </div>
-                  <div className="glass-card visual-card">
-                    <div className="card-header">Loss Overlay (Vibrant Red)</div>
-                    <div className="img-wrapper">
-                      <img src={s2Results.deforestation_overlay} alt="Overlay" />
-                    </div>
-                  </div>
-                </div>
-                {s2Results.model_note && (
-                  <div className="glass-card" style={{ padding: 14, color: 'var(--text-muted)', fontSize: '0.8rem', lineHeight: 1.5 }}>
-                    {s2Results.model_note}
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
-
-        {/* TAB 4: TIMELINE COMPARISON */}
-        {activeTab === 'swipe' && (
-          <div className="tab-content">
-            <div
-              className="glass-card control-panel"
-              style={{ justifyContent: 'center' }}
-            >
-              <div style={{ width: 350 }}>
-                <label className="section-label">
-                  Select Temporal Image Pair
-                </label>
-                <select
-                  className="custom-select"
-                  value={swipeSample}
-                  onChange={(event) => {
-                    setSwipeSample(event.target.value);
-                    setSwipeData(null);
-                    setTimelineStep(0);
+              {manualTab === 'stage2' && (
+                <Stage2View
+                  samples={samples}
+                  sentinelStatus={sentinelStatus}
+                  s2Sample={s2Sample}
+                  setS2Sample={setS2Sample}
+                  s2FileT1={s2FileT1}
+                  setS2FileT1={setS2FileT1}
+                  s2FileT2={s2FileT2}
+                  setS2FileT2={setS2FileT2}
+                  s2Threshold={s2Threshold}
+                  setS2Threshold={setS2Threshold}
+                  s2Results={s2Results}
+                  loading={loading}
+                  onRun={handleRunStage2}
+                  onOpenMap={() => {
+                    setGisMode('stage2');
+                    setView('map');
                   }}
-                >
-                  <option value="">-- Choose Sample Pair --</option>
-                  {samples.stage2_samples.map((sample, index) => (
-                    <option key={index} value={JSON.stringify(sample)}>
-                      {sample.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <button className="btn btn-primary" onClick={handleLoadSwipe}>
-                <Play size={16} /> Analyze Pair
-              </button>
-            </div>
-
-            {swipeData && (
-              <div className="glass-card timeline-container">
-                <div className="timeline-summary">
-                  <div>
-                    <span className="timeline-kicker">
-                      Selected paired area
-                    </span>
-                    <strong>{swipeData.pair_name}</strong>
-                  </div>
-
-                  <div className="timeline-loss">
-                    <span>Estimated loss</span>
-                    <strong>{swipeData.deforestation_pct}%</strong>
-                    <span>
-                      {Number(
-                        swipeData.deforestation_pixels ?? 0
-                      ).toLocaleString()} pixels
-                    </span>
-                  </div>
-                </div>
-
-                {selectedTimelineFrame && (
-                  <div className="timeline-frame">
-                    <span className="timeline-frame-label">
-                      {selectedTimelineFrame.label}
-                    </span>
-                    <img
-                      src={selectedTimelineFrame.image}
-                      className="timeline-image"
-                      alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name || 'selected satellite pair'
-                        }`}
-                    />
-                  </div>
-                )}
-
-                <div className="timeline-control">
-                  <input
-                    type="range"
-                    min="0"
-                    max={Math.max(timelineFrames.length - 1, 0)}
-                    step="1"
-                    value={timelineStep}
-                    aria-label="Timeline timepoint"
-                    aria-valuetext={selectedTimelineFrame?.label || ''}
-                    onChange={(event) =>
-                      setTimelineStep(Number(event.target.value))
-                    }
-                  />
-
-                  <div className="timeline-ticks">
-                    {timelineFrames.map((frame, index) => (
-                      <button
-                        key={frame.label}
-                        type="button"
-                        className={timelineStep === index ? 'active' : ''}
-                        onClick={() => setTimelineStep(index)}
-                      >
-                        {frame.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <p className="timeline-description">
-                  {selectedTimelineFrame?.description}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* TAB 5: ANALYTICS */}
-        {activeTab === 'metrics' && (
-          <div className="tab-content">
-            <div className="analytics-grid">
-              {analytics?.stage1 && (
-                <div className="glass-card metric-group">
-                  <div className="group-title">
-                    <h3>
-                      Stage 1 U-Net Model (Forest Canopy Segmentation)
-                    </h3>
-                    <span className="badge badge-success">
-                      Validation Set Evaluation
-                    </span>
-                  </div>
-                  <div className="metric-row">
-                    <div className="m-box">
-                      <span className="m-val text-green">
-                        {analytics.stage1.val_iou?.toFixed(4) || '0.8412'}
-                      </span>
-                      <span className="m-lbl">Mean IoU</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val text-green">
-                        {analytics.stage1.val_dice?.toFixed(4) || '0.9137'}
-                      </span>
-                      <span className="m-lbl">Dice Score</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val">
-                        {analytics.stage1.val_precision?.toFixed(4) || '0.9240'}
-                      </span>
-                      <span className="m-lbl">Precision</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val">
-                        {analytics.stage1.val_recall?.toFixed(4) || '0.9036'}
-                      </span>
-                      <span className="m-lbl">Recall</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val">
-                        {analytics.stage1.val_accuracy?.toFixed(4) || '0.9582'}
-                      </span>
-                      <span className="m-lbl">Pixel Accuracy</span>
-                    </div>
-                  </div>
-                </div>
+                />
               )}
 
-              {analytics?.stage2 && (
-                <div className="glass-card metric-group">
-                  <div className="group-title">
-                    <h3>
-                      Stage 2 Temporal U-Net (Deforestation Change Detection)
-                    </h3>
-                    <span className="badge badge-warning">
-                      Held-Out Test Set (33 Image Pairs)
-                    </span>
-                  </div>
-                  <div className="metric-row">
-                    <div className="m-box">
-                      <span className="m-val text-red">
-                        {analytics.stage2.global_iou?.toFixed(4) || '0.5043'}
-                      </span>
-                      <span className="m-lbl">Global Test IoU</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val text-red">
-                        {analytics.stage2.global_dice?.toFixed(4) || '0.6705'}
-                      </span>
-                      <span className="m-lbl">Global Dice Score</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val">
-                        {analytics.stage2.global_precision?.toFixed(4) || '0.6812'}
-                      </span>
-                      <span className="m-lbl">Precision</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val">
-                        {analytics.stage2.global_recall?.toFixed(4) || '0.6601'}
-                      </span>
-                      <span className="m-lbl">Recall</span>
-                    </div>
-                    <div className="m-box">
-                      <span className="m-val">
-                        {analytics.stage2.total_test_pairs || '33'}
-                      </span>
-                      <span className="m-lbl">Test Image Pairs</span>
-                    </div>
-                  </div>
-                </div>
+              {manualTab === 'timeline' && (
+                <TimelineView
+                  samples={samples}
+                  swipeSample={swipeSample}
+                  setSwipeSample={setSwipeSample}
+                  setSwipeData={setSwipeData}
+                  setTimelineStep={setTimelineStep}
+                  swipeData={swipeData}
+                  timelineFrames={timelineFrames}
+                  timelineStep={timelineStep}
+                  selectedTimelineFrame={selectedTimelineFrame}
+                  loading={loading}
+                  onLoad={handleLoadSwipe}
+                />
               )}
+
+              {manualTab === 'benchmarks' && <EvaluationPanel analytics={analytics} />}
             </div>
           </div>
         )}
       </main>
     </div>
   );
+}
 
+/* ══════════════════════════════════════════════════════════════
+   Manual workbench views
+   ══════════════════════════════════════════════════════════════ */
+
+function Stage1View({
+  samples,
+  s1Sample,
+  setS1Sample,
+  s1File,
+  setS1File,
+  s1Threshold,
+  setS1Threshold,
+  s1Results,
+  loading,
+  onRun,
+}) {
+  return (
+    <>
+      <section className="panel">
+        <div className="panel__head">
+          <div>
+            <div className="panel__title">Forest Cover Segmentation</div>
+            <div className="block__hint">Single-image binary canopy mask with physical area estimates.</div>
+          </div>
+          <span className="badge badge--green">
+            <ShieldCheck size={11} /> U-Net · 7.76M params
+          </span>
+        </div>
+
+        <div className="control-grid">
+          <div className="field">
+            <label htmlFor="s1-sample">Pre-loaded sample</label>
+            <select
+              id="s1-sample"
+              className="select"
+              value={s1Sample}
+              onChange={(e) => {
+                setS1Sample(e.target.value);
+                setS1File(null);
+              }}
+            >
+              <option value="">— Choose a sample —</option>
+              {samples.stage1_samples.map((s, i) => (
+                <option key={i} value={s.path}>
+                  [{s.split}] {s.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <label className={`upload-zone ${s1File ? 'has-file' : ''}`}>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                if (e.target.files.length > 0) {
+                  setS1File(e.target.files[0]);
+                  setS1Sample('');
+                }
+              }}
+            />
+            <Upload size={17} />
+            <span className="upload-zone__label">{s1File ? s1File.name : 'Upload a TIFF / PNG'}</span>
+            <span className="upload-zone__hint">Drop-in custom imagery for offline inference</span>
+          </label>
+
+          <div className="slider-block">
+            <div className="slider-row">
+              <span>Confidence threshold</span>
+              <span className="slider-value">{s1Threshold.toFixed(2)}</span>
+            </div>
+            <input
+              type="range"
+              min="0.1"
+              max="0.9"
+              step="0.05"
+              value={s1Threshold}
+              onChange={(e) => setS1Threshold(parseFloat(e.target.value))}
+              aria-label="Confidence threshold"
+            />
+          </div>
+
+          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading}>
+            {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+            Run segmentation
+          </button>
+        </div>
+      </section>
+
+      {s1Results && (
+        <>
+          <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
+            <div className="stat stat--green">
+              <span className="stat__label">
+                <Trees size={11} /> Forest canopy
+              </span>
+              <div className="stat__value">
+                {s1Results.forest_hectares}
+                <span className="stat__unit">ha</span>
+              </div>
+              <div className="stat__sub">{s1Results.forest_pct}% of total land cover</div>
+            </div>
+            <div className="stat stat--neutral">
+              <span className="stat__label">Non-forest</span>
+              <div className="stat__value">
+                {s1Results.non_forest_pct}
+                <span className="stat__unit">%</span>
+              </div>
+              <div className="stat__sub">{s1Results.non_forest_pixels.toLocaleString()} pixels</div>
+            </div>
+            <div className="stat stat--cyan">
+              <span className="stat__label">Total tile</span>
+              <div className="stat__value">
+                {s1Results.total_hectares}
+                <span className="stat__unit">ha</span>
+              </div>
+              <div className="stat__sub">10 m ground sample distance (est.)</div>
+            </div>
+          </div>
+
+          <div className="visual-grid">
+            <VisualCard title="Original RGB" src={s1Results.original_image} alt="Original satellite image" />
+            <VisualCard title="Binary mask" src={s1Results.mask_image} alt="Predicted forest mask" />
+            <VisualCard title="Canopy overlay" src={s1Results.overlay_image} alt="Forest overlay" />
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function Stage2View({
+  samples,
+  sentinelStatus,
+  s2Sample,
+  setS2Sample,
+  s2FileT1,
+  setS2FileT1,
+  s2FileT2,
+  setS2FileT2,
+  s2Threshold,
+  setS2Threshold,
+  s2Results,
+  loading,
+  onRun,
+  onOpenMap,
+}) {
+  return (
+    <>
+      <section className="panel">
+        <div className="panel__head">
+          <div>
+            <div className="panel__title">Bi-Temporal Deforestation Detection</div>
+            <div className="block__hint">
+              9-channel Temporal U-Net consuming T1, T2 and the absolute spectral difference.
+            </div>
+          </div>
+          <span className="badge badge--violet">
+            <Layers size={11} /> Temporal U-Net · 9-ch
+          </span>
+        </div>
+
+        <div className="control-grid">
+          <div className="field" style={{ gridColumn: 'span 2' }}>
+            <label>Live Sentinel-2 analysis</label>
+            <div className="note note--info">
+              <Satellite size={13} />
+              <span>
+                Draw an AOI and pick two acquisition dates on the GIS map. Both images are fetched for the same
+                footprint and analysed by the trained Temporal U-Net.
+              </span>
+            </div>
+            {sentinelStatus !== 'configured' && (
+              <div className="note note--warn" style={{ marginTop: 6 }}>
+                <RefreshCw size={12} />
+                <span>
+                  {sentinelStatus === 'checking'
+                    ? 'Checking Sentinel-2 service configuration…'
+                    : sentinelStatus === 'missing'
+                      ? 'Live imagery is unavailable until SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET are configured and the backend restarted. Sample pairs and uploads remain available.'
+                      : 'Sentinel-2 status could not be checked. Confirm the backend and Copernicus credentials before relying on live imagery.'}
+                </span>
+              </div>
+            )}
+            <button type="button" className="btn btn--cyan" style={{ marginTop: 8 }} onClick={onOpenMap}>
+              <MapPin size={13} /> Choose AOI and dates on map
+            </button>
+          </div>
+
+          <div className="field">
+            <label htmlFor="s2-sample">Pre-loaded temporal pair</label>
+            <select
+              id="s2-sample"
+              className="select"
+              value={s2Sample}
+              onChange={(e) => {
+                setS2Sample(e.target.value);
+                setS2FileT1(null);
+                setS2FileT2(null);
+              }}
+            >
+              <option value="">— No sample selected —</option>
+              {samples.stage2_samples.map((s, i) => (
+                <option key={i} value={JSON.stringify(s)}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <label className={`upload-zone ${s2FileT1 ? 'has-file' : ''}`}>
+            <input
+              type="file"
+              accept="image/*,.tif,.tiff"
+              onChange={(e) => {
+                if (e.target.files.length > 0) {
+                  setS2FileT1(e.target.files[0]);
+                  setS2Sample('');
+                }
+              }}
+            />
+            <Upload size={16} />
+            <span className="upload-zone__label">{s2FileT1 ? `T1 · ${s2FileT1.name}` : 'Upload Before (T1)'}</span>
+            <span className="upload-zone__hint">Co-registered with T2</span>
+          </label>
+
+          <label className={`upload-zone ${s2FileT2 ? 'has-file' : ''}`}>
+            <input
+              type="file"
+              accept="image/*,.tif,.tiff"
+              onChange={(e) => {
+                if (e.target.files.length > 0) {
+                  setS2FileT2(e.target.files[0]);
+                  setS2Sample('');
+                }
+              }}
+            />
+            <Upload size={16} />
+            <span className="upload-zone__label">{s2FileT2 ? `T2 · ${s2FileT2.name}` : 'Upload After (T2)'}</span>
+            <span className="upload-zone__hint">Identical dimensions required</span>
+          </label>
+
+          <div className="slider-block">
+            <div className="slider-row">
+              <span>Deforestation threshold</span>
+              <span className="slider-value">{s2Threshold.toFixed(2)}</span>
+            </div>
+            <input
+              type="range"
+              min="0.1"
+              max="0.9"
+              step="0.05"
+              value={s2Threshold}
+              onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
+              aria-label="Deforestation threshold"
+            />
+          </div>
+
+          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading}>
+            {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+            Detect deforestation
+          </button>
+        </div>
+      </section>
+
+      {s2Results && (
+        <>
+          {s2Results.live_source && (
+            <div className="note note--info">
+              <Satellite size={13} />
+              <span>
+                {s2Results.pair_name} · live Sentinel-2 imagery analysed with the Temporal U-Net. Live scenes have
+                no ground-truth mask, so accuracy metrics apply to the benchmark split only.
+              </span>
+            </div>
+          )}
+
+          <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
+            <div className="stat stat--red">
+              <span className="stat__label">Forest loss</span>
+              <div className="stat__value">
+                {s2Results.deforestation_hectares}
+                <span className="stat__unit">ha</span>
+              </div>
+              <div className="stat__sub">{s2Results.deforestation_pct}% tree cover lost</div>
+            </div>
+            <div className="stat stat--neutral">
+              <span className="stat__label">Stable land</span>
+              <div className="stat__value">
+                {s2Results.stable_pct}
+                <span className="stat__unit">%</span>
+              </div>
+              <div className="stat__sub">{s2Results.stable_pixels.toLocaleString()} pixels</div>
+            </div>
+            {s2Results.metrics && (
+              <div className="stat stat--green">
+                <span className="stat__label">
+                  <Activity size={11} /> Sample IoU / Dice
+                </span>
+                <div className="stat__value">
+                  {s2Results.metrics.sample_iou} / {s2Results.metrics.sample_dice}
+                </div>
+                <div className="stat__sub">Ground truth {s2Results.metrics.gt_defor_hectares} ha</div>
+              </div>
+            )}
+          </div>
+
+          <div className="visual-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
+            <VisualCard title="T1 · Before" src={s2Results.t1_image} alt="Before image" />
+            <VisualCard title="T2 · After" src={s2Results.t2_image} alt="After image" />
+            <VisualCard title="Change mask" src={s2Results.deforestation_mask} alt="Deforestation mask" />
+            <VisualCard title="Loss overlay" src={s2Results.deforestation_overlay} alt="Deforestation overlay" />
+          </div>
+
+          {s2Results.model_note && (
+            <div className="note note--warn">
+              <Cpu size={13} />
+              <span>{s2Results.model_note}</span>
+            </div>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+function TimelineView({
+  samples,
+  swipeSample,
+  setSwipeSample,
+  setSwipeData,
+  setTimelineStep,
+  swipeData,
+  timelineFrames,
+  timelineStep,
+  selectedTimelineFrame,
+  loading,
+  onLoad,
+}) {
+  return (
+    <>
+      <section className="panel">
+        <div className="panel__head">
+          <div>
+            <div className="panel__title">Temporal Pair Comparison</div>
+            <div className="block__hint">
+              Scrub through the earlier image, the later image and the predicted forest-loss overlay.
+            </div>
+          </div>
+        </div>
+
+        <div className="control-grid">
+          <div className="field" style={{ gridColumn: 'span 2' }}>
+            <label htmlFor="swipe-sample">Temporal image pair</label>
+            <select
+              id="swipe-sample"
+              className="select"
+              value={swipeSample}
+              onChange={(event) => {
+                setSwipeSample(event.target.value);
+                setSwipeData(null);
+                setTimelineStep(0);
+              }}
+            >
+              <option value="">— Choose a sample pair —</option>
+              {samples.stage2_samples.map((sample, index) => (
+                <option key={index} value={JSON.stringify(sample)}>
+                  {sample.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <button type="button" className="btn btn--primary" onClick={onLoad} disabled={loading}>
+            {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+            Load timeline
+          </button>
+        </div>
+      </section>
+
+      {swipeData ? (
+        <section className="panel">
+          <div className="panel__head">
+            <div>
+              <div className="panel__title">{selectedTimelineFrame?.label}</div>
+              <div className="block__hint">{selectedTimelineFrame?.description}</div>
+            </div>
+            <div className="row" style={{ gap: 12 }}>
+              <span className="badge badge--dim">{swipeData.pair_name}</span>
+              <span className="badge badge--red">
+                {swipeData.deforestation_pct}% loss ·{' '}
+                {Number(swipeData.deforestation_pixels ?? 0).toLocaleString()} px
+              </span>
+            </div>
+          </div>
+
+          <div className="compare-stage">
+            {selectedTimelineFrame && (
+              <>
+                <span className="compare-badge">{selectedTimelineFrame.label}</span>
+                <img
+                  src={selectedTimelineFrame.image}
+                  alt={`${selectedTimelineFrame.label} for ${swipeData.pair_name || 'selected pair'}`}
+                />
+              </>
+            )}
+          </div>
+
+          <div className="slider-block" style={{ marginTop: 12 }}>
+            <input
+              type="range"
+              min="0"
+              max={Math.max(timelineFrames.length - 1, 0)}
+              step="1"
+              value={timelineStep}
+              aria-label="Timeline timepoint"
+              aria-valuetext={selectedTimelineFrame?.label || ''}
+              onChange={(event) => setTimelineStep(Number(event.target.value))}
+            />
+          </div>
+
+          <div className="timeline-ticks" style={{ marginTop: 8 }}>
+            {timelineFrames.map((frame, index) => (
+              <button
+                key={frame.label}
+                type="button"
+                className={`timeline-tick ${timelineStep === index ? 'is-active' : ''}`}
+                onClick={() => setTimelineStep(index)}
+              >
+                {frame.label}
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : (
+        <div className="empty-state">
+          <GitCompare size={22} />
+          Select a temporal pair and load the timeline to compare T1, T2 and the predicted change.
+        </div>
+      )}
+    </>
+  );
+}
+
+function VisualCard({ title, src, alt }) {
+  if (!src) return null;
+  return (
+    <div className="visual-card">
+      <div className="visual-card__head">{title}</div>
+      <img className="visual-card__img" src={src} alt={alt} />
+    </div>
+  );
 }
