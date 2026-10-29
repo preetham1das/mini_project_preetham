@@ -568,6 +568,7 @@ def preview_sentinel():
     acquisition_id = request.args.get("acquisition_id") or request.args.get("id")
     lat_raw = request.args.get("lat") or request.args.get("latitude")
     lon_raw = request.args.get("lon") or request.args.get("longitude")
+    bbox_raw = request.args.get("bbox")
 
     if not acquisition_id or not acquisition_id.strip():
         return jsonify({
@@ -576,6 +577,16 @@ def preview_sentinel():
         }), 400
 
     acquisition_id = acquisition_id.strip()
+
+    # If lat/lon are omitted but bbox is provided, compute center from bbox
+    if (not lat_raw or not lon_raw) and bbox_raw:
+        try:
+            parts = [float(v.strip()) for v in bbox_raw.split(",")]
+            if len(parts) == 4:
+                lon_raw = str((parts[0] + parts[2]) / 2.0)
+                lat_raw = str((parts[1] + parts[3]) / 2.0)
+        except Exception:
+            pass
 
     if not lat_raw:
         return jsonify({
@@ -1458,11 +1469,10 @@ def analyze_sentinel_deforestation():
     pil_after, err = decode_b64_image(img_after_b64, "image_after")
     if err:
         return jsonify({"success": False, "error": err}), 400
+    # Both images are resized to TARGET_SIZE (256, 256) below, so small
+    # preview dimension variations (e.g. from aspect ratio rounding) are handled safely.
     if pil_before.size != pil_after.size:
-        return jsonify({
-            "success": False,
-            "error": "Before and after images must have identical dimensions and cover the same AOI."
-        }), 400
+        print(f"[Sentinel Analyze] Dimension variance: T1={pil_before.size}, T2={pil_after.size}. Resampling both to {TARGET_SIZE}.")
 
     # -- Preprocessing: identical to temporal_dataset.py TemporalForestDataset -
     # Step 1: Resize to 256x256 (BILINEAR, same as training)

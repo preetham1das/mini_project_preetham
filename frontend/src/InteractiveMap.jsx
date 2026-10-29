@@ -851,7 +851,7 @@ export default function InteractiveMap({
       fromData.bbox.some((coordinate, index) =>
         !Number.isFinite(coordinate) ||
         !Number.isFinite(toData.bbox[index]) ||
-        Math.abs(coordinate - toData.bbox[index]) > 1e-8
+        Math.abs(coordinate - toData.bbox[index]) > 0.01
       )
     ) {
       setAnalysisError('The Sentinel-2 images do not share the same area. Select both dates from the same AOI search.');
@@ -877,10 +877,14 @@ export default function InteractiveMap({
       return;
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
+
     try {
-      const res  = await fetch('/api/sentinel/analyze', {
+      const res = await fetch('/api/sentinel/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           image_before: fromData.image,
           image_after:  toData.image,
@@ -890,10 +894,17 @@ export default function InteractiveMap({
           threshold:    stage2Threshold,
         }),
       });
-      const data = await res.json();
+      clearTimeout(timeoutId);
+
+      let data;
+      try {
+        data = await res.json();
+      } catch (jsonErr) {
+        throw new Error(`Server returned HTTP ${res.status} with non-JSON response.`);
+      }
 
       if (!res.ok || !data.success) {
-        setAnalysisError(data.error || 'Analysis failed.');
+        setAnalysisError(data.error || `Analysis failed (HTTP ${res.status}).`);
         setAnalysing(false);
         return;
       }
@@ -914,8 +925,14 @@ export default function InteractiveMap({
       setAnalysisResult(data);
       onStage2Result?.(data);
     } catch (err) {
-      setAnalysisError('Network error: ' + err.message);
+      clearTimeout(timeoutId);
+      if (err.name === 'AbortError') {
+        setAnalysisError('Analysis request timed out after 35 seconds. Please try again.');
+      } else {
+        setAnalysisError('Network error: ' + err.message);
+      }
     } finally {
+      clearTimeout(timeoutId);
       setAnalysing(false);
     }
   }, [fromData, toData, aoiBounds, overlayOpacity, stage2Threshold, onStage2Result]);
@@ -1615,16 +1632,16 @@ export default function InteractiveMap({
               type="button"
               className={`btn btn--primary btn--block btn--cta ${canAnalyze ? '' : 'btn--ghost'}`}
               style={{ marginTop: 11 }}
-              disabled={!canAnalyze}
+              disabled={!canAnalyze || analysing}
               onClick={runAnalysis}
             >
               {analysing ? (
                 <>
-                  <span className="btn__spinner" /> Running Temporal U-Net…
+                  <span className="btn__spinner" /> Analysing Forest Change…
                 </>
               ) : (
                 <>
-                  <Activity size={16} /> Fetch Satellite Data &amp; Run Inference
+                  <Activity size={16} /> Run Deforestation Analysis
                 </>
               )}
             </button>

@@ -126,21 +126,44 @@ export default function App() {
       return;
     }
 
-    const sampleObj = JSON.parse(selectedGisSample);
+    let sampleObj;
+    try {
+      sampleObj = JSON.parse(selectedGisSample);
+    } catch {
+      alert('Invalid sample selection.');
+      return;
+    }
+
     const formData = new FormData();
     formData.append('threshold', gisThreshold);
     setLoading(true);
 
     const endpoint = gisMode === 'stage1' ? '/api/predict/stage1' : '/api/predict/stage2';
     if (gisMode === 'stage1') {
+      if (!sampleObj.path) {
+        setLoading(false);
+        alert('Please choose a Stage 1 canopy sample tile.');
+        return;
+      }
       formData.append('sample_path', sampleObj.path);
     } else {
+      if (!sampleObj.id) {
+        setLoading(false);
+        alert('Please choose a Stage 2 change detection pair.');
+        return;
+      }
       formData.append('sample_id', sampleObj.id);
-      formData.append('split', sampleObj.split);
+      formData.append('split', sampleObj.split || 'test');
     }
 
-    fetch(endpoint, { method: 'POST', body: formData })
-      .then((res) => res.json())
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+    fetch(endpoint, { method: 'POST', body: formData, signal: controller.signal })
+      .then((res) => {
+        clearTimeout(timeoutId);
+        return res.json();
+      })
       .then((data) => {
         setLoading(false);
         if (data.error) {
@@ -151,9 +174,14 @@ export default function App() {
         setAiOverlayData({ image: overlayImg, gis: data.gis, mode: gisMode, metrics: data });
       })
       .catch((err) => {
+        clearTimeout(timeoutId);
         setLoading(false);
         console.error(err);
-        alert('Failed to connect to backend server!');
+        if (err.name === 'AbortError') {
+          alert('Model execution timed out after 25 seconds.');
+        } else {
+          alert('Failed to connect to backend server!');
+        }
       });
   };
 
@@ -171,8 +199,14 @@ export default function App() {
     }
 
     setLoading(true);
-    fetch('/api/predict/stage1', { method: 'POST', body: formData })
-      .then((res) => res.json())
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    fetch('/api/predict/stage1', { method: 'POST', body: formData, signal: controller.signal })
+      .then((res) => {
+        clearTimeout(timeoutId);
+        return res.json();
+      })
       .then((data) => {
         setLoading(false);
         if (data.error) {
@@ -181,9 +215,14 @@ export default function App() {
         }
         setS1Results(data);
       })
-      .catch(() => {
+      .catch((err) => {
+        clearTimeout(timeoutId);
         setLoading(false);
-        alert('Backend connection error.');
+        if (err.name === 'AbortError') {
+          alert('Stage 1 inference timed out.');
+        } else {
+          alert('Backend connection error: ' + err.message);
+        }
       });
   };
 
@@ -195,9 +234,15 @@ export default function App() {
       formData.append('file_t1', s2FileT1);
       formData.append('file_t2', s2FileT2);
     } else if (s2Sample) {
-      const sampleObj = JSON.parse(s2Sample);
+      let sampleObj;
+      try {
+        sampleObj = JSON.parse(s2Sample);
+      } catch {
+        alert('Invalid sample selection.');
+        return;
+      }
       formData.append('sample_id', sampleObj.id);
-      formData.append('split', sampleObj.split);
+      formData.append('split', sampleObj.split || 'test');
     } else {
       if (s2FileT1 && !s2FileT2) {
         alert('Please also upload the After Image (T2).');
@@ -210,8 +255,14 @@ export default function App() {
     }
 
     setLoading(true);
-    fetch('/api/predict/stage2', { method: 'POST', body: formData })
-      .then((res) => res.json())
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
+
+    fetch('/api/predict/stage2', { method: 'POST', body: formData, signal: controller.signal })
+      .then((res) => {
+        clearTimeout(timeoutId);
+        return res.json();
+      })
       .then((data) => {
         setLoading(false);
         if (data.error) {
@@ -220,9 +271,69 @@ export default function App() {
         }
         setS2Results(data);
       })
-      .catch(() => {
+      .catch((err) => {
+        clearTimeout(timeoutId);
         setLoading(false);
-        alert('Backend connection error.');
+        if (err.name === 'AbortError') {
+          alert('Stage 2 analysis timed out after 35 seconds. Please try again.');
+        } else {
+          alert('Backend connection error: ' + err.message);
+        }
+      });
+  };
+
+  /* Re-run Stage 2 inference on currently loaded live Sentinel-2 images */
+  const handleRunLiveStage2 = (threshold = s2Threshold) => {
+    const beforeImg = s2Results?.before_image || s2Results?.t1_image;
+    const afterImg = s2Results?.after_image || s2Results?.t2_image;
+    if (!beforeImg || !afterImg) {
+      alert('No live Sentinel-2 imagery available to re-run. Please select an AOI on the map.');
+      return;
+    }
+    const dateBefore = s2Results?.date_before || 'T1';
+    const dateAfter = s2Results?.date_after || 'T2';
+    const bbox = s2Results?.gis?.bounds ? [
+      s2Results.gis.bounds[0][1], s2Results.gis.bounds[0][0],
+      s2Results.gis.bounds[1][1], s2Results.gis.bounds[1][0]
+    ] : null;
+
+    setLoading(true);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
+
+    fetch('/api/sentinel/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        image_before: beforeImg,
+        image_after: afterImg,
+        date_before: dateBefore,
+        date_after: dateAfter,
+        bbox: bbox,
+        threshold: threshold,
+      }),
+    })
+      .then((res) => {
+        clearTimeout(timeoutId);
+        return res.json();
+      })
+      .then((data) => {
+        setLoading(false);
+        if (!data.success) {
+          alert(data.error || 'Live analysis failed.');
+          return;
+        }
+        handleLiveStage2Result(data);
+      })
+      .catch((err) => {
+        clearTimeout(timeoutId);
+        setLoading(false);
+        if (err.name === 'AbortError') {
+          alert('Live analysis timed out after 35 seconds. Please try again.');
+        } else {
+          alert('Failed to connect to backend: ' + err.message);
+        }
       });
   };
 
@@ -293,7 +404,7 @@ export default function App() {
           type="button"
           className={`seg__btn ${gisMode === 'stage1' ? 'is-active' : ''}`}
           style={{ flex: 1, justifyContent: 'center' }}
-          onClick={() => setGisMode('stage1')}
+          onClick={() => { setGisMode('stage1'); setSelectedGisSample(''); }}
         >
           Stage 1 · Canopy
         </button>
@@ -301,7 +412,7 @@ export default function App() {
           type="button"
           className={`seg__btn ${gisMode === 'stage2' ? 'is-active' : ''}`}
           style={{ flex: 1, justifyContent: 'center' }}
-          onClick={() => setGisMode('stage2')}
+          onClick={() => { setGisMode('stage2'); setSelectedGisSample(''); }}
         >
           Stage 2 · Loss
         </button>
@@ -529,6 +640,7 @@ export default function App() {
                   s2Results={s2Results}
                   loading={loading}
                   onRun={handleRunStage2}
+                  onRunLive={handleRunLiveStage2}
                   onOpenMap={() => {
                     setGisMode('stage2');
                     setView('map');
@@ -706,8 +818,13 @@ function Stage2View({
   s2Results,
   loading,
   onRun,
+  onRunLive,
   onOpenMap,
 }) {
+  const [stage2Mode, setStage2Mode] = useState(
+    s2Results?.live_source ? 'live' : (s2FileT1 || s2FileT2 ? 'upload' : s2Sample ? 'sample' : 'live')
+  );
+
   return (
     <>
       <section className="panel">
@@ -715,7 +832,7 @@ function Stage2View({
           <div>
             <div className="panel__title">Bi-Temporal Deforestation Detection</div>
             <div className="block__hint">
-              9-channel Temporal U-Net consuming T1, T2 and the absolute spectral difference.
+              9-channel Temporal U-Net comparing earlier (T1) and later (T2) satellite imagery.
             </div>
           </div>
           <span className="badge badge--violet">
@@ -723,107 +840,234 @@ function Stage2View({
           </span>
         </div>
 
-        <div className="control-grid">
-          <div className="field" style={{ gridColumn: 'span 2' }}>
-            <label>Live Sentinel-2 analysis</label>
-            <div className="note note--info">
-              <Satellite size={13} />
-              <span>
-                Draw an AOI and pick two acquisition dates on the GIS map. Both images are fetched for the same
-                footprint and analysed by the trained Temporal U-Net.
-              </span>
-            </div>
+        {/* ── Mode Selector: Clean, Segmented Switcher ── */}
+        <div className="seg" style={{ width: '100%', marginBottom: 14 }}>
+          <button
+            type="button"
+            className={`seg__btn ${stage2Mode === 'live' ? 'is-active' : ''}`}
+            style={{ flex: 1, justifyContent: 'center' }}
+            onClick={() => setStage2Mode('live')}
+          >
+            <Satellite size={12} /> Live Sentinel-2
+          </button>
+          <button
+            type="button"
+            className={`seg__btn ${stage2Mode === 'sample' ? 'is-active' : ''}`}
+            style={{ flex: 1, justifyContent: 'center' }}
+            onClick={() => setStage2Mode('sample')}
+          >
+            <GitCompare size={12} /> Sample Image Pair
+          </button>
+          <button
+            type="button"
+            className={`seg__btn ${stage2Mode === 'upload' ? 'is-active' : ''}`}
+            style={{ flex: 1, justifyContent: 'center' }}
+            onClick={() => setStage2Mode('upload')}
+          >
+            <Upload size={12} /> Upload Image Pair
+          </button>
+        </div>
+
+        {/* ── Mode A: Live Sentinel-2 ── */}
+        {stage2Mode === 'live' && (
+          <div className="control-grid" style={{ gridTemplateColumns: '1fr' }}>
             {sentinelStatus !== 'configured' && (
-              <div className="note note--warn" style={{ marginTop: 6 }}>
+              <div className="note note--warn">
                 <RefreshCw size={12} />
                 <span>
                   {sentinelStatus === 'checking'
-                    ? 'Checking Sentinel-2 service configuration…'
+                    ? 'Checking Sentinel-2 STAC service configuration…'
                     : sentinelStatus === 'missing'
-                      ? 'Live imagery is unavailable until SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET are configured and the backend restarted. Sample pairs and uploads remain available.'
-                      : 'Sentinel-2 status could not be checked. Confirm the backend and Copernicus credentials before relying on live imagery.'}
+                      ? 'Live imagery is unavailable until SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET are configured. Prepared sample pairs and offline uploads remain active.'
+                      : 'Sentinel-2 status could not be verified. Confirm credentials in .env.'}
                 </span>
               </div>
             )}
-            <button type="button" className="btn btn--cyan" style={{ marginTop: 8 }} onClick={onOpenMap}>
-              <MapPin size={13} /> Choose AOI and dates on map
+
+            {s2Results?.live_source ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div className="note note--ok">
+                  <Satellite size={13} />
+                  <span>
+                    <strong>Active Live Pair:</strong> {s2Results.pair_name || 'Sentinel-2 Scene'}
+                  </span>
+                </div>
+
+                <div className="slider-block">
+                  <div className="slider-row">
+                    <span>Deforestation confidence threshold</span>
+                    <span className="slider-value">{s2Threshold.toFixed(2)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.1"
+                    max="0.9"
+                    step="0.05"
+                    value={s2Threshold}
+                    onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
+                    aria-label="Deforestation threshold"
+                  />
+                </div>
+
+                <div className="row" style={{ gap: 8, marginTop: 4 }}>
+                  <button
+                    type="button"
+                    className="btn btn--primary"
+                    style={{ flex: 1 }}
+                    onClick={() => onRunLive?.(s2Threshold)}
+                    disabled={loading}
+                  >
+                    {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+                    Re-run Detection
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn--cyan"
+                    onClick={onOpenMap}
+                  >
+                    <MapPin size={13} /> Choose New AOI on Map
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div className="note note--info">
+                  <Satellite size={13} />
+                  <span>
+                    Select an Area of Interest (AOI) rectangle on the GIS Map and choose two Sentinel-2 historical acquisition dates across 2018–2026. The 9-channel Temporal U-Net analyzes radiometric changes in the identical geographic tile.
+                  </span>
+                </div>
+
+                <div className="row" style={{ justifyContent: 'flex-start', marginTop: 4 }}>
+                  <button type="button" className="btn btn--cyan" onClick={onOpenMap}>
+                    <MapPin size={14} /> Open GIS Map &amp; Draw AOI
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Mode B: Sample Image Pair ── */}
+        {stage2Mode === 'sample' && (
+          <div className="control-grid">
+            <div className="field" style={{ gridColumn: 'span 2' }}>
+              <label htmlFor="s2-sample">Pre-loaded temporal pair</label>
+              <select
+                id="s2-sample"
+                className="select"
+                value={s2Sample}
+                onChange={(e) => {
+                  setS2Sample(e.target.value);
+                  setS2FileT1(null);
+                  setS2FileT2(null);
+                }}
+              >
+                <option value="">— Choose a benchmark sample pair —</option>
+                {samples.stage2_samples.map((s, i) => (
+                  <option key={i} value={JSON.stringify(s)}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="slider-block" style={{ gridColumn: 'span 2' }}>
+              <div className="slider-row">
+                <span>Deforestation threshold</span>
+                <span className="slider-value">{s2Threshold.toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min="0.1"
+                max="0.9"
+                step="0.05"
+                value={s2Threshold}
+                onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
+                aria-label="Deforestation threshold"
+              />
+            </div>
+
+            <button
+              type="button"
+              className="btn btn--primary"
+              style={{ gridColumn: 'span 2' }}
+              onClick={onRun}
+              disabled={loading || !s2Sample}
+            >
+              {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+              Detect Deforestation
             </button>
           </div>
+        )}
 
-          <div className="field">
-            <label htmlFor="s2-sample">Pre-loaded temporal pair</label>
-            <select
-              id="s2-sample"
-              className="select"
-              value={s2Sample}
-              onChange={(e) => {
-                setS2Sample(e.target.value);
-                setS2FileT1(null);
-                setS2FileT2(null);
-              }}
-            >
-              <option value="">— No sample selected —</option>
-              {samples.stage2_samples.map((s, i) => (
-                <option key={i} value={JSON.stringify(s)}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <label className={`upload-zone ${s2FileT1 ? 'has-file' : ''}`}>
-            <input
-              type="file"
-              accept="image/*,.tif,.tiff"
-              onChange={(e) => {
-                if (e.target.files.length > 0) {
-                  setS2FileT1(e.target.files[0]);
-                  setS2Sample('');
-                }
-              }}
-            />
-            <Upload size={16} />
-            <span className="upload-zone__label">{s2FileT1 ? `T1 · ${s2FileT1.name}` : 'Upload Before (T1)'}</span>
-            <span className="upload-zone__hint">Co-registered with T2</span>
-          </label>
-
-          <label className={`upload-zone ${s2FileT2 ? 'has-file' : ''}`}>
-            <input
-              type="file"
-              accept="image/*,.tif,.tiff"
-              onChange={(e) => {
-                if (e.target.files.length > 0) {
-                  setS2FileT2(e.target.files[0]);
-                  setS2Sample('');
-                }
-              }}
-            />
-            <Upload size={16} />
-            <span className="upload-zone__label">{s2FileT2 ? `T2 · ${s2FileT2.name}` : 'Upload After (T2)'}</span>
-            <span className="upload-zone__hint">Identical dimensions required</span>
-          </label>
-
-          <div className="slider-block">
-            <div className="slider-row">
-              <span>Deforestation threshold</span>
-              <span className="slider-value">{s2Threshold.toFixed(2)}</span>
+        {/* ── Mode C: Upload Image Pair ── */}
+        {stage2Mode === 'upload' && (
+          <div className="control-grid">
+            <div className="block__hint" style={{ gridColumn: 'span 2', marginBottom: -4 }}>
+              Upload two co-registered satellite images covering the exact same geographic extent (PNG, TIFF, JPG).
             </div>
-            <input
-              type="range"
-              min="0.1"
-              max="0.9"
-              step="0.05"
-              value={s2Threshold}
-              onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
-              aria-label="Deforestation threshold"
-            />
-          </div>
 
-          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading}>
-            {loading ? <span className="btn__spinner" /> : <Play size={14} />}
-            Detect deforestation
-          </button>
-        </div>
+            <label className={`upload-zone ${s2FileT1 ? 'has-file' : ''}`}>
+              <input
+                type="file"
+                accept="image/*,.tif,.tiff"
+                onChange={(e) => {
+                  if (e.target.files.length > 0) {
+                    setS2FileT1(e.target.files[0]);
+                    setS2Sample('');
+                  }
+                }}
+              />
+              <Upload size={16} />
+              <span className="upload-zone__label">{s2FileT1 ? `T1 · ${s2FileT1.name}` : 'Upload Before (T1)'}</span>
+              <span className="upload-zone__hint">Earlier timestamp</span>
+            </label>
+
+            <label className={`upload-zone ${s2FileT2 ? 'has-file' : ''}`}>
+              <input
+                type="file"
+                accept="image/*,.tif,.tiff"
+                onChange={(e) => {
+                  if (e.target.files.length > 0) {
+                    setS2FileT2(e.target.files[0]);
+                    setS2Sample('');
+                  }
+                }}
+              />
+              <Upload size={16} />
+              <span className="upload-zone__label">{s2FileT2 ? `T2 · ${s2FileT2.name}` : 'Upload After (T2)'}</span>
+              <span className="upload-zone__hint">Later timestamp</span>
+            </label>
+
+            <div className="slider-block" style={{ gridColumn: 'span 2' }}>
+              <div className="slider-row">
+                <span>Deforestation threshold</span>
+                <span className="slider-value">{s2Threshold.toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min="0.1"
+                max="0.9"
+                step="0.05"
+                value={s2Threshold}
+                onChange={(e) => setS2Threshold(parseFloat(e.target.value))}
+                aria-label="Deforestation threshold"
+              />
+            </div>
+
+            <button
+              type="button"
+              className="btn btn--primary"
+              style={{ gridColumn: 'span 2' }}
+              onClick={onRun}
+              disabled={loading || !s2FileT1 || !s2FileT2}
+            >
+              {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+              Detect Deforestation
+            </button>
+          </div>
+        )}
       </section>
 
       {s2Results && (
@@ -842,18 +1086,18 @@ function Stage2View({
             <div className="stat stat--red">
               <span className="stat__label">Forest loss</span>
               <div className="stat__value">
-                {s2Results.deforestation_hectares}
+                {s2Results.deforestation_hectares ?? 0}
                 <span className="stat__unit">ha</span>
               </div>
-              <div className="stat__sub">{s2Results.deforestation_pct}% tree cover lost</div>
+              <div className="stat__sub">{s2Results.deforestation_pct ?? 0}% tree cover lost</div>
             </div>
             <div className="stat stat--neutral">
               <span className="stat__label">Stable land</span>
               <div className="stat__value">
-                {s2Results.stable_pct}
+                {s2Results.stable_pct ?? 0}
                 <span className="stat__unit">%</span>
               </div>
-              <div className="stat__sub">{s2Results.stable_pixels.toLocaleString()} pixels</div>
+              <div className="stat__sub">{(s2Results.stable_pixels ?? 0).toLocaleString()} pixels</div>
             </div>
             {s2Results.metrics && (
               <div className="stat stat--green">
@@ -869,8 +1113,8 @@ function Stage2View({
           </div>
 
           <div className="visual-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
-            <VisualCard title="T1 · Before" src={s2Results.t1_image} alt="Before image" />
-            <VisualCard title="T2 · After" src={s2Results.t2_image} alt="After image" />
+            <VisualCard title="T1 · Before" src={s2Results.t1_image || s2Results.before_image} alt="Before image" />
+            <VisualCard title="T2 · After" src={s2Results.t2_image || s2Results.after_image} alt="After image" />
             <VisualCard title="Change mask" src={s2Results.deforestation_mask} alt="Deforestation mask" />
             <VisualCard title="Loss overlay" src={s2Results.deforestation_overlay} alt="Deforestation overlay" />
           </div>
