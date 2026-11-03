@@ -204,7 +204,8 @@ export default function InteractiveMap({
   aiOverlayData,
   stage2Threshold = 0.5,
   onStage2Result,
-  sidebarTop = null,
+  onAcquisitions,
+  workspace = 'map',
 }) {
   // Map refs
   const mapDivRef   = useRef(null);
@@ -232,6 +233,8 @@ export default function InteractiveMap({
   // Sentinel search
   const [startDate, setStartDate] = useState('2023-01-01');
   const [endDate, setEndDate] = useState('2024-12-31');
+  const [collection, setCollection] = useState('sentinel-2-l2a');
+  const [maxCloudCover, setMaxCloudCover] = useState(100);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
   const [acquisitions, setAcquisitions] = useState([]);  // [{id, datetime, cloud_coverage}]
@@ -251,9 +254,11 @@ export default function InteractiveMap({
 
   // Filtered acquisitions based on selected year tab
   const displayedAcquisitions = useMemo(() => {
-    if (selectedYear === 'all') return acquisitions;
-    return acquisitions.filter(a => a.datetime && a.datetime.startsWith(selectedYear));
-  }, [acquisitions, selectedYear]);
+    return acquisitions.filter((acquisition) =>
+      (selectedYear === 'all' || acquisition.datetime?.startsWith(selectedYear)) &&
+      (acquisition.cloud_coverage == null || acquisition.cloud_coverage <= maxCloudCover)
+    );
+  }, [acquisitions, selectedYear, maxCloudCover]);
 
   // Sentinel preview — Before/After workflow
   // fromIdx = FROM date (T1, older image = "Before")
@@ -299,6 +304,10 @@ export default function InteractiveMap({
   const [loadingToCloud,   setLoadingToCloud]   = useState(false);
   const [cloudMaskVisible, setCloudMaskVisible] = useState(false);
   const cloudLayerRef = useRef(null); // L.imageOverlay for cloud mask
+
+  useEffect(() => {
+    if (hasSearched) onAcquisitions?.(acquisitions);
+  }, [acquisitions, hasSearched, onAcquisitions]);
 
   useEffect(() => {
     if (!mapDivRef.current || mapRef.current) return;
@@ -639,6 +648,7 @@ export default function InteractiveMap({
       lon:        centerLon.toFixed(6),
       start_date: startDate,
       end_date:   endDate,
+      collection,
       bbox:       `${west.toFixed(6)},${south.toFixed(6)},${east.toFixed(6)},${north.toFixed(6)}`,
       limit:      1000,
     });
@@ -664,7 +674,7 @@ export default function InteractiveMap({
     } finally {
       setSearching(false);
     }
-  }, [aoiBounds, startDate, endDate]);
+  }, [aoiBounds, startDate, endDate, collection]);
 
 
   // ── Load Sentinel Preview ─────────────────────────────────────────────────────
@@ -1205,7 +1215,7 @@ export default function InteractiveMap({
       <aside className={`drawer ${drawerOpen ? '' : 'is-collapsed'}`} aria-hidden={!drawerOpen}>
         <div className="drawer__head">
           <div className="drawer__title">
-            <Satellite size={14} color="var(--cyan-bright)" /> AOI &amp; Acquisition
+            <Satellite size={14} color="var(--cyan-bright)" /> {workspace === 'acquisition' ? 'Area & imagery' : 'Map controls'}
           </div>
           <button
             type="button"
@@ -1218,9 +1228,6 @@ export default function InteractiveMap({
         </div>
 
         <div className="drawer__body">
-
-          {/* Model overlay controls (supplied by the app shell) */}
-          {sidebarTop}
 
           {/* ── Area of Interest ─────────────────────────────── */}
           <div className="block">
@@ -1263,13 +1270,23 @@ export default function InteractiveMap({
             )}
           </div>
 
+          {workspace === 'acquisition' && <>
           {/* ── Sentinel-2 search ────────────────────────────── */}
           <div className="block">
             <div className="block__head">
               <div className="block__title">
                 <Satellite size={14} color="var(--cyan-bright)" /> Sentinel-2 Search
               </div>
-              <span className="badge badge--cyan">L2A</span>
+              <span className="badge badge--cyan">{collection === 'all' ? 'L1C + L2A' : collection.endsWith('l1c') ? 'L1C' : 'L2A'}</span>
+            </div>
+
+            <div className="field" style={{ marginBottom: 9 }}>
+              <label htmlFor="acq-collection">Sentinel-2 product</label>
+              <select id="acq-collection" className="select" value={collection} onChange={(event) => setCollection(event.target.value)}>
+                <option value="sentinel-2-l2a">Sentinel-2 L2A · Surface reflectance</option>
+                <option value="sentinel-2-l1c">Sentinel-2 L1C · Top of atmosphere</option>
+                <option value="all">L1C + L2A</option>
+              </select>
             </div>
 
             <div className="field-grid">
@@ -1682,6 +1699,8 @@ export default function InteractiveMap({
             )}
           </div>
 
+          </>}
+
           {/* Legend */}
           <div className="block">
             <div className="block__head" style={{ marginBottom: 8 }}>
@@ -1708,7 +1727,7 @@ export default function InteractiveMap({
       </aside>
 
       {/* ─── Floating analytics panel ───────────────────────────── */}
-      {analysisResult && (
+      {workspace === 'acquisition' && analysisResult && (
         <aside className="analytics-panel">
           <div className="analytics-panel__head">
             <div className="analytics-panel__title">
@@ -1855,7 +1874,7 @@ export default function InteractiveMap({
       )}
 
       {/* ─── Timeline dock ──────────────────────────────────────── */}
-      {acquisitions.length > 0 && (
+      {workspace === 'acquisition' && acquisitions.length > 0 && (
         <div className="timeline-dock">
           <div className="timeline-dock__head">
             <div className="row">
@@ -1918,6 +1937,11 @@ export default function InteractiveMap({
               })}
             </div>
           )}
+
+          <div className="timeline-filter">
+            <span>Maximum cloud cover</span><strong>{maxCloudCover}%</strong>
+            <input type="range" min="0" max="100" step="5" value={maxCloudCover} onChange={(event) => setMaxCloudCover(Number(event.target.value))} aria-label="Maximum acquisition cloud cover" />
+          </div>
 
           <div className="timeline-scroll">
             {displayedAcquisitions.map((acq, idx) => {

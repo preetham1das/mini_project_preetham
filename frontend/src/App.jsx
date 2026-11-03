@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Globe,
   Trees,
   Layers,
   GitCompare,
@@ -16,25 +15,18 @@ import {
   Activity,
   ShieldCheck,
   ChevronRight,
+  LayoutDashboard,
+  Map as MapIcon,
+  History as HistoryIcon,
+  Cpu as CpuIcon,
+  Search,
+  ArrowUpRight,
 } from 'lucide-react';
 import InteractiveMap from './InteractiveMap.jsx';
 import EvaluationPanel from './EvaluationPanel.jsx';
 
-/* Benchmark figures from the recorded evaluation artefacts (outputs/).
-   Stage 1 → validation IoU; Stage 2 → best validation IoU during training. */
-const FALLBACK_S1_IOU = 0.8386;
-const S2_VAL_IOU = 0.5043;
-
-const MANUAL_TABS = [
-  { id: 'stage1', label: 'Stage 1 · Canopy', icon: Trees },
-  { id: 'stage2', label: 'Stage 2 · Change', icon: Layers },
-  { id: 'timeline', label: 'Timeline', icon: GitCompare },
-  { id: 'benchmarks', label: 'Benchmarks', icon: BarChart3 },
-];
-
 export default function App() {
-  const [view, setView] = useState('map'); // 'map' | 'manual'
-  const [manualTab, setManualTab] = useState('stage1');
+  const [view, setView] = useState(() => window.location.hash.replace(/^#\/?/, '') || 'dashboard');
 
   const [loading, setLoading] = useState(false);
   const [backendStatus, setBackendStatus] = useState('connecting');
@@ -45,8 +37,6 @@ export default function App() {
 
   // GIS / AI overlay state (passed into the map)
   const [gisMode, setGisMode] = useState('stage1');
-  const [selectedGisSample, setSelectedGisSample] = useState('');
-  const [gisThreshold, setGisThreshold] = useState(0.5);
   const [gisOpacity, setGisOpacity] = useState(0.8);
   const [aiOverlayData, setAiOverlayData] = useState(null);
 
@@ -70,6 +60,40 @@ export default function App() {
 
   // Benchmarks
   const [analytics, setAnalytics] = useState(null);
+  const [regions, setRegions] = useState([]);
+  const [latestAcquisitions, setLatestAcquisitions] = useState([]);
+  const [analysisHistory, setAnalysisHistory] = useState(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('forestwatch-analysis-history') || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    }
+    catch { return []; }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('forestwatch-analysis-history', JSON.stringify(analysisHistory.slice(0, 50)));
+  }, [analysisHistory]);
+
+  const recordAnalysis = useCallback((record) => {
+    const entry = { id: `${Date.now()}-${Math.random()}`, analyzedAt: new Date().toISOString(), ...record };
+    setAnalysisHistory((items) => [entry, ...items].slice(0, 50));
+  }, []);
+
+  const navigate = useCallback((nextPage) => {
+    if (window.location.hash === `#/${nextPage}`) return;
+    window.history.pushState({}, '', `#/${nextPage}`);
+    setView(nextPage);
+  }, []);
+
+  useEffect(() => {
+    const syncRoute = () => setView(window.location.hash.replace(/^#\/?/, '') || 'dashboard');
+    window.addEventListener('popstate', syncRoute);
+    window.addEventListener('hashchange', syncRoute);
+    return () => {
+      window.removeEventListener('popstate', syncRoute);
+      window.removeEventListener('hashchange', syncRoute);
+    };
+  }, []);
 
   useEffect(() => {
     fetch('/api/samples')
@@ -87,6 +111,11 @@ export default function App() {
       .then((res) => res.json())
       .then((data) => setAnalytics(data))
       .catch((err) => console.error('Metrics fetch error:', err));
+
+    fetch('/api/gis/regions')
+      .then((res) => res.json())
+      .then((data) => setRegions(data.regions || []))
+      .catch((err) => console.error('Regions fetch error:', err));
 
     fetch('/api/sentinel/status')
       .then((res) => {
@@ -114,76 +143,17 @@ export default function App() {
       t2_image: data.after_image ?? data.t2_image,
       live_source: true,
     });
-    // Stay on the map so the new overlay is visible; the manual Stage 2 tab
-    // already holds the same result if the user switches over.
-    setManualTab('stage2');
-  }, []);
-
-  /* Run the model on a pre-loaded sample tile and overlay the mask on the map. */
-  const handleRunGis = () => {
-    if (!selectedGisSample) {
-      alert('Please select a sample satellite tile from the dropdown.');
-      return;
-    }
-
-    let sampleObj;
-    try {
-      sampleObj = JSON.parse(selectedGisSample);
-    } catch {
-      alert('Invalid sample selection.');
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append('threshold', gisThreshold);
-    setLoading(true);
-
-    const endpoint = gisMode === 'stage1' ? '/api/predict/stage1' : '/api/predict/stage2';
-    if (gisMode === 'stage1') {
-      if (!sampleObj.path) {
-        setLoading(false);
-        alert('Please choose a Stage 1 canopy sample tile.');
-        return;
-      }
-      formData.append('sample_path', sampleObj.path);
-    } else {
-      if (!sampleObj.id) {
-        setLoading(false);
-        alert('Please choose a Stage 2 change detection pair.');
-        return;
-      }
-      formData.append('sample_id', sampleObj.id);
-      formData.append('split', sampleObj.split || 'test');
-    }
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
-
-    fetch(endpoint, { method: 'POST', body: formData, signal: controller.signal })
-      .then((res) => {
-        clearTimeout(timeoutId);
-        return res.json();
-      })
-      .then((data) => {
-        setLoading(false);
-        if (data.error) {
-          alert(data.error);
-          return;
-        }
-        const overlayImg = gisMode === 'stage1' ? data.overlay_image : data.deforestation_overlay;
-        setAiOverlayData({ image: overlayImg, gis: data.gis, mode: gisMode, metrics: data });
-      })
-      .catch((err) => {
-        clearTimeout(timeoutId);
-        setLoading(false);
-        console.error(err);
-        if (err.name === 'AbortError') {
-          alert('Model execution timed out after 25 seconds.');
-        } else {
-          alert('Failed to connect to backend server!');
-        }
-      });
-  };
+    setGisMode('stage2');
+    setAiOverlayData({ image: data.deforestation_overlay, gis: data.gis, mode: 'stage2', metrics: data });
+    recordAnalysis({
+      type: 'Change detection',
+      region: `Sentinel-2 ${data.date_before || 'T1'} → ${data.date_after || 'T2'}`,
+      date: data.date_after || new Date().toISOString().slice(0, 10),
+      lossHa: data.deforestation_hectares,
+      lossPct: deforestationPct,
+    });
+    navigate('change');
+  }, [recordAnalysis, navigate]);
 
   const handleRunStage1 = () => {
     const formData = new FormData();
@@ -214,6 +184,9 @@ export default function App() {
           return;
         }
         setS1Results(data);
+        setGisMode('stage1');
+        setAiOverlayData({ image: data.overlay_image, gis: data.gis, mode: 'stage1', metrics: data });
+        recordAnalysis({ type: 'Forest analysis', region: data.sample_name || s1File?.name || 'Uploaded image', date: new Date().toISOString().slice(0, 10), forestHa: data.forest_hectares, forestPct: data.forest_pct });
       })
       .catch((err) => {
         clearTimeout(timeoutId);
@@ -270,6 +243,9 @@ export default function App() {
           return;
         }
         setS2Results(data);
+        setGisMode('stage2');
+        setAiOverlayData({ image: data.deforestation_overlay, gis: data.gis, mode: 'stage2', metrics: data });
+        recordAnalysis({ type: 'Change detection', region: data.pair_name || 'Uploaded image pair', date: new Date().toISOString().slice(0, 10), lossHa: data.deforestation_hectares, lossPct: data.deforestation_pct });
       })
       .catch((err) => {
         clearTimeout(timeoutId);
@@ -387,231 +363,68 @@ export default function App() {
     : [];
   const selectedTimelineFrame = timelineFrames[timelineStep];
 
-  const s1Iou = analytics?.stage1?.iou ?? FALLBACK_S1_IOU;
-
-  /* Model overlay controls rendered inside the map drawer. */
-  const overlayControls = (
-    <div className="block">
-      <div className="block__head">
-        <div className="block__title">
-          <ScanLine size={14} color="var(--cyan-bright)" /> Model Overlay
-        </div>
-        {aiOverlayData && <span className="badge badge--green">Active</span>}
-      </div>
-
-      <div className="seg" style={{ width: '100%', marginBottom: 9 }}>
-        <button
-          type="button"
-          className={`seg__btn ${gisMode === 'stage1' ? 'is-active' : ''}`}
-          style={{ flex: 1, justifyContent: 'center' }}
-          onClick={() => { setGisMode('stage1'); setSelectedGisSample(''); }}
-        >
-          Stage 1 · Canopy
-        </button>
-        <button
-          type="button"
-          className={`seg__btn ${gisMode === 'stage2' ? 'is-active' : ''}`}
-          style={{ flex: 1, justifyContent: 'center' }}
-          onClick={() => { setGisMode('stage2'); setSelectedGisSample(''); }}
-        >
-          Stage 2 · Loss
-        </button>
-      </div>
-
-      <div className="field">
-        <label htmlFor="gis-sample">Sample tile</label>
-        <select
-          id="gis-sample"
-          className="select"
-          value={selectedGisSample}
-          onChange={(e) => setSelectedGisSample(e.target.value)}
-        >
-          <option value="">— Choose a sample tile —</option>
-          {gisMode === 'stage1'
-            ? samples.stage1_samples.map((s, idx) => (
-                <option key={idx} value={JSON.stringify(s)}>
-                  [{s.split}] {s.name}
-                </option>
-              ))
-            : samples.stage2_samples.map((s, idx) => (
-                <option key={idx} value={JSON.stringify(s)}>
-                  {s.name}
-                </option>
-              ))}
-        </select>
-      </div>
-
-      <div className="slider-block" style={{ marginTop: 9 }}>
-        <div className="slider-row">
-          <span>Threshold</span>
-          <span className="slider-value">{gisThreshold.toFixed(2)}</span>
-        </div>
-        <input
-          type="range"
-          min="0.1"
-          max="0.9"
-          step="0.05"
-          value={gisThreshold}
-          onChange={(e) => setGisThreshold(parseFloat(e.target.value))}
-          aria-label="Prediction threshold"
-        />
-      </div>
-
-      <div className="slider-block">
-        <div className="slider-row">
-          <span>Mask opacity</span>
-          <span className="slider-value">{Math.round(gisOpacity * 100)}%</span>
-        </div>
-        <input
-          type="range"
-          min="0.1"
-          max="1"
-          step="0.05"
-          value={gisOpacity}
-          onChange={(e) => setGisOpacity(parseFloat(e.target.value))}
-          aria-label="Mask opacity"
-        />
-      </div>
-
-      <button
-        type="button"
-        className="btn btn--cyan btn--block btn--sm"
-        style={{ marginTop: 9 }}
-        onClick={handleRunGis}
-        disabled={loading}
-      >
-        {loading ? <span className="btn__spinner" /> : <Play size={13} />}
-        Run on sample tile
-      </button>
-
-      {aiOverlayData?.metrics && (
-        <div className="note note--ok" style={{ marginTop: 8 }}>
-          {gisMode === 'stage1' ? (
-            <>
-              <strong>{aiOverlayData.metrics.forest_hectares} ha</strong> canopy ·{' '}
-              {aiOverlayData.metrics.forest_pct}% cover
-            </>
-          ) : (
-            <>
-              <strong>{aiOverlayData.metrics.deforestation_hectares} ha</strong> forest loss
-            </>
-          )}
-          <span style={{ color: 'var(--text-faint)' }}>(est. 10 m GSD)</span>
-        </div>
-      )}
-    </div>
-  );
+  const navItems = [
+    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+    { id: 'map', label: 'GIS Map', icon: MapIcon },
+    { id: 'acquisition', label: 'Satellite Acquisition', icon: Satellite },
+    { id: 'forest', label: 'Forest Analysis', icon: Trees },
+    { id: 'change', label: 'Change Detection', icon: GitCompare },
+    { id: 'analytics', label: 'Analytics & Reports', icon: BarChart3 },
+    { id: 'history', label: 'Timeline & History', icon: HistoryIcon },
+    { id: 'benchmarks', label: 'Model Benchmarks', icon: CpuIcon },
+  ];
+  const page = navItems.find((item) => item.id === view) || navItems[0];
+  const isMapPage = view === 'map' || view === 'acquisition';
 
   return (
-    <div className="app-shell">
-      {/* ── Top navigation bar ─────────────────────────────────── */}
-      <header className="topbar">
-        <div className="topbar__brand">
-          <div className="brand-mark">
-            <Radar size={20} strokeWidth={2.4} />
-          </div>
-          <div className="brand-text">
-            <span className="brand-title">
-              Forest<span>Watch</span> GIS
-            </span>
-            <span className="brand-sub">Satellite Deforestation Intelligence</span>
-          </div>
+    <div className={`app-shell fw-shell ${isMapPage ? 'fw-shell--map' : ''}`}>
+      <aside className="fw-sidebar">
+        <button className="fw-brand" type="button" onClick={() => navigate('dashboard')}>
+          <span className="fw-brand__mark"><Radar size={19} /></span>
+          <span><strong>ForestWatch</strong><small>GIS Intelligence</small></span>
+        </button>
+        <div className="fw-nav-label">WORKSPACE</div>
+        <nav className="fw-nav" aria-label="Main navigation">
+          {navItems.map(({ id, label, icon: Icon }) => (
+            <button key={id} type="button" className={`fw-nav__item ${view === id ? 'is-active' : ''}`} onClick={() => navigate(id)}>
+              <Icon size={16} /><span>{label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="fw-sidebar__bottom">
+          <div className={`fw-health ${backendStatus}`}><i /> Inference API <strong>{backendStatus === 'online' ? 'Online' : backendStatus === 'offline' ? 'Offline' : 'Checking'}</strong></div>
+          <div className={`fw-health ${sentinelStatus}`}><i /> Sentinel-2 <strong>{sentinelStatus === 'configured' ? 'Connected' : sentinelStatus === 'missing' ? 'Not configured' : 'Checking'}</strong></div>
+          <small>ForestWatch GIS · {new Date().getFullYear()}</small>
         </div>
+      </aside>
 
-        <div className="topbar__meta">
-          <div className={`status-chip ${sentinelStatus === 'configured' ? 'is-live' : sentinelStatus === 'missing' ? 'is-warn' : 'is-off'}`}>
-            <span className="status-dot" />
-            {sentinelStatus === 'configured' && 'Connected to Sentinel-2 STAC API'}
-            {sentinelStatus === 'checking' && 'Checking Sentinel-2 STAC…'}
-            {sentinelStatus === 'missing' && 'Sentinel-2 credentials missing'}
-            {sentinelStatus === 'unknown' && 'STAC status unknown'}
-          </div>
+      <div className="fw-main">
+        <header className="fw-topbar">
+          <div><span className="fw-breadcrumb">ForestWatch /</span> <strong>{page.label}</strong></div>
+          <div className="fw-topbar__status"><span className={`fw-status-dot ${backendStatus}`} />{backendStatus === 'online' ? 'Services operational' : backendStatus === 'offline' ? 'API unavailable' : 'Checking services'}</div>
+        </header>
 
-          <div className={`status-chip ${backendStatus === 'online' ? 'is-live' : backendStatus === 'offline' ? 'is-off' : 'is-warn'}`}>
-            <span className="status-dot" />
-            {backendStatus === 'online' && 'Inference API online'}
-            {backendStatus === 'connecting' && 'Connecting to inference API…'}
-            {backendStatus === 'offline' && 'Inference API offline'}
-          </div>
-
-          <div className="bench-row" style={{ padding: '4px 8px', background: 'transparent', border: '1px dashed var(--border)' }}>
-            <span className="bench-badge" title="Stage 1 U-Net validation IoU">
-              <Trees size={11} /> Forest U-Net <strong>{s1Iou.toFixed(3)}</strong>
-            </span>
-            <span className="bench-badge bench-badge--warn" title="Stage 2 Temporal U-Net best validation IoU">
-              <Layers size={11} /> Temporal U-Net <strong>{S2_VAL_IOU.toFixed(3)}</strong>
-            </span>
-          </div>
-        </div>
-
-        <div className="mode-switch" role="tablist" aria-label="Application mode">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'map'}
-            className={`mode-switch__btn ${view === 'map' ? 'is-active' : ''}`}
-            onClick={() => setView('map')}
-          >
-            <Globe size={14} /> Interactive GIS Map
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'manual'}
-            className={`mode-switch__btn ${view === 'manual' ? 'is-active' : ''}`}
-            onClick={() => setView('manual')}
-          >
-            <Upload size={14} /> Manual Upload (Fallback)
-          </button>
-        </div>
-      </header>
-
-      <main className="app-main">
-        {view === 'map' ? (
-          <div className="view" style={{ gap: 0 }}>
+        <main className={`app-main fw-content ${isMapPage ? 'fw-content--map' : ''}`}>
+        {isMapPage ? (
+          <div className="fw-map-page">
+            <div className="fw-page-heading fw-page-heading--map">
+              <div><span className="fw-eyebrow">{view === 'acquisition' ? 'IMAGERY WORKSPACE' : 'GEOSPATIAL WORKSPACE'}</span><h1>{view === 'acquisition' ? 'Satellite Acquisition' : 'Interactive GIS Map'}</h1><p>{view === 'acquisition' ? 'Define an area, search Sentinel-2 scenes, inspect previews and select a date pair for analysis.' : 'Explore satellite basemaps, define regions and review forest change overlays.'}</p></div>
+              {view === 'acquisition' && <button className="btn btn--primary" onClick={() => navigate('change')}><GitCompare size={14} /> Open Change Detection</button>}
+            </div>
             <InteractiveMap
+              workspace={view}
               samples={samples}
-              aiMode={gisMode}
+              aiMode={aiOverlayData?.mode || gisMode}
               aiOpacity={gisOpacity}
               aiOverlayData={aiOverlayData}
               stage2Threshold={s2Threshold}
               onStage2Result={handleLiveStage2Result}
-              sidebarTop={overlayControls}
+              onAcquisitions={setLatestAcquisitions}
             />
           </div>
-        ) : (
-          <div className="view">
-            <div className="view-head">
-              <div>
-                <h1 className="view-head__title">Manual Image Upload</h1>
-                <p className="view-head__sub">
-                  Fallback workbench for offline analysis. Upload a single tile for canopy segmentation, or a
-                  co-registered before/after pair for change detection — no live Sentinel-2 access required.
-                </p>
-              </div>
-              <button type="button" className="btn btn--ghost" onClick={() => setView('map')}>
-                <MapPin size={13} /> Back to map
-              </button>
-            </div>
-
-            <div className="manual-tabs" role="tablist" aria-label="Manual workbench">
-              {MANUAL_TABS.map(({ id, label, icon: Icon }) => (
-                <button
-                  key={id}
-                  type="button"
-                  role="tab"
-                  aria-selected={manualTab === id}
-                  className={`manual-tab ${manualTab === id ? 'is-active' : ''}`}
-                  onClick={() => setManualTab(id)}
-                >
-                  <Icon size={13} /> {label}
-                </button>
-              ))}
-            </div>
-
-            <div className="manual-scroll">
-              {manualTab === 'stage1' && (
-                <Stage1View
+        ) : view === 'forest' ? (
+          <PageFrame className="fw-page--forest" title="Forest Analysis" description="Run Forest U-Net canopy segmentation on a sample tile or uploaded image.">
+            <Stage1View
                   samples={samples}
                   s1Sample={s1Sample}
                   setS1Sample={setS1Sample}
@@ -623,10 +436,16 @@ export default function App() {
                   loading={loading}
                   onRun={handleRunStage1}
                 />
-              )}
-
-              {manualTab === 'stage2' && (
-                <Stage2View
+            <OverlaySettings
+              overlay={aiOverlayData}
+              opacity={gisOpacity}
+              onOpacityChange={setGisOpacity}
+              onViewMap={() => navigate('map')}
+            />
+          </PageFrame>
+        ) : view === 'change' ? (
+          <PageFrame className="fw-page--change" title="Change Detection" description="Compare aligned T1 and T2 imagery with the Temporal U-Net. Live Sentinel-2 pairs are selected on the map.">
+            <Stage2View
                   samples={samples}
                   sentinelStatus={sentinelStatus}
                   s2Sample={s2Sample}
@@ -643,34 +462,164 @@ export default function App() {
                   onRunLive={handleRunLiveStage2}
                   onOpenMap={() => {
                     setGisMode('stage2');
-                    setView('map');
+                    navigate(s2Results?.live_source ? 'map' : 'acquisition');
                   }}
                 />
-              )}
-
-              {manualTab === 'timeline' && (
-                <TimelineView
-                  samples={samples}
-                  swipeSample={swipeSample}
-                  setSwipeSample={setSwipeSample}
-                  setSwipeData={setSwipeData}
-                  setTimelineStep={setTimelineStep}
-                  swipeData={swipeData}
-                  timelineFrames={timelineFrames}
-                  timelineStep={timelineStep}
-                  selectedTimelineFrame={selectedTimelineFrame}
-                  loading={loading}
-                  onLoad={handleLoadSwipe}
-                />
-              )}
-
-              {manualTab === 'benchmarks' && <EvaluationPanel analytics={analytics} />}
-            </div>
-          </div>
+            <OverlaySettings
+              overlay={aiOverlayData}
+              opacity={gisOpacity}
+              onOpacityChange={setGisOpacity}
+              onViewMap={() => navigate('map')}
+            />
+          </PageFrame>
+        ) : view === 'timeline' || view === 'history' ? (
+          <PageFrame className="fw-page--history" title="Timeline & History" description="Review benchmark image pairs and analyses completed in this browser.">
+            <HistoryView history={analysisHistory}>
+              <TimelineView
+                samples={samples}
+                swipeSample={swipeSample}
+                setSwipeSample={setSwipeSample}
+                setSwipeData={setSwipeData}
+                setTimelineStep={setTimelineStep}
+                swipeData={swipeData}
+                timelineFrames={timelineFrames}
+                timelineStep={timelineStep}
+                selectedTimelineFrame={selectedTimelineFrame}
+                loading={loading}
+                onLoad={handleLoadSwipe}
+              />
+            </HistoryView>
+          </PageFrame>
+        ) : view === 'analytics' ? (
+          <PageFrame title="Analytics & Reports" description="Explore recorded analysis results and export the data available in this browser.">
+            <AnalyticsView history={analysisHistory} analytics={analytics} />
+          </PageFrame>
+        ) : view === 'benchmarks' ? (
+          <PageFrame title="Model Benchmarks" description="Evaluation results from the recorded benchmark datasets. Live scene results are shown separately from these scores.">
+            <EvaluationPanel analytics={analytics} />
+          </PageFrame>
+        ) : (
+          <DashboardView
+            history={analysisHistory}
+            regions={regions}
+            acquisitions={latestAcquisitions}
+            backendStatus={backendStatus}
+            sentinelStatus={sentinelStatus}
+            latestForest={s1Results}
+            analytics={analytics}
+            onNavigate={navigate}
+          />
         )}
       </main>
+      </div>
     </div>
   );
+}
+
+function PageFrame({ title, description, children, className = '' }) {
+  return (
+    <div className={`fw-page view ${className}`}>
+      <div className="fw-page-heading">
+        <div><span className="fw-eyebrow">FORESTWATCH GIS</span><h1>{title}</h1><p>{description}</p></div>
+      </div>
+      <div className="fw-page-scroll">{children}</div>
+    </div>
+  );
+}
+
+function DashboardView({ history, regions, acquisitions, backendStatus, sentinelStatus, latestForest, analytics, onNavigate }) {
+  const latestLoss = history.find((item) => Number.isFinite(Number(item.lossHa)));
+  const latestCanopy = latestForest || history.find((item) => item.forestPct != null);
+  const stage1Iou = analytics?.stage1?.iou;
+  const cards = [
+    { label: 'Available regions', value: regions.length || '—', detail: regions.length ? 'Sample regions from project data' : 'No region metadata available', icon: MapPin, tone: 'green' },
+    { label: 'Completed analyses', value: history.length, detail: 'Saved in this browser', icon: Activity, tone: 'cyan' },
+    { label: 'Latest detected loss', value: latestLoss ? `${latestLoss.lossHa ?? '—'} ha` : '—', detail: latestLoss ? `${latestLoss.lossPct ?? '—'}% · ${latestLoss.region}` : 'Run a change analysis to populate', icon: Trees, tone: 'red' },
+    { label: 'Latest canopy cover', value: latestCanopy ? `${latestCanopy.forest_pct ?? latestCanopy.forestPct}%` : '—', detail: latestCanopy ? `${latestCanopy.forest_hectares ?? latestCanopy.forestHa} ha estimated` : 'Run forest analysis to populate', icon: ScanLine, tone: 'green' },
+  ];
+  return (
+    <div className="fw-page view">
+      <div className="fw-page-heading"><div><span className="fw-eyebrow">FOREST INTELLIGENCE</span><h1>Dashboard</h1><p>Monitor imagery services and review the work completed in this browser.</p></div><button className="btn btn--primary" onClick={() => onNavigate('acquisition')}><Satellite size={14} /> Start an analysis</button></div>
+      <div className="fw-page-scroll">
+        <section className="fw-stat-grid">
+          {cards.map(({ label, value, detail, icon: Icon, tone }) => <article key={label} className="fw-stat-card"><div className={`fw-stat-icon ${tone}`}><Icon size={17} /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>)}
+        </section>
+        <div className="fw-dashboard-grid">
+          <section className="fw-card fw-activity-card"><div className="fw-section-head"><div><h2>Recent analysis activity</h2><p>Results recorded locally in this browser</p></div><button className="fw-text-button" onClick={() => onNavigate('history')}>View history <ArrowUpRight size={14} /></button></div>
+            {history.length ? <div className="fw-activity-list">{history.slice(0, 5).map((item) => <div className="fw-activity-row" key={item.id}><span className={`fw-activity-mark ${item.type === 'Forest analysis' ? 'forest' : 'loss'}`} /><div><strong>{item.type}</strong><small>{item.region || 'Analysis'} · {item.date || new Date(item.analyzedAt).toLocaleDateString()}</small></div><b>{item.lossHa != null ? `${item.lossHa} ha loss` : item.forestHa != null ? `${item.forestHa} ha canopy` : 'Completed'}</b></div>)}</div> : <EmptyState title="No completed analyses yet" text="Run a Forest U-Net or Temporal U-Net workflow to see results here." />}
+          </section>
+          <section className="fw-card"><div className="fw-section-head"><div><h2>Service health</h2><p>Connectivity reported by the backend</p></div><ShieldCheck size={17} /></div>
+            <ServiceRow label="Inference API" status={backendStatus === 'online' ? 'Online' : backendStatus === 'offline' ? 'Offline' : 'Checking'} tone={backendStatus} />
+            <ServiceRow label="Sentinel-2 STAC" status={sentinelStatus === 'configured' ? 'Connected' : sentinelStatus === 'missing' ? 'Credentials missing' : 'Checking'} tone={sentinelStatus} />
+            <div className="fw-model-note"><CpuIcon size={16} /><div><strong>Model benchmarks</strong><span>{stage1Iou ? `Forest U-Net IoU ${(stage1Iou * 100).toFixed(1)}%` : 'See recorded benchmark results'}</span></div><button aria-label="Open model benchmarks" onClick={() => onNavigate('benchmarks')}><ChevronRight size={15} /></button></div>
+          </section>
+          <section className="fw-card fw-regions-card"><div className="fw-section-head"><div><h2>Available regions</h2><p>Region metadata returned by the GIS API</p></div><button className="fw-text-button" onClick={() => onNavigate('map')}>Open map <ArrowUpRight size={14} /></button></div>
+            {regions.length ? <div className="fw-region-list">{regions.slice(0, 4).map((region) => <div className="fw-region-row" key={region.id}><MapPin size={14} /><span><strong>{region.region_name || region.name}</strong><small>{region.center?.map((n) => Number(n).toFixed(3)).join(', ') || 'Coordinates unavailable'}</small></span><span className="fw-region-gsd">{region.gsd_meters || '—'} m</span></div>)}</div> : <EmptyState title="No region data returned" text="Check the backend connection or open the GIS map to define an AOI." />}
+          </section>
+          <section className="fw-card"><div className="fw-section-head"><div><h2>Latest satellite acquisitions</h2><p>From the most recent Sentinel-2 search</p></div><button className="fw-text-button" onClick={() => onNavigate('acquisition')}>Search scenes <ArrowUpRight size={14} /></button></div>
+            {acquisitions?.length ? <div className="fw-region-list">{acquisitions.slice(-4).reverse().map((scene) => <div className="fw-region-row" key={scene.id}><Satellite size={14} /><span><strong>{scene.datetime ? new Date(scene.datetime).toLocaleString() : scene.id}</strong><small>{scene.id}</small></span><span className="fw-region-gsd">{scene.cloud_coverage == null ? 'Cloud n/a' : `${scene.cloud_coverage}% cloud`}</span></div>)}</div> : <EmptyState title="No recent acquisitions" text="Search for Sentinel-2 scenes on the acquisition page." />}
+          </section>
+          <section className="fw-card fw-trend-card"><div className="fw-section-head"><div><h2>Forest loss trend</h2><p>Based on completed analyses saved in this browser</p></div><BarChart3 size={17} /></div><TrendChart records={history.filter((item) => Number.isFinite(Number(item.lossHa))).slice(0, 8).reverse()} /></section>
+          <section className="fw-card fw-trend-card"><div className="fw-section-head"><div><h2>Forest cover trend</h2><p>Canopy estimates from completed Forest U-Net runs</p></div><Trees size={17} /></div><TrendChart metric="forestPct" unit="%" records={history.filter((item) => Number.isFinite(Number(item.forestPct))).slice(0, 8).reverse()} /></section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ServiceRow({ label, status, tone }) {
+  const ok = tone === 'online' || tone === 'configured';
+  const warn = tone === 'connecting' || tone === 'checking';
+  return <div className="fw-service-row"><span><i className={ok ? 'ok' : warn ? 'warn' : 'off'} />{label}</span><strong>{status}</strong></div>;
+}
+
+function OverlaySettings({ overlay, opacity, onOpacityChange, onViewMap }) {
+  return (
+    <section className="fw-card fw-overlay-settings">
+      <div className="fw-section-head">
+        <div><h2>Map overlay</h2><p>Control how the latest inference result appears on the GIS map.</p></div>
+        <span className={`fw-overlay-status ${overlay ? 'is-active' : ''}`}><i />{overlay ? 'Ready' : 'No result yet'}</span>
+      </div>
+      <div className="fw-overlay-controls">
+        <label htmlFor="result-overlay-opacity">Overlay opacity <strong>{Math.round(opacity * 100)}%</strong></label>
+        <input id="result-overlay-opacity" type="range" min="0.1" max="1" step="0.05" value={opacity} onChange={(event) => onOpacityChange(Number(event.target.value))} />
+        <span className="fw-overlay-hint">{overlay ? `${overlay.mode === 'stage1' ? 'Forest canopy' : 'Forest loss'} result is ready to view on the map.` : 'Run an analysis to generate a map overlay.'}</span>
+      </div>
+      <button type="button" className="btn btn--primary" onClick={onViewMap} disabled={!overlay}>View result on GIS map</button>
+    </section>
+  );
+}
+
+function EmptyState({ title, text }) {
+  return <div className="fw-empty"><Search size={17} /><strong>{title}</strong><span>{text}</span></div>;
+}
+
+function TrendChart({ records, metric = 'lossHa', unit = 'ha' }) {
+  if (!records.length) return <EmptyState title="Trend data will appear here" text={unit === '%' ? 'No canopy coverage results have been recorded yet.' : 'No forest loss measurements have been recorded yet.'} />;
+  const max = Math.max(...records.map((record) => Number(record[metric])), 1);
+  return <div className="fw-chart" role="img" aria-label={unit === '%' ? 'Forest cover percentage by analysis' : 'Forest loss hectares by analysis'}><div className="fw-chart__bars">{records.map((record, index) => <div className="fw-chart__col" key={record.id || index}><span>{Number(record[metric]).toLocaleString()} {unit}</span><i style={{ height: `${Math.max(6, Number(record[metric]) / max * 100)}%` }} /><small>{record.date || 'Analysis'}</small></div>)}</div></div>;
+}
+
+function AnalyticsView({ history, analytics }) {
+  const lossRecords = history.filter((item) => Number.isFinite(Number(item.lossHa)));
+  const exportCsv = () => {
+    const rows = [['Analysis date', 'Type', 'Region', 'Forest loss (ha)', 'Forest loss (%)', 'Forest cover (ha)', 'Forest cover (%)'], ...history.map((item) => [item.date || '', item.type || '', item.region || '', item.lossHa ?? '', item.lossPct ?? '', item.forestHa ?? '', item.forestPct ?? ''])];
+    const csv = rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(',')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = 'forestwatch-analysis-history.csv'; link.click(); URL.revokeObjectURL(url);
+  };
+  const benchmarkSources = analytics?.stage1 && analytics?.stage2 ? '2 models' : analytics?.stage1 ? 'Forest U-Net' : analytics?.stage2 ? 'Temporal U-Net' : 'Unavailable';
+  const forestRecords = history.filter((item) => Number.isFinite(Number(item.forestPct)));
+  return <div className="fw-reports"><section className="fw-card"><div className="fw-section-head"><div><h2>Analysis report</h2><p>Export measured results recorded in this browser. Benchmark metrics are separate.</p></div><button className="btn btn--ghost" onClick={exportCsv} disabled={!history.length}>Download CSV</button></div><div className="fw-report-kpis"><div><span>Saved analyses</span><strong>{history.length}</strong></div><div><span>Change analyses</span><strong>{history.filter((item) => item.type === 'Change detection').length}</strong></div><div><span>Measured loss runs</span><strong>{lossRecords.length}</strong></div><div><span>Benchmark sources</span><strong>{benchmarkSources}</strong></div></div></section><section className="fw-card"><div className="fw-section-head"><div><h2>Forest loss by analysis</h2><p>Hectares reported by Temporal U-Net runs</p></div></div><TrendChart records={lossRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Canopy cover by analysis</h2><p>Coverage reported by Forest U-Net runs</p></div></div><TrendChart metric="forestPct" unit="%" records={forestRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Regional results</h2><p>Recorded outputs, with no extrapolation across unsurveyed regions</p></div></div><HistoryTable history={history} /></section></div>;
+}
+
+function HistoryView({ history, children }) {
+  return <div className="fw-history-layout">{children}<section className="fw-card fw-history-card"><div className="fw-section-head"><div><h2>Analysis history</h2><p>Saved in this browser only; records are not synced to a server.</p></div><span className="fw-history-count">{history.length} {history.length === 1 ? 'record' : 'records'}</span></div><HistoryTable history={history} /></section></div>;
+}
+
+function HistoryTable({ history }) {
+  if (!history.length) return <EmptyState title="No analysis history" text="Completed analyses will be listed here." />;
+  return <div className="fw-table-wrap"><table className="fw-table"><thead><tr><th>Analysis</th><th>Region / pair</th><th>Date</th><th>Measured result</th></tr></thead><tbody>{history.map((item) => <tr key={item.id}><td>{item.type}</td><td>{item.region || '—'}</td><td>{item.date || new Date(item.analyzedAt).toLocaleDateString()}</td><td>{item.lossHa != null ? `${item.lossHa} ha · ${item.lossPct ?? '—'}% loss` : item.forestHa != null ? `${item.forestHa} ha · ${item.forestPct ?? '—'}% cover` : '—'}</td></tr>)}</tbody></table></div>;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -702,25 +651,31 @@ function Stage1View({
           </span>
         </div>
 
-        <div className="control-grid">
-          <div className="field">
-            <label htmlFor="s1-sample">Pre-loaded sample</label>
-            <select
-              id="s1-sample"
-              className="select"
-              value={s1Sample}
-              onChange={(e) => {
-                setS1Sample(e.target.value);
-                setS1File(null);
-              }}
-            >
-              <option value="">— Choose a sample —</option>
-              {samples.stage1_samples.map((s, i) => (
-                <option key={i} value={s.path}>
-                  [{s.split}] {s.name}
-                </option>
-              ))}
-            </select>
+        <div className="control-grid fw-forest-controls">
+          <div className="fw-forest-source">
+            <div className="field">
+              <label htmlFor="s1-sample">Pre-loaded sample</label>
+              <select
+                id="s1-sample"
+                className="select"
+                value={s1Sample}
+                onChange={(e) => {
+                  setS1Sample(e.target.value);
+                  setS1File(null);
+                }}
+              >
+                <option value="">— Choose a sample —</option>
+                {samples.stage1_samples.map((s, i) => (
+                  <option key={i} value={s.path}>
+                    [{s.split}] {s.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading || (!s1Sample && !s1File)}>
+              {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+              Run segmentation
+            </button>
           </div>
 
           <label className={`upload-zone ${s1File ? 'has-file' : ''}`}>
@@ -755,16 +710,12 @@ function Stage1View({
             />
           </div>
 
-          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading}>
-            {loading ? <span className="btn__spinner" /> : <Play size={14} />}
-            Run segmentation
-          </button>
         </div>
       </section>
 
       {s1Results && (
         <>
-          <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
+          <div className="stat-grid fw-forest-results" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
             <div className="stat stat--green">
               <span className="stat__label">
                 <Trees size={11} /> Forest canopy
@@ -793,7 +744,7 @@ function Stage1View({
             </div>
           </div>
 
-          <div className="visual-grid">
+          <div className="visual-grid fw-forest-visuals">
             <VisualCard title="Original RGB" src={s1Results.original_image} alt="Original satellite image" />
             <VisualCard title="Binary mask" src={s1Results.mask_image} alt="Predicted forest mask" />
             <VisualCard title="Canopy overlay" src={s1Results.overlay_image} alt="Forest overlay" />
@@ -827,7 +778,7 @@ function Stage2View({
 
   return (
     <>
-      <section className="panel">
+      <section className="panel fw-change-panel">
         <div className="panel__head">
           <div>
             <div className="panel__title">Bi-Temporal Deforestation Detection</div>
@@ -841,9 +792,11 @@ function Stage2View({
         </div>
 
         {/* ── Mode Selector: Clean, Segmented Switcher ── */}
-        <div className="seg" style={{ width: '100%', marginBottom: 14 }}>
+        <div className="seg fw-mode-switcher" role="tablist" aria-label="Change detection source">
           <button
             type="button"
+            role="tab"
+            aria-selected={stage2Mode === 'live'}
             className={`seg__btn ${stage2Mode === 'live' ? 'is-active' : ''}`}
             style={{ flex: 1, justifyContent: 'center' }}
             onClick={() => setStage2Mode('live')}
@@ -852,6 +805,8 @@ function Stage2View({
           </button>
           <button
             type="button"
+            role="tab"
+            aria-selected={stage2Mode === 'sample'}
             className={`seg__btn ${stage2Mode === 'sample' ? 'is-active' : ''}`}
             style={{ flex: 1, justifyContent: 'center' }}
             onClick={() => setStage2Mode('sample')}
@@ -860,6 +815,8 @@ function Stage2View({
           </button>
           <button
             type="button"
+            role="tab"
+            aria-selected={stage2Mode === 'upload'}
             className={`seg__btn ${stage2Mode === 'upload' ? 'is-active' : ''}`}
             style={{ flex: 1, justifyContent: 'center' }}
             onClick={() => setStage2Mode('upload')}
@@ -870,7 +827,7 @@ function Stage2View({
 
         {/* ── Mode A: Live Sentinel-2 ── */}
         {stage2Mode === 'live' && (
-          <div className="control-grid" style={{ gridTemplateColumns: '1fr' }}>
+          <div className="control-grid fw-change-live">
             {sentinelStatus !== 'configured' && (
               <div className="note note--warn">
                 <RefreshCw size={12} />
@@ -885,7 +842,7 @@ function Stage2View({
             )}
 
             {s2Results?.live_source ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div className="fw-change-live__content">
                 <div className="note note--ok">
                   <Satellite size={13} />
                   <span>
@@ -930,7 +887,7 @@ function Stage2View({
                 </div>
               </div>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div className="fw-change-live__content">
                 <div className="note note--info">
                   <Satellite size={13} />
                   <span>
@@ -950,8 +907,8 @@ function Stage2View({
 
         {/* ── Mode B: Sample Image Pair ── */}
         {stage2Mode === 'sample' && (
-          <div className="control-grid">
-            <div className="field" style={{ gridColumn: 'span 2' }}>
+          <div className="control-grid fw-change-controls fw-change-controls--sample">
+            <div className="field">
               <label htmlFor="s2-sample">Pre-loaded temporal pair</label>
               <select
                 id="s2-sample"
@@ -972,7 +929,7 @@ function Stage2View({
               </select>
             </div>
 
-            <div className="slider-block" style={{ gridColumn: 'span 2' }}>
+            <div className="slider-block fw-change-threshold">
               <div className="slider-row">
                 <span>Deforestation threshold</span>
                 <span className="slider-value">{s2Threshold.toFixed(2)}</span>
@@ -990,8 +947,7 @@ function Stage2View({
 
             <button
               type="button"
-              className="btn btn--primary"
-              style={{ gridColumn: 'span 2' }}
+              className="btn btn--primary fw-change-submit"
               onClick={onRun}
               disabled={loading || !s2Sample}
             >
@@ -1003,12 +959,12 @@ function Stage2View({
 
         {/* ── Mode C: Upload Image Pair ── */}
         {stage2Mode === 'upload' && (
-          <div className="control-grid">
-            <div className="block__hint" style={{ gridColumn: 'span 2', marginBottom: -4 }}>
-              Upload two co-registered satellite images covering the exact same geographic extent (PNG, TIFF, JPG).
+          <div className="control-grid fw-change-controls fw-change-controls--upload">
+            <div className="block__hint fw-change-note">
+              Upload two co-registered satellite images covering the exact same geographic extent (PNG, TIFF, JPG). The upload endpoint checks matching pixel dimensions; it cannot verify geospatial coordinates or CRS, so confirm both files are spatially aligned before running.
             </div>
 
-            <label className={`upload-zone ${s2FileT1 ? 'has-file' : ''}`}>
+            <label className={`upload-zone fw-change-upload ${s2FileT1 ? 'has-file' : ''}`}>
               <input
                 type="file"
                 accept="image/*,.tif,.tiff"
@@ -1024,7 +980,7 @@ function Stage2View({
               <span className="upload-zone__hint">Earlier timestamp</span>
             </label>
 
-            <label className={`upload-zone ${s2FileT2 ? 'has-file' : ''}`}>
+            <label className={`upload-zone fw-change-upload ${s2FileT2 ? 'has-file' : ''}`}>
               <input
                 type="file"
                 accept="image/*,.tif,.tiff"
@@ -1040,7 +996,7 @@ function Stage2View({
               <span className="upload-zone__hint">Later timestamp</span>
             </label>
 
-            <div className="slider-block" style={{ gridColumn: 'span 2' }}>
+            <div className="slider-block fw-change-threshold">
               <div className="slider-row">
                 <span>Deforestation threshold</span>
                 <span className="slider-value">{s2Threshold.toFixed(2)}</span>
@@ -1058,8 +1014,7 @@ function Stage2View({
 
             <button
               type="button"
-              className="btn btn--primary"
-              style={{ gridColumn: 'span 2' }}
+              className="btn btn--primary fw-change-submit"
               onClick={onRun}
               disabled={loading || !s2FileT1 || !s2FileT2}
             >
@@ -1082,7 +1037,7 @@ function Stage2View({
             </div>
           )}
 
-          <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
+          <div className="stat-grid fw-change-results" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
             <div className="stat stat--red">
               <span className="stat__label">Forest loss</span>
               <div className="stat__value">
@@ -1112,7 +1067,7 @@ function Stage2View({
             )}
           </div>
 
-          <div className="visual-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
+          <div className="visual-grid fw-change-visuals" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
             <VisualCard title="T1 · Before" src={s2Results.t1_image || s2Results.before_image} alt="Before image" />
             <VisualCard title="T2 · After" src={s2Results.t2_image || s2Results.after_image} alt="After image" />
             <VisualCard title="Change mask" src={s2Results.deforestation_mask} alt="Deforestation mask" />
@@ -1146,7 +1101,7 @@ function TimelineView({
 }) {
   return (
     <>
-      <section className="panel">
+      <section className="panel fw-history-selector">
         <div className="panel__head">
           <div>
             <div className="panel__title">Temporal Pair Comparison</div>
@@ -1156,8 +1111,8 @@ function TimelineView({
           </div>
         </div>
 
-        <div className="control-grid">
-          <div className="field" style={{ gridColumn: 'span 2' }}>
+        <div className="control-grid fw-history-source">
+          <div className="field">
             <label htmlFor="swipe-sample">Temporal image pair</label>
             <select
               id="swipe-sample"
@@ -1178,7 +1133,7 @@ function TimelineView({
             </select>
           </div>
 
-          <button type="button" className="btn btn--primary" onClick={onLoad} disabled={loading}>
+          <button type="button" className="btn btn--primary" onClick={onLoad} disabled={loading || !swipeSample}>
             {loading ? <span className="btn__spinner" /> : <Play size={14} />}
             Load timeline
           </button>
@@ -1186,7 +1141,7 @@ function TimelineView({
       </section>
 
       {swipeData ? (
-        <section className="panel">
+        <section className="panel fw-timeline-result">
           <div className="panel__head">
             <div>
               <div className="panel__title">{selectedTimelineFrame?.label}</div>
@@ -1240,7 +1195,7 @@ function TimelineView({
           </div>
         </section>
       ) : (
-        <div className="empty-state">
+        <div className="empty-state fw-history-empty">
           <GitCompare size={22} />
           Select a temporal pair and load the timeline to compare T1, T2 and the predicted change.
         </div>
@@ -1251,9 +1206,10 @@ function TimelineView({
 
 function VisualCard({ title, src, alt }) {
   if (!src) return null;
+  const filename = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.png`;
   return (
     <div className="visual-card">
-      <div className="visual-card__head">{title}</div>
+      <div className="visual-card__head"><span>{title}</span><a href={src} download={filename} aria-label={`Download ${title}`}>Download</a></div>
       <img className="visual-card__img" src={src} alt={alt} />
     </div>
   );
