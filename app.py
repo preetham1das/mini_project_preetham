@@ -54,16 +54,8 @@ CORS(app)
 DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
 
-# GIS Spatial Constants
-# Ground Sample Distance: 10 meters per pixel (Sentinel-2 standard)
-GSD_METERS = 10.0
-SQM_PER_PIXEL = GSD_METERS * GSD_METERS
-HA_PER_PIXEL = SQM_PER_PIXEL / 10000.0
-SQKM_PER_PIXEL = SQM_PER_PIXEL / 1000000.0
-
-# Base Amazon Basin Reference Coordinates
-BASE_LAT = -3.4653
-BASE_LON = -62.2159
+# Approximate spherical Earth radius used only for AOI area estimates.
+EARTH_RADIUS_METERS = 6_371_008.8
 
 # Sentinel-2 / Copernicus Data Space Ecosystem Configuration
 SENTINEL_CLIENT_ID = os.environ.get("SENTINEL_CLIENT_ID", "").strip()
@@ -162,27 +154,57 @@ stage1_model = None
 stage2_model = None
 
 
-def get_sample_bounds(sample_id_str):
-    """Generates realistic Lat/Lon bounding box based on sample hash."""
-    h = hash(str(sample_id_str)) % 1000
-    lat_offset = (h / 1000.0) * 4.0 - 2.0
-    lon_offset = ((h * 3) % 1000 / 1000.0) * 4.0 - 2.0
+def estimate_pixel_area_hectares(bbox, pixel_count):
+    """Estimate hectares per prediction pixel from a real geographic AOI bbox.
 
-    lat_center = BASE_LAT + lat_offset
-    lon_center = BASE_LON + lon_offset
+    This spherical-area approximation is only appropriate when the prediction
+    image spans the supplied bbox. Unreferenced samples and uploads return None.
+    """
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4 or pixel_count <= 0:
+        return None
+    try:
+        west, south, east, north = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return None
+    if not all(np.isfinite(value) for value in (west, south, east, north)):
+        return None
+    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
+        return None
 
-    delta_deg = 0.023
+    west_rad, east_rad = np.radians([west, east])
+    south_rad, north_rad = np.radians([south, north])
+    area_square_meters = EARTH_RADIUS_METERS ** 2 * (east_rad - west_rad) * (
+        np.sin(north_rad) - np.sin(south_rad)
+    )
+    if not np.isfinite(area_square_meters) or area_square_meters <= 0:
+        return None
+    return float(area_square_meters / pixel_count / 10_000.0)
 
-    south = round(lat_center - delta_deg / 2, 6)
-    north = round(lat_center + delta_deg / 2, 6)
-    west = round(lon_center - delta_deg / 2, 6)
-    east = round(lon_center + delta_deg / 2, 6)
 
-    return {
-        "bounds": [[south, west], [north, east]],
-        "center": [round(lat_center, 6), round(lon_center, 6)],
-        "south": south, "north": north, "west": west, "east": east
-    }
+def parse_probability_threshold(value, default=0.5):
+    """Parse and validate a binary-classification probability threshold."""
+    try:
+        threshold = float(default if value is None else value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Threshold must be a number between 0 and 1.") from exc
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Threshold must be a number between 0 and 1.")
+    return threshold
+
+
+def parse_geographic_bbox(value):
+    """Validate a [west, south, east, north] WGS84 bounding box."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError("AOI bbox must contain west, south, east, and north coordinates.")
+    try:
+        west, south, east, north = (float(coordinate) for coordinate in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AOI bbox coordinates must be numeric.") from exc
+    if not all(np.isfinite(coordinate) for coordinate in (west, south, east, north)):
+        raise ValueError("AOI bbox coordinates must be finite numbers.")
+    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
+        raise ValueError("AOI bbox must be ordered and within WGS84 longitude/latitude ranges.")
+    return [west, south, east, north]
 
 
 def load_models():
@@ -1442,7 +1464,15 @@ def analyze_sentinel_deforestation():
     date_before    = data.get("date_before", "Unknown")
     date_after     = data.get("date_after",  "Unknown")
     bbox           = data.get("bbox", None)
-    threshold      = float(data.get("threshold", 0.5))
+    try:
+        threshold = parse_probability_threshold(data.get("threshold", 0.5))
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    if bbox is not None:
+        try:
+            bbox = parse_geographic_bbox(bbox)
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 400
 
     if not img_before_b64 or not img_after_b64:
         return jsonify({
@@ -1505,8 +1535,9 @@ def analyze_sentinel_deforestation():
     stable_pixels = total_pixels - defor_pixels
     defor_pct     = round((defor_pixels / total_pixels) * 100.0, 2)
     stable_pct    = round(100.0 - defor_pct, 2)
-    defor_ha      = round(defor_pixels * HA_PER_PIXEL, 2)
-    defor_sqkm    = round(defor_pixels * SQKM_PER_PIXEL, 3)
+    pixel_area_ha = estimate_pixel_area_hectares(bbox, total_pixels)
+    defor_ha = round(defor_pixels * pixel_area_ha, 4) if pixel_area_ha is not None else None
+    defor_sqkm = round(defor_ha / 100.0, 6) if defor_ha is not None else None
 
     # -- GIS bounds for overlay ------------------------------------------------
     if bbox and len(bbox) == 4:
@@ -1517,7 +1548,7 @@ def analyze_sentinel_deforestation():
             "west": west, "east": east, "south": south, "north": north,
         }
     else:
-        gis_bounds_obj = get_sample_bounds("sentinel_analysis")
+        gis_bounds_obj = None
 
     # -- Encode output images --------------------------------------------------
     # Before image (resized)
@@ -1555,6 +1586,7 @@ def analyze_sentinel_deforestation():
         "stable_pct":         stable_pct,
         "deforestation_hectares": defor_ha,
         "deforestation_sqkm":     defor_sqkm,
+        "area_estimate_method": "spherical approximation from AOI bounding box" if pixel_area_ha is not None else None,
         "gis": gis_bounds_obj,
         "before_image":        before_b64,
         "after_image":         after_b64,
@@ -1696,23 +1728,11 @@ def sentinel_superresolve_status():
 
 @app.route("/api/gis/regions", methods=["GET"])
 def get_gis_regions():
-    """Returns sample GIS region metadata and bounding boxes."""
-    amazon_dir = Path("data/Amazon Forest Dataset")
-    regions = []
-
-    test_images = list((amazon_dir / "Validation" / "images").glob("*.tiff")) + list((amazon_dir / "Validation" / "images").glob("*.tif"))
-    for f in test_images[:8]:
-        gis_info = get_sample_bounds(f.name)
-        regions.append({
-            "id": f.name,
-            "name": f.name,
-            "region_name": f"Amazon Sub-basin Tile {f.stem}",
-            "center": gis_info["center"],
-            "bounds": gis_info["bounds"],
-            "gsd_meters": GSD_METERS
-        })
-
-    return jsonify({"regions": regions, "gsd_meters": GSD_METERS})
+    """Return only regions with real spatial metadata (none are bundled yet)."""
+    return jsonify({
+        "regions": [],
+        "message": "Bundled samples do not include georeferenced region metadata."
+    })
 
 
 @app.route("/api/samples", methods=["GET"])
@@ -1723,24 +1743,22 @@ def get_samples():
     
     val_images = list((amazon_dir / "Validation" / "images").glob("*.tiff")) + list((amazon_dir / "Validation" / "images").glob("*.tif"))
     for f in val_images[:10]:
-        gis = get_sample_bounds(f.name)
         stage1_samples.append({
             "id": f.name,
             "name": f.name,
             "split": "Validation",
             "path": str(f),
-            "gis": gis
+            "gis": None
         })
 
     test_images = list((amazon_dir / "Test").glob("*.tiff")) + list((amazon_dir / "Test").glob("*.tif"))
     for f in test_images[:10]:
-        gis = get_sample_bounds(f.name)
         stage1_samples.append({
             "id": f.name,
             "name": f"Test / {f.name}",
             "split": "Test",
             "path": str(f),
-            "gis": gis
+            "gis": None
         })
 
     temporal_root = Path("data/Forest-Change/extracted/Forest-Change-dataset/images")
@@ -1749,18 +1767,17 @@ def get_samples():
     if (temporal_root / "test" / "A").exists():
         test_pairs = sorted([f.stem for f in (temporal_root / "test" / "A").glob("*.png")])
         for p in test_pairs[:12]:
-            gis = get_sample_bounds(p)
             stage2_samples.append({
                 "id": p,
                 "name": f"Test Pair: {p}",
                 "split": "test",
-                "gis": gis
+                "gis": None
             })
 
     return jsonify({
         "stage1_samples": stage1_samples,
         "stage2_samples": stage2_samples,
-        "gsd_meters": GSD_METERS
+        "gsd_meters": None
     })
 
 
@@ -1770,23 +1787,43 @@ def predict_stage1():
     if stage1_model is None:
         return jsonify({"error": "Stage 1 model is not loaded"}), 500
 
-    threshold = float(request.form.get("threshold", THRESHOLD))
+    try:
+        threshold = parse_probability_threshold(request.form.get("threshold"), THRESHOLD)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     pil_img = None
     sample_name = "Uploaded Image"
 
     if "file" in request.files and request.files["file"].filename != "":
         file = request.files["file"]
         sample_name = file.filename
-        pil_img = Image.open(file.stream).convert("RGB")
+        try:
+            pil_img = Image.open(file.stream).convert("RGB")
+        except (OSError, ValueError) as exc:
+            return jsonify({"error": f"Could not read uploaded image: {exc}"}), 400
     else:
         sample_path_str = request.form.get("sample_path")
-        if sample_path_str and Path(sample_path_str).exists():
-            pil_img = Image.open(sample_path_str).convert("RGB")
-            sample_name = Path(sample_path_str).name
-        else:
+        if not sample_path_str:
             return jsonify({"error": "No image provided"}), 400
+        try:
+            candidate = Path(sample_path_str).resolve()
+            allowed_roots = [
+                (Path("data/Amazon Forest Dataset/Validation/images")).resolve(),
+                (Path("data/Amazon Forest Dataset/Test")).resolve(),
+            ]
+            is_allowed_sample = any(candidate.is_relative_to(root) for root in allowed_roots)
+        except (OSError, ValueError):
+            is_allowed_sample = False
+            candidate = None
+        if not is_allowed_sample or candidate is None or not candidate.is_file() or candidate.suffix.lower() not in {".tif", ".tiff"}:
+            return jsonify({"error": "Sample path must refer to a bundled validation or test TIFF."}), 400
+        try:
+            pil_img = Image.open(candidate).convert("RGB")
+        except (OSError, ValueError) as exc:
+            return jsonify({"error": f"Could not read sample image: {exc}"}), 400
+        sample_name = candidate.name
 
-    gis_bounds = get_sample_bounds(sample_name)
+    gis_bounds = None
 
     pil_resized = pil_img.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
     img_np = np.array(pil_resized, dtype=np.float32) / 255.0
@@ -1805,9 +1842,9 @@ def predict_stage1():
     non_forest_pixels = total_pixels - forest_pixels
     non_forest_pct = round(100.0 - forest_pct, 2)
 
-    total_hectares = round(total_pixels * HA_PER_PIXEL, 2)
-    forest_hectares = round(forest_pixels * HA_PER_PIXEL, 2)
-    forest_sqkm = round(forest_pixels * SQKM_PER_PIXEL, 3)
+    total_hectares = None
+    forest_hectares = None
+    forest_sqkm = None
 
     original_b64 = array_to_base64_png(img_np)
 
@@ -1833,6 +1870,7 @@ def predict_stage1():
         "total_hectares": total_hectares,
         "forest_hectares": forest_hectares,
         "forest_sqkm": forest_sqkm,
+        "area_estimate_method": None,
         "gis": gis_bounds,
         "original_image": original_b64,
         "mask_image": mask_b64,
@@ -1846,7 +1884,10 @@ def predict_stage2():
     if stage2_model is None:
         return jsonify({"error": "Stage 2 temporal model is not loaded"}), 500
 
-    threshold = float(request.form.get("threshold", 0.5))
+    try:
+        threshold = parse_probability_threshold(request.form.get("threshold"), 0.5)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     split = request.form.get("split", "test")
     sample_id = request.form.get("sample_id")
 
@@ -1865,6 +1906,8 @@ def predict_stage2():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
     elif sample_id:
+        if split not in {"train", "val", "test"} or not re.fullmatch(r"(?:train|val|test)_\d{6}", sample_id):
+            return jsonify({"error": "Invalid sample pair or split."}), 400
         t1_path = temporal_root / split / "A" / f"{sample_id}.png"
         t2_path = temporal_root / split / "B" / f"{sample_id}.png"
         gt_path = temporal_root / split / "label" / f"{sample_id}.png"
@@ -1882,7 +1925,7 @@ def predict_stage2():
     else:
         return jsonify({"error": "No T1 and T2 images provided"}), 400
 
-    gis_bounds = get_sample_bounds(pair_name)
+    gis_bounds = None
 
     pil_a_resized = pil_a.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
     pil_b_resized = pil_b.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
@@ -1910,8 +1953,8 @@ def predict_stage2():
     stable_pixels = total_pixels - defor_pixels
     stable_pct = round(100.0 - defor_pct, 2)
 
-    defor_hectares = round(defor_pixels * HA_PER_PIXEL, 2)
-    defor_sqkm = round(defor_pixels * SQKM_PER_PIXEL, 3)
+    defor_hectares = None
+    defor_sqkm = None
 
     t1_b64 = array_to_base64_png(img_a_np)
     t2_b64 = array_to_base64_png(img_b_np)
@@ -1951,7 +1994,7 @@ def predict_stage2():
             "sample_dice": round(dice, 4),
             "gt_defor_pixels": gt_defor_px,
             "gt_defor_pct": round((gt_defor_px / total_pixels) * 100.0, 2),
-            "gt_defor_hectares": round(gt_defor_px * HA_PER_PIXEL, 2)
+            "gt_defor_hectares": None
         }
 
     return jsonify({
@@ -1962,6 +2005,7 @@ def predict_stage2():
         "deforestation_pct": defor_pct,
         "deforestation_hectares": defor_hectares,
         "deforestation_sqkm": defor_sqkm,
+        "area_estimate_method": None,
         "stable_pixels": stable_pixels,
         "stable_pct": stable_pct,
         "gis": gis_bounds,

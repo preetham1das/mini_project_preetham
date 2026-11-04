@@ -1760,19 +1760,19 @@ export default function InteractiveMap({
               <div className="stat stat--red">
                 <span className="stat__label">Area</span>
                 <div className="stat__value">
-                  {analysisResult.deforestation_hectares}
-                  <span className="stat__unit">ha</span>
+                  {analysisResult.deforestation_hectares ?? Number(analysisResult.defor_pixels ?? 0).toLocaleString()}
+                  <span className="stat__unit">{analysisResult.deforestation_hectares != null ? 'ha*' : 'px'}</span>
                 </div>
-                <div className="stat__sub">physical forest loss</div>
+                <div className="stat__sub">{analysisResult.area_estimate_method || 'Area unavailable'}</div>
               </div>
 
               <div className="stat stat--neutral">
                 <span className="stat__label">Square km</span>
                 <div className="stat__value">
-                  {analysisResult.deforestation_sqkm}
-                  <span className="stat__unit">km²</span>
+                  {analysisResult.deforestation_sqkm ?? '—'}
+                  {analysisResult.deforestation_sqkm != null && <span className="stat__unit">km²</span>}
                 </div>
-                <div className="stat__sub">10 m GSD estimate</div>
+                <div className="stat__sub">AOI-based approximation</div>
               </div>
 
               <div className="stat stat--green">
