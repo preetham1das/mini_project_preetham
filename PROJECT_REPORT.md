@@ -266,6 +266,8 @@ The network follows the canonical U-Net architecture (`src/model.py`):
 - **Final Projection:** $1 \times 1$ convolution mapping 32 channels to 1 logit output.
 - **Trainable Parameters:** **7,763,041** parameters.
 
+The forward pass pads the bottom/right edges to a multiple of 16 (the four pooling stages) and crops logits to the input dimensions. This preserves checkpoint parameter shapes while accepting arbitrary positive image dimensions. Shared soft Dice losses now calculate overlap per image and average across the batch. The validation metric helpers also expose specificity and balanced accuracy; undefined precision or recall uses zero instead of a perfect score. Historical results below come from already saved artifacts: no training was rerun during this audit, and the revised loss can change future training results.
+
 ---
 
 ## 11. Stage 2: Bi-Temporal Deforestation Detection

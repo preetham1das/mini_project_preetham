@@ -59,8 +59,9 @@ This project addresses these challenges with a validated two-stage machine learn
 ## ✨ Key Features
 
 - **Direct Temporal Modeling:** Overcomes the failure modes of post-classification subtraction by processing bi-temporal image pairs through an end-to-end 9-channel architecture.
+- **Robust U-Net Spatial Shapes:** Both U-Nets pad only the bottom/right edges to a multiple of 16 and crop logits to the original dimensions, so odd-sized inputs work without changing learned checkpoint weights.
 - **Explicit Change Prior:** Ingests the absolute difference tensor $|T_1 - T_2|$ alongside raw RGB channels, giving early convolutional layers a direct inductive bias for spectral change detection.
-- **Severe Class Imbalance Mitigation:** Combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$) and Focal Loss ($\gamma = 2.0, \alpha = 0.75$) with Soft Dice Loss to ensure stable gradient updates on rare change events.
+- **Severe Class Imbalance Mitigation:** Combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$) and Focal Loss ($\gamma = 2.0, \alpha = 0.75$) with per-image Soft Dice Loss to reduce domination by samples with different foreground prevalence.
 - **Live Copernicus Data Space Integration:** Authenticated OAuth2 integration querying the Sentinel-2 L2A STAC catalog and retrieving dynamically rendered true-color RGB tiles via the Process API.
 - **AOI-Specific Cloud Statistics:** Extracts the 20-meter Scene Classification Layer (SCL) to compute cloud obscuration percentages specifically within the user's drawn bounding box, distinguishing local cloud cover from tile-wide catalog estimates.
 - **Client-Side Cloud Mask Overlay:** Generates a cyan-tinted map overlay showing obscured pixels to alert analysts before running inference.
@@ -313,6 +314,8 @@ When running inference on live Sentinel-2 imagery via `/api/sentinel/analyze`, t
 ```
 Deforestation-Detection-from-Satellite-Images/
 ├── app.py                      # Production Flask REST API (Port 5000)
+├── backend/
+│   └── main.py                  # Separate FastAPI inference service (legacy/optional; not used by Vite)
 ├── PROJECT_REPORT.md           # Formal 27-section technical engineering report
 ├── README.md                   # System documentation and developer guide
 ├── package.json                # Root package configuration
@@ -481,16 +484,16 @@ The Flask backend provides 13 operational REST endpoints:
 
 ## 🧪 Testing & Verification Suite
 
-The repository includes a comprehensive testing suite to verify individual components:
+The tracked tests cover core model/data regressions plus Sentinel and super-resolution integrations:
 
-### 1. Core Architecture Smoke Test
-Verifies dataset shapes, 6-channel and 9-channel tensor concatenation, model parameters, and loss function gradients:
+### 1. Focused ML regression tests
+Verifies U-Net shape handling and gradients, six/nine-channel temporal inputs, image-mask alignment, metric edge cases, and loss behavior:
 ```powershell
-.\venv\Scripts\python.exe smoke_test.py
+.\venv\Scripts\python.exe -m unittest tests.test_ml_core -v
 ```
-*Expected output: `All smoke tests PASSED`*
+Run the available offline tests and optional integrations together with `python -m unittest tests.test_ml_core test_stage2_uploads test_cloud_stats test_sen2naip -v`. The Sentinel cloud integration test skips its live request when credentials are absent or the external service is unavailable. Some root-level `test_*.py` files are manual scripts that call a separately running server and should not be included in automated discovery.
 
-### 2. SCL Cloud Statistics Unit Tests
+### 2. SCL Cloud Statistics Tests
 Tests parameter validation, Process API integration, and cloud percentage calculations:
 ```powershell
 .\venv\Scripts\python.exe test_cloud_stats.py

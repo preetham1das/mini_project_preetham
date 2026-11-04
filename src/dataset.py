@@ -45,11 +45,9 @@ class ForestDataset(Dataset):
                             f"Image/mask dimensions are invalid for {image_path.name}: "
                             f"image={image.size}, mask={mask.size}"
                         )
-                    image_ratio = image.width / image.height
-                    mask_ratio = mask.width / mask.height
-                    if abs(image_ratio - mask_ratio) > 0.05:
+                    if image.size != mask.size:
                         raise ValueError(
-                            f"Image/mask dimensions are incompatible for {image_path.name}: "
+                            f"Image/mask dimensions must match exactly for {image_path.name}: "
                             f"image={image.size}, mask={mask.size}"
                         )
 
@@ -96,6 +94,12 @@ class ForestDataset(Dataset):
             if pil_mask.size != self.target_size:
                 pil_mask = pil_mask.resize(self.target_size, Image.Resampling.NEAREST)
             mask = np.array(pil_mask)
+            mask_values = np.unique(mask)
+            if not np.isin(mask_values, (1, 2)).all():
+                raise ValueError(
+                    f"Unexpected mask classes for {mask_path.name}: {mask_values.tolist()}; "
+                    "expected raw classes 1 (non-forest) and 2 (forest)."
+                )
 
         # Apply augmentation if enabled
         if self.augment:

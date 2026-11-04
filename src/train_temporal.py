@@ -135,9 +135,9 @@ def main():
         v_dice_den = 2 * val_tp + val_fp + val_fn
         val_dice = (2 * val_tp) / v_dice_den if v_dice_den > 0 else 1.0
         v_prec_den = val_tp + val_fp
-        val_prec = val_tp / v_prec_den if v_prec_den > 0 else 1.0
+        val_prec = val_tp / v_prec_den if v_prec_den > 0 else 0.0
         v_rec_den = val_tp + val_fn
-        val_rec = val_tp / v_rec_den if v_rec_den > 0 else 1.0
+        val_rec = val_tp / v_rec_den if v_rec_den > 0 else 0.0
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)

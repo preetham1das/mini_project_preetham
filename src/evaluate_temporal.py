@@ -128,8 +128,8 @@ def main():
 
     iou = global_tp / iou_denom if iou_denom > 0 else 1.0
     dice = (2 * global_tp) / dice_denom if dice_denom > 0 else 1.0
-    precision = global_tp / prec_denom if prec_denom > 0 else 1.0
-    recall = global_tp / rec_denom if rec_denom > 0 else 1.0
+    precision = global_tp / prec_denom if prec_denom > 0 else 0.0
+    recall = global_tp / rec_denom if rec_denom > 0 else 0.0
     accuracy = (global_tp + global_tn) / total_pixels if total_pixels > 0 else 1.0
 
     total_pred = global_tp + global_fp

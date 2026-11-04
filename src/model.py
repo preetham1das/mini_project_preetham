@@ -68,6 +68,16 @@ class UNet(nn.Module):
         self.outc = nn.Conv2d(features, out_channels, kernel_size=1)
 
     def forward(self, x):
+        expected_channels = self.inc.double_conv[0].in_channels
+        if x.ndim != 4 or x.shape[1] != expected_channels:
+            raise ValueError(f"Expected input shaped (N, {expected_channels}, H, W), got {tuple(x.shape)}")
+        height, width = x.shape[-2:]
+        if height == 0 or width == 0:
+            raise ValueError("Input height and width must be positive.")
+        pad_h, pad_w = (-height) % 16, (-width) % 16
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+
         # Encoder
         x1 = self.inc(x)
         x2 = self.down1(x1)
@@ -93,7 +103,7 @@ class UNet(nn.Module):
         x_up = self.conv_up4(x_up)
 
         logits = self.outc(x_up)
-        return logits
+        return logits[..., :height, :width]
 
 
 if __name__ == "__main__":
