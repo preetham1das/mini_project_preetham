@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sys
+import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,6 +40,8 @@ from flask_cors import CORS
 import numpy as np
 from PIL import Image
 import torch
+import rasterio
+from rasterio.warp import transform_bounds
 
 # Ensure src directory is in sys.path
 src_dir = Path(__file__).resolve().parent / "src"
@@ -47,12 +51,35 @@ if str(src_dir) not in sys.path:
 from model import UNet, CHECKPOINT_PATH
 from temporal_model import TemporalUNet, TEMPORAL_CHECKPOINT_PATH
 from metrics import THRESHOLD
+from experiments.kaggle_amazon_deforestation.model import LateFusionSegNet
 
 app = Flask(__name__)
 CORS(app)
 
 DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
+KAGGLE_AMAZON_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "kaggle_amazon" / "late_fusion_segnet_v2_corrected_best.pt"
+KAGGLE_AMAZON_NORMALIZATION = Path(__file__).resolve().parent / "checkpoints" / "kaggle_amazon" / "normalization.json"
+kaggle_amazon_model = None
+
+
+def get_kaggle_amazon_model():
+    """Load the independent Sentinel-1/Sentinel-2 experiment checkpoint lazily."""
+    global kaggle_amazon_model
+    if kaggle_amazon_model is not None:
+        return kaggle_amazon_model
+    if not KAGGLE_AMAZON_CHECKPOINT.is_file():
+        raise FileNotFoundError(f"Kaggle Amazon checkpoint not found: {KAGGLE_AMAZON_CHECKPOINT}")
+    if not KAGGLE_AMAZON_NORMALIZATION.is_file():
+        raise FileNotFoundError(f"Kaggle Amazon normalization config not found: {KAGGLE_AMAZON_NORMALIZATION}")
+
+    checkpoint = torch.load(KAGGLE_AMAZON_CHECKPOINT, map_location=DEVICE, weights_only=True)
+    state_dict = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
+    model = LateFusionSegNet(s1_channels=2, s2_channels=4, base_channels=32).to(DEVICE)
+    model.load_state_dict(state_dict)
+    model.eval()
+    kaggle_amazon_model = model
+    return kaggle_amazon_model
 
 # Approximate spherical Earth radius used only for AOI area estimates.
 EARTH_RADIUS_METERS = 6_371_008.8
@@ -2016,6 +2043,207 @@ def predict_stage2():
         "gt_mask": gt_b64,
         "metrics": metrics
     })
+
+
+@app.route("/api/predict/kaggle-amazon", methods=["POST"])
+def predict_kaggle_amazon():
+    """Infer with the separate dual-stream model on aligned S1/S2 GeoTIFFs."""
+    s1_upload = request.files.get("sentinel1")
+    s2_upload = request.files.get("sentinel2")
+    if not s1_upload or not s2_upload:
+        return jsonify({"error": "Upload both Sentinel-1 and Sentinel-2 GeoTIFF files."}), 400
+    try:
+        threshold = parse_probability_threshold(request.form.get("threshold"), 0.5)
+        model = get_kaggle_amazon_model()
+        normalization = json.loads(KAGGLE_AMAZON_NORMALIZATION.read_text(encoding="utf-8"))
+        low1 = np.asarray(normalization["s1"]["low"], dtype=np.float32)[:, None, None]
+        high1 = np.asarray(normalization["s1"]["high"], dtype=np.float32)[:, None, None]
+        low2 = np.asarray(normalization["s2"]["low"], dtype=np.float32)[:, None, None]
+        high2 = np.asarray(normalization["s2"]["high"], dtype=np.float32)[:, None, None]
+
+        temp_paths = []
+        try:
+            for upload in (s1_upload, s2_upload):
+                handle = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+                temp_paths.append(Path(handle.name))
+                handle.close()
+                upload.save(str(temp_paths[-1]))
+
+            with rasterio.open(temp_paths[0]) as s1_src, rasterio.open(temp_paths[1]) as s2_src:
+                # --- Relaxed validation: tolerate minor geotransform differences ---
+                if s1_src.count != 2:
+                    raise ValueError(f"Sentinel-1 raster must have exactly 2 bands; got {s1_src.count}.")
+                if s2_src.count != 4:
+                    raise ValueError(f"Sentinel-2 raster must have exactly 4 bands; got {s2_src.count}.")
+                if s1_src.width < 1 or s1_src.height < 1:
+                    raise ValueError("Input rasters are empty.")
+
+                s1 = s1_src.read().astype(np.float32)
+                # Resample S2 to match S1 dimensions if they differ
+                if (s2_src.width, s2_src.height) != (s1_src.width, s1_src.height):
+                    import rasterio.warp as _warp
+                    s2_resampled = np.zeros((s2_src.count, s1_src.height, s1_src.width), dtype=np.float32)
+                    _warp.reproject(
+                        source=s2_src.read().astype(np.float32),
+                        destination=s2_resampled,
+                        src_transform=s2_src.transform,
+                        src_crs=s2_src.crs or s1_src.crs,
+                        dst_transform=s1_src.transform,
+                        dst_crs=s1_src.crs or s2_src.crs,
+                        resampling=_warp.Resampling.bilinear,
+                    )
+                    s2 = s2_resampled
+                    app.logger.info(
+                        "Resampled S2 from (%d,%d) to match S1 (%d,%d)",
+                        s2_src.width, s2_src.height, s1_src.width, s1_src.height
+                    )
+                else:
+                    s2 = s2_src.read().astype(np.float32)
+                valid = np.all(s1_src.read_masks() > 0, axis=0)
+                # s2_src.read_masks() may have different dims if resampled; use pixel validity instead
+                valid &= np.all(np.isfinite(s1), axis=0) & np.all(np.isfinite(s2), axis=0)
+                if not valid.any():
+                    raise ValueError("The rasters contain no mutually valid pixels.")
+
+                s1 = np.clip((s1 - low1) / np.maximum(high1 - low1, 1e-6), 0.0, 1.0)
+                s2 = np.clip((s2 - low2) / np.maximum(high2 - low2, 1e-6), 0.0, 1.0)
+                s1[:, ~valid] = 0.0
+                s2[:, ~valid] = 0.0
+                height, width = valid.shape
+                prediction = np.zeros((height, width), dtype=np.uint8)
+                window_batch1, window_batch2, windows = [], [], []
+                batch_size = 2
+
+                def run_window_batch():
+                    if not windows:
+                        return
+                    x1 = torch.from_numpy(np.stack(window_batch1)).to(DEVICE)
+                    x2 = torch.from_numpy(np.stack(window_batch2)).to(DEVICE)
+                    with torch.inference_mode():
+                        logits = model(x1, x2)
+                        masks = (torch.sigmoid(logits.float()) >= threshold).cpu().numpy()[:, 0]
+                    for (row, col, rows, cols), mask in zip(windows, masks):
+                        prediction[row:row + rows, col:col + cols] = mask[:rows, :cols].astype(np.uint8)
+                    windows.clear(); window_batch1.clear(); window_batch2.clear()
+
+                for row in range(0, height, 256):
+                    for col in range(0, width, 256):
+                        rows, cols = min(256, height - row), min(256, width - col)
+                        patch1 = np.zeros((2, 256, 256), dtype=np.float32)
+                        patch2 = np.zeros((4, 256, 256), dtype=np.float32)
+                        patch1[:, :rows, :cols] = s1[:, row:row + rows, col:col + cols]
+                        patch2[:, :rows, :cols] = s2[:, row:row + rows, col:col + cols]
+                        window_batch1.append(patch1); window_batch2.append(patch2)
+                        windows.append((row, col, rows, cols))
+                        if len(windows) == batch_size:
+                            run_window_batch()
+                run_window_batch()
+                # 0=predicted stable/background, 1=predicted deforestation,
+                # 255=NoData. Preserve the invalid-pixel distinction in output.
+                prediction[~valid] = 255
+
+                valid_pixels = int(valid.sum())
+                predicted_pixels = int(((prediction == 1) & valid).sum())
+                percent = 100.0 * predicted_pixels / max(valid_pixels, 1)
+                pixel_area_ha = None
+                if s1_src.crs.is_projected and s1_src.crs.linear_units.casefold() in {"metre", "meter", "metres", "meters"}:
+                    pixel_area_ha = abs(s1_src.transform.a * s1_src.transform.e - s1_src.transform.b * s1_src.transform.d) / 10000.0
+                hectares = predicted_pixels * pixel_area_ha if pixel_area_ha is not None else None
+
+                prediction_id = uuid.uuid4().hex
+                prediction_dir = Path(__file__).resolve().parent / "outputs" / "kaggle_amazon" / "predictions"
+                prediction_dir.mkdir(parents=True, exist_ok=True)
+                prediction_path = prediction_dir / f"{prediction_id}_deforestation_mask.tif"
+                result_profile = s2_src.profile.copy()
+                result_profile.update(
+                    driver="GTiff", count=1, dtype="uint8", nodata=255,
+                    compress="deflate", photometric="MINISBLACK",
+                )
+                with rasterio.open(prediction_path, "w", **result_profile) as result_dst:
+                    result_dst.write(prediction, 1)
+                    result_dst.update_tags(
+                        model="Kaggle Amazon Dual-Stream Late-Fusion SegNet V2",
+                        threshold=str(threshold),
+                        class_0="predicted non-deforestation",
+                        class_1="predicted deforestation",
+                        nodata_255="invalid input pixel",
+                    )
+                    result_dst.update_tags(**s2_src.tags())
+
+                west, south, east, north = transform_bounds(
+                    s1_src.crs, "EPSG:4326", *s1_src.bounds, densify_pts=21
+                )
+
+                # Build a bounded preview response to avoid sending full rasters as JSON.
+                scale = min(1.0, 1024.0 / max(height, width))
+                out_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                display = np.moveaxis(s2[:3], 0, -1)
+                rgb = np.zeros_like(display, dtype=np.uint8)
+                for channel in range(3):
+                    values = display[..., channel][valid]
+                    lo, hi = np.percentile(values, (2, 98))
+                    rgb[..., channel] = (np.clip((display[..., channel] - lo) / max(float(hi - lo), 1e-6), 0, 1) * 255).astype(np.uint8)
+                image_pil = Image.fromarray(rgb).resize(out_size, Image.Resampling.BILINEAR)
+                display_mask = np.where(prediction == 1, 255, 0).astype(np.uint8)
+                mask_pil = Image.fromarray(display_mask).resize(out_size, Image.Resampling.NEAREST)
+                overlay = np.asarray(image_pil).copy()
+                overlay_mask = np.asarray(mask_pil) > 0
+                overlay[overlay_mask] = (0.55 * overlay[overlay_mask] + 0.45 * np.array([255, 48, 64])).astype(np.uint8)
+                transparent_overlay = np.zeros((height, width, 4), dtype=np.uint8)
+                transparent_overlay[prediction == 1] = (255, 48, 64, 190)
+                map_overlay = Image.fromarray(transparent_overlay, mode="RGBA").resize(out_size, Image.Resampling.NEAREST)
+                return jsonify({
+                    "success": True,
+                    "model": "Kaggle Amazon dual-stream SegNet V2",
+                    "threshold": threshold,
+                    "width": width,
+                    "height": height,
+                    "crs": s1_src.crs.to_string(),
+                    "valid_pixels": valid_pixels,
+                    "deforestation_pixels": predicted_pixels,
+                    "deforestation_pct": round(percent, 4),
+                    "deforestation_hectares": round(hectares, 4) if hectares is not None else None,
+                    "area_estimate_method": "GeoTIFF affine pixel area and projected CRS units" if hectares is not None else None,
+                    "gis": {"bounds": [[south, west], [north, east]]},
+                    "download_url": f"/api/predict/kaggle-amazon/{prediction_id}/download",
+                    "preview_image": array_to_base64_png(np.asarray(image_pil)),
+                    "prediction_mask": array_to_base64_png(np.asarray(mask_pil)),
+                    "overlay_image": array_to_base64_png(overlay),
+                    "map_overlay_image": array_to_base64_png(np.asarray(map_overlay)),
+                })
+        finally:
+            for path in temp_paths:
+                path.unlink(missing_ok=True)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except (rasterio.errors.RasterioError, OSError) as exc:
+        return jsonify({"error": f"Could not read the uploaded GeoTIFFs: {exc}"}), 400
+    except Exception as exc:
+        app.logger.exception("Kaggle Amazon inference failed")
+        return jsonify({"error": f"Kaggle Amazon inference failed: {exc}"}), 500
+
+
+@app.route("/api/predict/kaggle-amazon/<prediction_id>/download", methods=["GET"])
+def download_kaggle_amazon_prediction(prediction_id):
+    """Download a prediction GeoTIFF with the source grid and CRS preserved."""
+    if not re.fullmatch(r"[0-9a-f]{32}", prediction_id):
+        return jsonify({"error": "Invalid prediction identifier."}), 400
+    prediction_dir = Path(__file__).resolve().parent / "outputs" / "kaggle_amazon" / "predictions"
+    prediction_path = prediction_dir / f"{prediction_id}_deforestation_mask.tif"
+    if not prediction_path.is_file() or prediction_path.resolve().parent != prediction_dir.resolve():
+        return jsonify({"error": "Prediction file not found. Run the analysis again."}), 404
+    return send_file(prediction_path, as_attachment=True, download_name="amazon_deforestation_prediction.tif")
+
+
+@app.route("/api/kaggle-amazon/research-metrics", methods=["GET"])
+def get_kaggle_amazon_research_metrics():
+    """Return the recorded Colab research evaluation, separate from live inference."""
+    metrics_path = Path(__file__).resolve().parent / "experiments" / "kaggle_amazon_deforestation" / "research_metrics.json"
+    if not metrics_path.is_file():
+        return jsonify({"available": False, "message": "Recorded research metrics are unavailable."}), 404
+    return jsonify(json.loads(metrics_path.read_text(encoding="utf-8")))
 
 
 @app.route("/api/metrics", methods=["GET"])
