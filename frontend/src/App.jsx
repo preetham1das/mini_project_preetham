@@ -53,6 +53,12 @@ export default function App() {
   const [s2Threshold, setS2Threshold] = useState(0.5);
   const [s2Results, setS2Results] = useState(null);
 
+  // Separate Kaggle Amazon multimodal experiment (Sentinel-1 + Sentinel-2).
+  const [kaggleS1File, setKaggleS1File] = useState(null);
+  const [kaggleS2File, setKaggleS2File] = useState(null);
+  const [kaggleThreshold, setKaggleThreshold] = useState(0.5);
+  const [kaggleResults, setKaggleResults] = useState(null);
+
   // Timeline state
   const [swipeSample, setSwipeSample] = useState('');
   const [swipeData, setSwipeData] = useState(null);
@@ -260,6 +266,42 @@ export default function App() {
       });
   };
 
+  const handleRunKaggleAmazon = async () => {
+    if (!kaggleS1File || !kaggleS2File) {
+      alert('Select both the Sentinel-1 (2-band) and Sentinel-2 (4-band) GeoTIFFs.');
+      return;
+    }
+    const formData = new FormData();
+    formData.append('sentinel1', kaggleS1File);
+    formData.append('sentinel2', kaggleS2File);
+    formData.append('threshold', String(kaggleThreshold));
+    setLoading(true);
+    try {
+      const response = await fetch('/api/predict/kaggle-amazon', { method: 'POST', body: formData });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error || `Request failed (${response.status})`);
+      setKaggleResults(data);
+      setGisMode('kaggle-amazon');
+      setAiOverlayData({ image: data.map_overlay_image, gis: data.gis, mode: 'kaggle-amazon', metrics: data });
+      recordAnalysis({
+        type: 'Amazon multimodal inference',
+        region: `${kaggleS1File.name} + ${kaggleS2File.name}`,
+        date: new Date().toISOString().slice(0, 10),
+        lossPct: data.deforestation_pct,
+        lossPixels: data.deforestation_pixels,
+        areaMethod: data.area_estimate_method,
+      });
+    } catch (error) {
+      const isNetworkError = error instanceof TypeError && error.message === 'Failed to fetch';
+      const msg = isNetworkError
+        ? 'Cannot reach the inference server. Make sure the Flask backend is running on port 5000.'
+        : `Kaggle Amazon inference failed: ${error.message}`;
+      alert(msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   /* Re-run Stage 2 inference on currently loaded live Sentinel-2 images */
   const handleRunLiveStage2 = (threshold = s2Threshold) => {
     const beforeImg = s2Results?.before_image || s2Results?.t1_image;
@@ -371,6 +413,7 @@ export default function App() {
     { id: 'acquisition', label: 'Satellite Acquisition', icon: Satellite },
     { id: 'forest', label: 'Forest Analysis', icon: Trees },
     { id: 'change', label: 'Change Detection', icon: GitCompare },
+    { id: 'kaggle-amazon', label: 'S1 + S2 Experiment', icon: Layers },
     { id: 'analytics', label: 'Analytics & Reports', icon: BarChart3 },
     { id: 'history', label: 'Timeline & History', icon: HistoryIcon },
     { id: 'benchmarks', label: 'Model Benchmarks', icon: CpuIcon },
@@ -471,6 +514,16 @@ export default function App() {
               overlay={aiOverlayData}
               opacity={gisOpacity}
               onOpacityChange={setGisOpacity}
+              onViewMap={() => navigate('map')}
+            />
+          </PageFrame>
+        ) : view === 'kaggle-amazon' ? (
+          <PageFrame className="fw-page--kaggle" title="Kaggle Amazon Experiment" description="Separate Sentinel-1 SAR + Sentinel-2 optical SegNet. These inputs are sensor modalities, not a temporal before/after pair.">
+            <KaggleAmazonView
+              sentinel1File={kaggleS1File} setSentinel1File={setKaggleS1File}
+              sentinel2File={kaggleS2File} setSentinel2File={setKaggleS2File}
+              threshold={kaggleThreshold} setThreshold={setKaggleThreshold}
+              results={kaggleResults} loading={loading} onRun={handleRunKaggleAmazon}
               onViewMap={() => navigate('map')}
             />
           </PageFrame>
@@ -627,6 +680,116 @@ function HistoryTable({ history }) {
 /* ══════════════════════════════════════════════════════════════
    Manual workbench views
    ══════════════════════════════════════════════════════════════ */
+
+function KaggleAmazonView({ sentinel1File, setSentinel1File, sentinel2File, setSentinel2File,
+  threshold, setThreshold, results, loading, onRun, onViewMap }) {
+  const [researchMetrics, setResearchMetrics] = useState(null);
+  const [researchMetricsError, setResearchMetricsError] = useState('');
+
+  useEffect(() => {
+    fetch('/api/kaggle-amazon/research-metrics')
+      .then((response) => {
+        if (!response.ok) throw new Error(`Research metrics unavailable (${response.status})`);
+        return response.json();
+      })
+      .then(setResearchMetrics)
+      .catch((error) => setResearchMetricsError(error.message));
+  }, []);
+
+  return (
+    <>
+      <section className="panel kaggle-research-panel">
+        <div className="panel__head">
+          <div>
+            <div className="panel__title">Recorded research evaluation</div>
+            <div className="block__hint">V2 Colab held-out test results · separate from the live result below</div>
+          </div>
+          <span className="badge badge--green"><ShieldCheck size={11} /> Threshold 0.50</span>
+        </div>
+        {researchMetrics ? (
+          <>
+            <div className="stat-grid kaggle-research-stats">
+              {[
+                ['IoU', researchMetrics.held_out_test.iou],
+                ['Dice / F1', researchMetrics.held_out_test.dice_f1],
+                ['Precision', researchMetrics.held_out_test.precision],
+                ['Recall', researchMetrics.held_out_test.recall],
+                ['Accuracy', researchMetrics.held_out_test.accuracy],
+              ].map(([label, value]) => (
+                <div className="stat stat--cyan" key={label}>
+                  <span className="stat__label">{label}</span>
+                  <strong className="stat__value">{Number(value).toFixed(4)}</strong>
+                </div>
+              ))}
+            </div>
+            <div className="kaggle-research-meta">
+              <span>Best validation epoch: {researchMetrics.best_validation.epoch}</span>
+              <span>Training epochs: {researchMetrics.training.epochs_completed}</span>
+              <span>Confusion matrix [[TN, FP], [FN, TP]]: {researchMetrics.held_out_test.confusion_matrix.map((row) => row.join(', ')).join('] [')}</span>
+            </div>
+            <div className="block__hint kaggle-audit-note">{researchMetrics.audit_note}</div>
+          </>
+        ) : <div className="block__hint">{researchMetricsError || 'Loading recorded metrics…'}</div>}
+      </section>
+
+      <section className="panel">
+        <div className="panel__head">
+          <div>
+            <div className="panel__title">Sentinel-1 + Sentinel-2 late-fusion SegNet</div>
+            <div className="block__hint">This separate experiment requires aligned multi-band GeoTIFFs: 2 SAR bands and 4 optical bands.</div>
+          </div>
+          <span className="badge badge--green"><Layers size={11} /> Kaggle Amazon V2</span>
+        </div>
+        <div className="block__hint" style={{ marginBottom: 14 }}>
+          Choose co-registered rasters with matching dimensions, CRS and affine transform. This model uses the V2 per-band normalization saved with its checkpoint. PNG/JPEG and ordinary RGB images are not supported.
+        </div>
+        <div className="control-grid">
+          <label className={`upload-zone ${sentinel1File ? 'has-file' : ''}`}>
+            <input type="file" accept=".tif,.tiff,image/tiff" onChange={(event) => setSentinel1File(event.target.files?.[0] || null)} />
+            <Upload size={17} />
+            <span className="upload-zone__label">{sentinel1File?.name || 'Upload Sentinel-1 GeoTIFF'}</span>
+            <span className="upload-zone__hint">2 bands · same grid as Sentinel-2</span>
+          </label>
+          <label className={`upload-zone ${sentinel2File ? 'has-file' : ''}`}>
+            <input type="file" accept=".tif,.tiff,image/tiff" onChange={(event) => setSentinel2File(event.target.files?.[0] || null)} />
+            <Upload size={17} />
+            <span className="upload-zone__label">{sentinel2File?.name || 'Upload Sentinel-2 GeoTIFF'}</span>
+            <span className="upload-zone__hint">4 bands · same grid as Sentinel-1</span>
+          </label>
+          <div className="slider-block">
+            <div className="slider-row"><span>Deforestation threshold</span><span className="slider-value">{threshold.toFixed(2)}</span></div>
+            <input type="range" min="0.1" max="0.9" step="0.05" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} aria-label="Kaggle model threshold" />
+          </div>
+          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading || !sentinel1File || !sentinel2File}>
+            {loading ? <span className="btn__spinner" /> : <Play size={14} />}
+            Run Kaggle model
+          </button>
+        </div>
+      </section>
+      {results && (
+        <>
+          <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
+            <div className="stat stat--red"><span className="stat__label">Predicted deforestation</span><strong className="stat__value">{results.deforestation_pct}%</strong><small className="stat__sub">{Number(results.deforestation_pixels).toLocaleString()} pixels</small></div>
+            <div className="stat stat--cyan"><span className="stat__label">Valid input pixels</span><strong className="stat__value">{Number(results.valid_pixels).toLocaleString()}</strong><small className="stat__sub">{results.width} × {results.height} · {results.crs}</small></div>
+            {results.deforestation_hectares != null && <div className="stat stat--green"><span className="stat__label">Estimated area</span><strong className="stat__value">{results.deforestation_hectares} ha</strong><small className="stat__sub">Calculated from GeoTIFF pixel size and projected CRS</small></div>}
+          </div>
+          <section className="panel">
+            <div className="panel__head"><div><div className="panel__title">Kaggle model output</div><div className="block__hint">Threshold {results.threshold} · Preview is downsampled for display.</div></div></div>
+            <div className="kaggle-result-actions">
+              <button type="button" className="btn btn--ghost" onClick={onViewMap} disabled={!results.gis?.bounds}>Show overlay on GIS map</button>
+              <a className="btn btn--ghost" href={results.download_url} download="amazon_deforestation_prediction.tif">Download georeferenced mask</a>
+            </div>
+            <div className="visuals-grid">
+              <figure><img src={results.preview_image} alt="Sentinel-2 input preview" /><figcaption>Sentinel-2 preview</figcaption></figure>
+              <figure><img src={results.prediction_mask} alt="Predicted deforestation mask" /><figcaption>Predicted mask</figcaption></figure>
+              <figure><img src={results.overlay_image} alt="Predicted mask overlay" /><figcaption>Overlay</figcaption></figure>
+            </div>
+          </section>
+        </>
+      )}
+    </>
+  );
+}
 
 function Stage1View({
   samples,
