@@ -1,6 +1,7 @@
 from pathlib import Path
 import io
 import base64
+import math
 
 import numpy as np
 from PIL import Image
@@ -24,12 +25,27 @@ from backend.sentinel_service import (
 # Configuration
 # --------------------------------------------------
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEVICE = torch.device("cpu")
 IMAGE_SIZE = 256
 THRESHOLD = 0.5
 
-CHECKPOINT_PATH = Path("models/best_unet_model.pth")
-TEMPORAL_CHECKPOINT_PATH = Path("models/best_temporal_model.pth")
+CHECKPOINT_PATH = PROJECT_ROOT / "models" / "best_unet_model.pth"
+TEMPORAL_CHECKPOINT_PATH = PROJECT_ROOT / "models" / "best_temporal_model.pth"
+
+
+def _resolve_sample_path(sample_path, allowed_root):
+    """Resolve a dataset sample only when it remains inside its approved split."""
+    candidate = Path(sample_path).resolve()
+    root = Path(allowed_root).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        raise ValueError("Invalid sample path.")
+    return candidate
+
+
+def _validate_threshold(threshold):
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Threshold must be a finite number between 0 and 1.")
 
 # --------------------------------------------------
 # FastAPI
@@ -184,8 +200,7 @@ def root():
 
 @app.get("/api/samples")
 def get_samples():
-    base_dir = Path(__file__).resolve().parent.parent
-    amazon_dir = base_dir / "data" / "Amazon Forest Dataset"
+    amazon_dir = PROJECT_ROOT / "data" / "Amazon Forest Dataset"
     stage1_samples = []
     
     val_dir = amazon_dir / "Validation" / "images"
@@ -210,7 +225,7 @@ def get_samples():
                 "path": str(f.resolve())
             })
 
-    temporal_root = base_dir / "data" / "Forest-Change" / "extracted" / "Forest-Change-dataset" / "images"
+    temporal_root = PROJECT_ROOT / "data" / "Forest-Change" / "extracted" / "Forest-Change-dataset" / "images"
     stage2_samples = []
     
     test_a_dir = temporal_root / "test" / "A"
@@ -248,10 +263,27 @@ async def predict(
     sample_path: str = Form(None),
     threshold: float = Form(0.5)
 ):
+    try:
+        _validate_threshold(threshold)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
     if sample_path:
         try:
-            image = Image.open(sample_path).convert("RGB")
-            filename = Path(sample_path).name
+            dataset_root = PROJECT_ROOT / "data" / "Amazon Forest Dataset"
+            allowed_roots = [
+                dataset_root / "Validation" / "images",
+                dataset_root / "Test",
+            ]
+            resolved = next(
+                (_resolve_sample_path(sample_path, root) for root in allowed_roots
+                 if Path(sample_path).resolve().is_relative_to(root.resolve())),
+                None,
+            )
+            if resolved is None or resolved.suffix.lower() not in {".tif", ".tiff"}:
+                raise ValueError("Sample path must refer to a bundled validation or test TIFF.")
+            image = Image.open(resolved).convert("RGB")
+            filename = resolved.name
         except Exception:
             return {"success": False, "error": "Invalid sample path."}
     elif file:
@@ -336,10 +368,28 @@ async def predict_temporal(
     threshold: float = Form(0.5),
     bbox: str = Form(None),
 ):
+    try:
+        _validate_threshold(threshold)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
     if sample_path_a and sample_path_b:
         try:
-            img_a = Image.open(sample_path_a).convert("RGB")
-            img_b = Image.open(sample_path_b).convert("RGB")
+            temporal_root = PROJECT_ROOT / "data" / "Forest-Change" / "extracted" / "Forest-Change-dataset" / "images"
+            pair = None
+            for split in ("train", "val", "test"):
+                try:
+                    candidate_a = _resolve_sample_path(sample_path_a, temporal_root / split / "A")
+                    candidate_b = _resolve_sample_path(sample_path_b, temporal_root / split / "B")
+                except (OSError, ValueError):
+                    continue
+                if candidate_a.name == candidate_b.name and candidate_a.suffix.lower() == ".png":
+                    pair = candidate_a, candidate_b
+                    break
+            if pair is None:
+                raise ValueError("Sample paths must identify a matching bundled T1/T2 pair.")
+            img_a = Image.open(pair[0]).convert("RGB")
+            img_b = Image.open(pair[1]).convert("RGB")
         except Exception:
             return {"success": False, "error": "Invalid sample paths."}
     elif before_image and after_image:

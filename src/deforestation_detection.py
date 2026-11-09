@@ -67,8 +67,8 @@ def calculate_metrics(pred_mask, gt_mask):
 
     iou = tp / iou_denom if iou_denom > 0 else 1.0
     dice = (2 * tp) / dice_denom if dice_denom > 0 else 1.0
-    precision = tp / prec_denom if prec_denom > 0 else 1.0
-    recall = tp / rec_denom if rec_denom > 0 else 1.0
+    precision = tp / prec_denom if prec_denom > 0 else 0.0
+    recall = tp / rec_denom if rec_denom > 0 else 0.0
     accuracy = (tp + tn) / acc_denom if acc_denom > 0 else 1.0
 
     return {

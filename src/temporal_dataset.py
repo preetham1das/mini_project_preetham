@@ -85,17 +85,21 @@ class TemporalForestDataset(Dataset):
 
         # Load and resize images
         pil_a = Image.open(a_path).convert("RGB")
+        pil_b = Image.open(b_path).convert("RGB")
+        pil_label = Image.open(label_path).convert("L")
+        if pil_a.size != pil_b.size or pil_a.size != pil_label.size:
+            raise ValueError(
+                f"T1, T2, and label dimensions must match for {name}: "
+                f"T1={pil_a.size}, T2={pil_b.size}, label={pil_label.size}"
+            )
         if pil_a.size != self.target_size:
             pil_a = pil_a.resize(self.target_size, Image.Resampling.BILINEAR)
         img_a = np.array(pil_a, dtype=np.float32)
-
-        pil_b = Image.open(b_path).convert("RGB")
         if pil_b.size != self.target_size:
             pil_b = pil_b.resize(self.target_size, Image.Resampling.BILINEAR)
         img_b = np.array(pil_b, dtype=np.float32)
 
         # Load and resize label (NEAREST to preserve binary values)
-        pil_label = Image.open(label_path).convert("L")
         if pil_label.size != self.target_size:
             pil_label = pil_label.resize(self.target_size, Image.Resampling.NEAREST)
         mask = np.array(pil_label)

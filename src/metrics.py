@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 
@@ -13,13 +15,18 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logits, targets):
+        if targets.dim() == logits.dim() - 1:
+            targets = targets.unsqueeze(1)
+        if logits.shape != targets.shape:
+            raise ValueError(f"Logits and targets must have matching shapes; got {logits.shape} and {targets.shape}.")
         probs = torch.sigmoid(logits)
-        probs = probs.view(-1)
-        targets = targets.view(-1).float()
-
-        intersection = (probs * targets).sum()
-        dice = (2.0 * intersection + self.smooth) / (probs.sum() + targets.sum() + self.smooth)
-        return 1.0 - dice
+        probs = probs.flatten(start_dim=1)
+        targets = targets.float().flatten(start_dim=1)
+        intersection = (probs * targets).sum(dim=1)
+        dice = (2.0 * intersection + self.smooth) / (
+            probs.sum(dim=1) + targets.sum(dim=1) + self.smooth
+        )
+        return 1.0 - dice.mean()
 
 
 class CombinedBCEDiceLoss(nn.Module):
@@ -46,6 +53,12 @@ class CombinedBCEDiceLoss(nn.Module):
 
 def calculate_confusion_counts(predictions, targets, threshold=THRESHOLD, is_logits=True):
     """Return foreground confusion counts for a batch of predictions."""
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("threshold must be a finite number between 0 and 1") from exc
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be a finite number between 0 and 1")
     if is_logits:
         predictions = torch.sigmoid(predictions)
 
@@ -53,6 +66,12 @@ def calculate_confusion_counts(predictions, targets, threshold=THRESHOLD, is_log
     if targets.dim() == 3:
         targets = targets.unsqueeze(1)
     targets = targets.float()
+    if predictions.shape != targets.shape:
+        raise ValueError(f"Predictions and targets must have matching shapes; got {predictions.shape} and {targets.shape}.")
+    if not torch.isfinite(predictions).all() or not torch.isfinite(targets).all():
+        raise ValueError("Predictions and targets must contain only finite values.")
+    if not torch.all((targets == 0) | (targets == 1)):
+        raise ValueError("Binary segmentation targets must contain only 0 and 1.")
 
     preds_flat = preds.reshape(-1)
     targets_flat = targets.reshape(-1)
@@ -81,8 +100,15 @@ def metrics_from_counts(counts):
     return {
         "iou": tp / iou_denominator if iou_denominator else 1.0,
         "dice": (2 * tp) / dice_denominator if dice_denominator else 1.0,
-        "precision": tp / precision_denominator if precision_denominator else 1.0,
-        "recall": tp / recall_denominator if recall_denominator else 1.0,
+        # Undefined positive-class metrics are zero so an empty prediction does
+        # not appear perfect on heavily imbalanced segmentation datasets.
+        "precision": tp / precision_denominator if precision_denominator else 0.0,
+        "recall": tp / recall_denominator if recall_denominator else 0.0,
+        "specificity": tn / (tn + fp) if (tn + fp) else 0.0,
+        "balanced_accuracy": (
+            (tp / recall_denominator + tn / (tn + fp)) / 2
+            if recall_denominator and (tn + fp) else 0.0
+        ),
         "accuracy": (tp + tn) / accuracy_denominator if accuracy_denominator else 1.0,
         "tp": tp,
         "fp": fp,

@@ -58,7 +58,7 @@ Monitoring planetary forest loss requires scalable automated analysis of satelli
 - **Stage 1** deploys a standard U-Net on the Amazon Forest Dataset, achieving a Mean Intersection-over-Union (IoU) of **0.8386** and a Mean Dice score of **0.9122** on the validation set.
 - **Stage 2** implements an end-to-end 9-channel Temporal U-Net trained on the Forest-Change dataset under extreme class imbalance (4.77% positive deforestation pixels; negative-to-positive ratio of 19.94). Evaluated on an independent, held-out test split of 33 temporal image pairs (2,162,688 total pixels), the Stage 2 model achieves a Global IoU of **0.3828**, a Global Dice coefficient of **0.5536**, and an Overall Pixel Accuracy of **0.9632**.
 
-To bridge model research and operational GIS monitoring, the system provides a Flask and React/Leaflet web platform connected to the European Space Agency (ESA) Copernicus Data Space Ecosystem. Users can define arbitrary AOIs, query historical Sentinel-2 L2A acquisitions via STAC, generate cloud-obscuration statistics from the 20-meter SCL layer, execute live bi-temporal inference with physical area calculation in hectares ($10\text{ m}$ GSD), and inspect 4× super-resolved imagery via SwinIR. We explicitly document model limitations, the domain gap between benchmark datasets and real-world Sentinel-2 imagery, and architectural boundaries.
+To bridge model research and operational GIS monitoring, the system provides a Flask and React/Leaflet web platform connected to the European Space Agency (ESA) Copernicus Data Space Ecosystem. Users can define AOIs, query historical Sentinel-2 acquisitions, generate cloud-obscuration statistics from the SCL layer, run live bi-temporal inference, and inspect 4× super-resolved imagery via SwinIR. Live area is an approximation from the AOI bounding box; bundled samples and ordinary uploads have no verified geographic footprint and therefore report pixels rather than physical area.
 
 ---
 
@@ -84,7 +84,7 @@ Tropical forests, particularly the Amazon Basin and Southeast Asian rainforests,
 4. **Connect Live Satellite APIs:** Establish a secure, authenticated integration with the Copernicus Data Space Ecosystem to query STAC catalogs and retrieve Level-2A surface reflectance imagery dynamically.
 5. **Implement AOI-Specific Cloud Assessment:** Develop an algorithmic pipeline to calculate cloud and obscuration percentages inside arbitrary user-drawn bounding boxes using official Sentinel-2 SCL classifications.
 6. **Integrate Visual Super-Resolution:** Integrate a pretrained SwinIR model to provide 4× spatial magnification for visual verification while strictly maintaining scientific isolation from the segmentation pipeline.
-7. **Deliver an Interactive GIS Interface:** Construct an intuitive web interface with Leaflet mapping, before/after swipe comparisons, metric dashboards, and physical area reporting in hectares and square kilometers.
+7. **Deliver an Interactive GIS Interface:** Construct a web interface with Leaflet mapping, before/after comparisons, metric dashboards, and approximate live AOI area reporting where geographic bounds are available.
 
 ---
 
@@ -98,7 +98,7 @@ Tropical forests, particularly the Amazon Basin and Southeast Asian rainforests,
 - Sentinel-2 SCL-based AOI cloud and shadow statistics.
 - Pretrained SwinIR classical 4× super-resolution visualization.
 - Interactive GIS map with Leaflet, Esri World Imagery, OpenStreetMap, opacity sliders, and swipe viewers.
-- Area estimation based on Sentinel-2 10-meter pixel resolution ($1\text{ pixel} = 100\text{ m}^2 = 0.01\text{ ha}$).
+- Approximate live AOI area from a spherical bounding-box calculation. The model output grid is treated as spanning the requested bbox; no per-pixel raster transform is used. Unreferenced samples and uploads have no physical area estimate.
 
 ### Out of Scope / Explicit Non-Claims
 - **No Physical 2.5 m Satellite Imagery:** SwinIR output is generative spatial super-resolution for visual inspection. It does not synthesize genuine sub-pixel radiometric measurements.
@@ -181,7 +181,7 @@ sequenceDiagram
     API->>API: Construct 9-channel tensor [T1, T2, |T1-T2|]
     API->>DL: Execute Temporal U-Net Inference
     DL-->>API: Deforestation Mask & Logits
-    API->>API: Calculate Hectares (10m GSD) & Red Color Overlay
+    API->>API: Estimate AOI area and generate red color overlay
     API-->>UI: Return Deforestation Mask, Hectares, & Stats
     UI-->>User: Display Red Mask Overlay & Impact Dashboard
 ```
@@ -265,6 +265,8 @@ The network follows the canonical U-Net architecture (`src/model.py`):
 - **Decoder:** 4 upsampling stages using $2 \times 2$ transposed convolutions (`ConvTranspose2d`) concatenated with corresponding encoder skip connections, processed through DoubleConv blocks ($512 \to 256 \to 128 \to 64 \to 32$).
 - **Final Projection:** $1 \times 1$ convolution mapping 32 channels to 1 logit output.
 - **Trainable Parameters:** **7,763,041** parameters.
+
+The forward pass pads the bottom/right edges to a multiple of 16 (the four pooling stages) and crops logits to the input dimensions. This preserves checkpoint parameter shapes while accepting arbitrary positive image dimensions. Shared soft Dice losses now calculate overlap per image and average across the batch. The validation metric helpers also expose specificity and balanced accuracy; undefined precision or recall uses zero instead of a perfect score. Historical results below come from already saved artifacts: no training was rerun during this audit, and the revised loss can change future training results.
 
 ---
 
@@ -526,11 +528,8 @@ function evaluatePixel(sample) {
 ```
 - **Dynamic Resampling:** The Process API dynamically clips, reprojects, and resamples the requested geographic bounding box into standard $512 \times 512$ or $256 \times 256$ PNG tiles.
 
-### 17.4 Physical Area Estimation
-Because Sentinel-2 Level-2A RGB bands possess a native Ground Sample Distance (GSD) of $10\text{ meters} \times 10\text{ meters}$, physical area metrics are calculated directly:
-$$\text{Area per Pixel} = 10\text{ m} \times 10\text{ m} = 100\text{ m}^2$$
-$$\text{Deforested Hectares} = \frac{\text{Deforested Pixels} \times 100\text{ m}^2}{10,000\text{ m}^2/\text{ha}} = \text{Deforested Pixels} \times 0.01\text{ ha}$$
-$$\text{Deforested Square Kilometers} = \frac{\text{Deforested Hectares}}{100}$$
+### 17.4 AOI-Based Area Approximation
+For live Sentinel analyses with a valid WGS84 bounding box, the backend estimates the spherical surface area of that bbox and divides it by the number of model-output pixels. The result is an approximation: the code does not use the raster transform, projected pixel dimensions, or per-pixel geodesic areas. Sample and uploaded-image endpoints leave hectare fields empty because those inputs do not provide a verified footprint.
 
 ---
 
@@ -655,7 +654,7 @@ The web interface is built with React 18, Vite, and Leaflet (`frontend/src/`):
    - Live Sentinel-2 acquisition search timeline with calendar controls.
    - SCL cloud statistics panel showing Cloud % and Clear % for FROM and TO dates.
    - SwinIR 4× super-resolution toggle for visual inspection.
-   - Live Temporal U-Net inference execution with red deforestation overlay and physical area reporting in hectares and square kilometers.
+   - Live Temporal U-Net inference execution with red deforestation overlay and approximate AOI-based area reporting.
 2. **Stage 1: Binary Forest Cover Segmentation (`stage1`):**
    - Single-image segmentation workbench using `best_unet_model.pth`.
    - Sample selector from Amazon Forest Dataset validation and test splits, plus custom image file upload.
@@ -686,10 +685,10 @@ The backend service is implemented in Flask 3.1 with CORS support (`app.py`). It
 | `GET` | `/api/sentinel/search` | `bbox`, `lat`, `lon`, `from`, `to`, `max_cloud` | Queries CDSE STAC catalog; returns sorted list of acquisitions. |
 | `GET` | `/api/sentinel/preview` | `acquisition_id`, `bbox`, `width`, `height` | Queries CDSE Process API; returns base64 true-color RGB PNG. |
 | `GET` | `/api/sentinel/cloud-stats` | `acquisition_id`, `bbox`, `resolution` | Queries SCL band; returns AOI cloud %, clear %, and SCL class histogram. |
-| `POST` | `/api/sentinel/analyze` | JSON: `image_before`, `image_after`, `bbox`, `threshold` | Executes Stage 2 Temporal U-Net on Sentinel pair; returns mask and hectares. |
+| `POST` | `/api/sentinel/analyze` | JSON: `image_before`, `image_after`, optional `bbox`, `threshold` | Executes Stage 2 Temporal U-Net; returns masks, pixel metrics, and approximate bbox-based area when valid coordinates are provided. |
 | `POST` | `/api/sentinel/superresolve` | JSON: `image` (base64) | Runs SwinIR 4× super-resolution; returns 4× enlarged base64 PNG. |
 | `GET` | `/api/sentinel/superresolve/status` | None | Checks whether `models/swinir_x4.pth` is available on disk. |
-| `GET` | `/api/gis/regions` | None | Returns predefined global forest monitoring regions with coordinates. |
+| `GET` | `/api/gis/regions` | None | Returns regions with verified spatial metadata; currently empty because bundled samples have no georeferenced region metadata. |
 | `GET` | `/api/samples` | None | Returns local dataset sample catalogs for Stage 1 and Stage 2 test splits. |
 | `POST` | `/api/predict/stage1` | Form: `sample_path` or `file`, `threshold` | Executes Stage 1 U-Net; returns binary forest mask and canopy metrics. |
 | `POST` | `/api/predict/stage2` | Form: `sample_id` or `files`, `threshold` | Executes Stage 2 U-Net; returns deforestation mask and pixel metrics. |
@@ -710,7 +709,7 @@ The Stage 2 Temporal U-Net was trained on the Forest-Change dataset, which consi
 While the system provides SCL-based cloud statistics and a visual cloud mask overlay, **cloudy pixels are not masked out during Temporal U-Net inference**. Passing images with cloud cover or cloud shadows through the change detection model will produce false positive detections. Analysts must verify that AOI cloud cover is $< 10\%$ before running deforestation analysis.
 
 ### 23.3 Absence of Ground Truth in Live Operations
-In live Sentinel-2 monitoring, the system reports detected change pixels, deforestation percentage, and estimated hectares. **It does not report IoU, Dice, Precision, or Recall for live queries**, as ground-truth masks do not exist for arbitrary real-time satellite queries.
+In live Sentinel-2 monitoring, the system reports detected change pixels, deforestation percentage, and an approximate AOI-based area when a valid bounding box is supplied. **It does not report IoU, Dice, Precision, or Recall for live queries**, as ground-truth masks do not exist for arbitrary real-time satellite queries.
 
 ### 23.4 CPU Inference Latency
 On CPU environments, running SwinIR 4× super-resolution over a $512 \times 512$ tile requires processing a $2048 \times 2048$ feature space across 6 Swin transformer blocks, taking 1 to 2 minutes. GPU acceleration is strongly recommended for operational use.

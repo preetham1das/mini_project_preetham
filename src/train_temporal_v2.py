@@ -143,8 +143,13 @@ def eval_epoch(model, loader, criterion, threshold=0.5):
         loss=total_loss / n,
         iou=iou_from_counts(tp, fp, fn),
         dice=dice_from_counts(tp, fp, fn),
-        precision=tp / (tp + fp) if (tp + fp) > 0 else 1.0,
-        recall=tp / (tp + fn) if (tp + fn) > 0 else 1.0,
+        precision=tp / (tp + fp) if (tp + fp) > 0 else 0.0,
+        recall=tp / (tp + fn) if (tp + fn) > 0 else 0.0,
+        specificity=tn / (tn + fp) if (tn + fp) > 0 else 0.0,
+        balanced_accuracy=(
+            ((tp / (tp + fn)) + (tn / (tn + fp))) / 2
+            if (tp + fn) > 0 and (tn + fp) > 0 else 0.0
+        ),
         tp=tp, fp=fp, fn=fn, tn=tn,
     )
 
@@ -216,7 +221,8 @@ def run_experiment(name, cfg, pos_weight_val, pos_weight_val_6ch=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     history = {k: [] for k in ["epoch","train_loss","train_iou","train_dice",
-                                "val_loss","val_iou","val_dice","val_precision","val_recall","lr"]}
+                                "val_loss","val_iou","val_dice","val_precision","val_recall",
+                                "val_specificity","val_balanced_accuracy","lr"]}
 
     best_val_iou = -1.0
     epochs_no_improve = 0
@@ -264,13 +270,16 @@ def run_experiment(name, cfg, pos_weight_val, pos_weight_val_6ch=None):
         history["val_dice"].append(vm["dice"])
         history["val_precision"].append(vm["precision"])
         history["val_recall"].append(vm["recall"])
+        history["val_specificity"].append(vm["specificity"])
+        history["val_balanced_accuracy"].append(vm["balanced_accuracy"])
         history["lr"].append(current_lr)
 
         print(
             f"Ep [{epoch:02d}/{max_ep}] "
             f"TLoss={train_loss:.4f} TIoU={train_iou:.4f} | "
             f"VLoss={vm['loss']:.4f} VIoU={vm['iou']:.4f} VDice={vm['dice']:.4f} "
-            f"VPrec={vm['precision']:.4f} VRec={vm['recall']:.4f} | "
+            f"VPrec={vm['precision']:.4f} VRec={vm['recall']:.4f} "
+            f"VSpec={vm['specificity']:.4f} VBalAcc={vm['balanced_accuracy']:.4f} | "
             f"lr={current_lr:.2e}"
         )
 

@@ -40,12 +40,25 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logits, targets):
-        probs = torch.sigmoid(logits).view(-1)
-        targets = targets.view(-1).float()
-        intersection = (probs * targets).sum()
-        return 1.0 - (2.0 * intersection + self.smooth) / (
-            probs.sum() + targets.sum() + self.smooth
+        if targets.ndim == logits.ndim - 1:
+            targets = targets.unsqueeze(1)
+        if logits.shape != targets.shape:
+            raise ValueError(f"Logits and targets must have matching shapes; got {logits.shape} and {targets.shape}.")
+        probs = torch.sigmoid(logits).flatten(start_dim=1)
+        targets = targets.float().flatten(start_dim=1)
+        intersection = (probs * targets).sum(dim=1)
+        dice = (2.0 * intersection + self.smooth) / (
+            probs.sum(dim=1) + targets.sum(dim=1) + self.smooth
         )
+        return 1.0 - dice.mean()
+
+
+def _match_target_shape(logits, targets):
+    if targets.ndim == logits.ndim - 1:
+        targets = targets.unsqueeze(1)
+    if logits.shape != targets.shape:
+        raise ValueError(f"Logits and targets must have matching shapes; got {logits.shape} and {targets.shape}.")
+    return targets.float()
 
 
 class FocalLoss(nn.Module):
@@ -58,12 +71,18 @@ class FocalLoss(nn.Module):
     """
     def __init__(self, gamma=2.0, alpha=0.75, reduction="mean"):
         super().__init__()
+        if gamma < 0:
+            raise ValueError("gamma must be non-negative")
+        if alpha is not None and not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be None or between 0 and 1")
+        if reduction not in {"mean", "sum", "none"}:
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
         self.gamma = gamma
         self.alpha = alpha
         self.reduction = reduction
 
     def forward(self, logits, targets):
-        targets = targets.float()
+        targets = _match_target_shape(logits, targets)
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         probs = torch.sigmoid(logits)
         p_t = probs * targets + (1 - probs) * (1 - targets)
@@ -93,7 +112,7 @@ class WeightedBCEDiceLoss(nn.Module):
         self.dice = DiceLoss()
 
     def forward(self, logits, targets):
-        targets = targets.float()
+        targets = _match_target_shape(logits, targets)
         # Move pos_weight to same device as logits
         self.bce.pos_weight = self.bce.pos_weight.to(logits.device)
         return self.bce_weight * self.bce(logits, targets) + self.dice_weight * self.dice(logits, targets)
@@ -167,6 +186,16 @@ class TemporalUNet(nn.Module):
         self.outc = nn.Conv2d(f, out_channels, kernel_size=1)
 
     def forward(self, x):
+        expected_channels = self.inc.block[0].in_channels
+        if x.ndim != 4 or x.shape[1] != expected_channels:
+            raise ValueError(f"Expected input shaped (N, {expected_channels}, H, W), got {tuple(x.shape)}")
+        height, width = x.shape[-2:]
+        if height == 0 or width == 0:
+            raise ValueError("Input height and width must be positive.")
+        pad_h, pad_w = (-height) % 16, (-width) % 16
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -178,7 +207,8 @@ class TemporalUNet(nn.Module):
         u = self.up3(u);   u = self.conv_up3(torch.cat([x2, u], dim=1))
         u = self.up4(u);   u = self.conv_up4(torch.cat([x1, u], dim=1))
 
-        return self.outc(u)
+        logits = self.outc(u)
+        return logits[..., :height, :width]
 
 
 if __name__ == "__main__":

@@ -68,8 +68,13 @@ def full_metrics(tp, fp, fn, tn):
     return dict(
         iou=iou_from_counts(tp, fp, fn),
         dice=(2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 1.0,
-        precision=tp / (tp + fp) if (tp + fp) > 0 else 1.0,
-        recall=tp / (tp + fn) if (tp + fn) > 0 else 1.0,
+        precision=tp / (tp + fp) if (tp + fp) > 0 else 0.0,
+        recall=tp / (tp + fn) if (tp + fn) > 0 else 0.0,
+        specificity=tn / (tn + fp) if (tn + fp) > 0 else 0.0,
+        balanced_accuracy=(
+            ((tp / (tp + fn)) + (tn / (tn + fp))) / 2
+            if (tp + fn) > 0 and (tn + fp) > 0 else 0.0
+        ),
         accuracy=(tp + tn) / total if total > 0 else 1.0,
         tp=int(tp), fp=int(fp), fn=int(fn), tn=int(tn),
     )
@@ -86,7 +91,7 @@ def main():
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
     cfg = checkpoint.get("config", {})
 
     in_channels        = cfg.get("in_channels", 6)
@@ -120,7 +125,7 @@ def main():
     # 3. Threshold sweep on VALIDATION set                                     
     thresholds = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
     print("\nThreshold sweep on VALIDATION set:")
-    print(f"  {'Threshold':<12} {'Val IoU':<10} {'Val Dice':<10} {'Val Prec':<10} {'Val Rec':<10}")
+    print(f"  {'Threshold':<12} {'Val IoU':<10} {'Val Dice':<10} {'Val Prec':<10} {'Val Rec':<10} {'Val BalAcc':<10}")
 
     best_thresh = 0.5
     best_thresh_iou = -1.0
@@ -129,7 +134,7 @@ def main():
     for t in thresholds:
         tp, fp, fn, tn = confusion_at_threshold(model, val_loader, t)
         m = full_metrics(tp, fp, fn, tn)
-        print(f"  {t:<12.1f} {m['iou']:<10.4f} {m['dice']:<10.4f} {m['precision']:<10.4f} {m['recall']:<10.4f}")
+        print(f"  {t:<12.1f} {m['iou']:<10.4f} {m['dice']:<10.4f} {m['precision']:<10.4f} {m['recall']:<10.4f} {m['balanced_accuracy']:<10.4f}")
         thresh_results.append({"threshold": t, **m})
         if m["iou"] > best_thresh_iou:
             best_thresh_iou = m["iou"]
@@ -151,6 +156,8 @@ def main():
     print(f"  Test Precision : {test_m['precision']:.4f}")
     print(f"  Test Recall    : {test_m['recall']:.4f}")
     print(f"  Test Accuracy  : {test_m['accuracy']:.4f}")
+    print(f"  Test Specificity: {test_m['specificity']:.4f}")
+    print(f"  Test Balanced Acc: {test_m['balanced_accuracy']:.4f}")
     print(f"  Predicted deforestation: {int(total_pred):,} px ({total_pred/total_px*100:.2f}%)")
     print(f"  Ground-truth deforestation: {int(total_gt):,} px ({total_gt/total_px*100:.2f}%)")
 
@@ -278,6 +285,8 @@ def main():
         f"  Precision : {test_m['precision']:.4f}",
         f"  Recall    : {test_m['recall']:.4f}",
         f"  Accuracy  : {test_m['accuracy']:.4f}",
+        f"  Specificity: {test_m['specificity']:.4f}",
+        f"  Balanced Accuracy: {test_m['balanced_accuracy']:.4f}",
         f"  TP={int(tp)}, FP={int(fp)}, FN={int(fn)}, TN={int(tn)}",
     ]
 

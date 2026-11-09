@@ -156,6 +156,8 @@ def train_model(
             "val_dice": avg_val_dice,
             "val_precision": avg_val_prec,
             "val_recall": avg_val_rec,
+            "val_specificity": val_metrics["specificity"],
+            "val_balanced_accuracy": val_metrics["balanced_accuracy"],
             "val_accuracy": avg_val_acc,
             "time_sec": epoch_elapsed
         }

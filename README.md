@@ -24,7 +24,7 @@ An end-to-end Earth Observation (EO) deep learning and Web GIS platform for auto
   - [AOI Drawing & STAC Catalog Query](#aoi-drawing--stac-catalog-query)
   - [SCL-Based Cloud & Obscuration Analysis](#scl-based-cloud--obscuration-analysis)
   - [SwinIR 4× Super-Resolution Visualization](#swinir-4-super-resolution-visualization)
-  - [Physical Area Estimation (10 m GSD)](#physical-area-estimation-10-m-gsd)
+  - [AOI-Based Area Approximation](#aoi-based-area-approximation)
 - [Datasets & Class Imbalance Audit](#-datasets--class-imbalance-audit)
 - [Empirical Measured Results](#-empirical-measured-results)
   - [Stage 1 Validation Performance](#stage-1-validation-performance)
@@ -50,21 +50,33 @@ Automating deforestation detection from satellite imagery must account for **sev
 
 This project provides a two-stage post-classification inference workflow and separately benchmarks a direct temporal model:
 1. **Stage 1 (Static Canopy Delineation):** A 3-channel convolutional U-Net trained on the Amazon Forest Dataset to segment baseline forest cover.
+<<<<<<< HEAD
 2. **Stage 2 (Bi-Temporal Change Detection):** Reuses the Stage 1 U-Net independently on $T_1$ and $T_2$; a pixel is deforestation only when it is forest at $T_1$ and non-forest at $T_2$. The separately trained Temporal U-Net remains available for benchmark training and evaluation, but is not used by the live inference endpoints.
 3. **Live Earth Observation:** A direct integration with the European Copernicus Data Space Ecosystem to query live Sentinel-2 L2A surface reflectance imagery, quantify AOI-specific cloud obscuration using the official Scene Classification Layer (SCL), and execute live deforestation inference with physical area reporting in hectares.
+=======
+2. **Stage 2 (Bi-Temporal Change Detection):** A 9-channel Temporal U-Net trained on the Forest-Change dataset that ingests pre-change imagery ($T_1$), post-change imagery ($T_2$), and an explicit absolute difference tensor ($|T_1 - T_2|$) to detect forest loss directly.
+3. **Live Earth Observation:** A direct integration with the European Copernicus Data Space Ecosystem to query Sentinel-2 imagery, quantify AOI-specific cloud obscuration using the Scene Classification Layer (SCL), and run live deforestation inference. Live area is an AOI-bounds approximation; benchmark samples and ordinary uploads report pixel counts without physical area.
+>>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
 4. **SwinIR Super-Resolution:** An architecturally isolated Swin Transformer module providing 4× spatial magnification for visual inspection without affecting model inference.
 
 ---
 
 ## ✨ Key Features
 
+<<<<<<< HEAD
 - **Post-Classification Forest-Loss Rule:** Runs the Stage 1 forest segmenter on each date and marks only pixels that change from forest to non-forest. Since it depends on two independent predictions, segmentation errors can propagate into the loss mask.
 - **Temporal Benchmark Training:** The separate temporal model combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$), Focal Loss ($\gamma = 2.0, \alpha = 0.75$), and Soft Dice Loss to train on rare change events; it is not used by current inference endpoints.
+=======
+- **Direct Temporal Modeling:** Overcomes the failure modes of post-classification subtraction by processing bi-temporal image pairs through an end-to-end 9-channel architecture.
+- **Robust U-Net Spatial Shapes:** Both U-Nets pad only the bottom/right edges to a multiple of 16 and crop logits to the original dimensions, so odd-sized inputs work without changing learned checkpoint weights.
+- **Explicit Change Prior:** Ingests the absolute difference tensor $|T_1 - T_2|$ alongside raw RGB channels, giving early convolutional layers a direct inductive bias for spectral change detection.
+- **Severe Class Imbalance Mitigation:** Combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$) and Focal Loss ($\gamma = 2.0, \alpha = 0.75$) with per-image Soft Dice Loss to reduce domination by samples with different foreground prevalence.
+>>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
 - **Live Copernicus Data Space Integration:** Authenticated OAuth2 integration querying the Sentinel-2 L2A STAC catalog and retrieving dynamically rendered true-color RGB tiles via the Process API.
 - **AOI-Specific Cloud Statistics:** Extracts the 20-meter Scene Classification Layer (SCL) to compute cloud obscuration percentages specifically within the user's drawn bounding box, distinguishing local cloud cover from tile-wide catalog estimates.
 - **Client-Side Cloud Mask Overlay:** Generates a cyan-tinted map overlay showing obscured pixels to alert analysts before running inference.
 - **SwinIR 4× Super-Resolution Visualization:** Magnifies Sentinel-2 imagery by 4× (from 10 m to 2.5 m pixel grid display) for visual verification, while maintaining strict isolation from the segmentation pipeline.
-- **Physical Area Quantification:** Translates detected pixel counts into physical hectares and square kilometers based on Sentinel-2's 10-meter Ground Sample Distance ($1\text{ pixel} = 100\text{ m}^2 = 0.01\text{ ha}$).
+- **AOI Area Approximation:** For live Sentinel analyses with a valid AOI bounding box, estimates area by dividing the spherical bounding-box area by the prediction pixel count. This approximation does not use per-pixel georeferencing. Unreferenced samples and uploads report pixel counts only.
 - **Interactive Web GIS Dashboard:** A React/Leaflet interface featuring five specialized views: Historical GIS Map, Stage 1 Workbench, Stage 2 Workbench, Temporal Swipe Viewer, and Live Analytics.
 
 ---
@@ -140,12 +152,19 @@ sequenceDiagram
 
     User->>Map: Click "Analyze Deforestation"
     Map->>Server: POST /api/sentinel/analyze (T1, T2, bbox, threshold)
+<<<<<<< HEAD
     Server->>Model: Predict forest mask for T1
     Model-->>Server: Return T1 forest mask
     Server->>Model: Predict forest mask for T2
     Model-->>Server: Return T2 forest mask
     Server->>Server: Mark T1 forest AND T2 non-forest pixels
     Server->>Server: Calculate Hectares (10m GSD) & Generate Red Overlay
+=======
+    Server->>Server: Construct 9-channel tensor [T1, T2, |T1-T2|]
+    Server->>Model: Execute Stage 2 Model Inference
+    Model-->>Server: Return Deforestation Mask & Logits
+    Server->>Server: Estimate AOI area and generate red overlay
+>>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
     Server-->>Map: Return Mask, Affected Area, and Stats
     Map-->>User: Render Semi-Transparent Red Mask on Satellite Base
 ```
@@ -206,11 +225,8 @@ The explicit difference tensor provides an inductive bias that immediately highl
 - **Strict Isolation:** SwinIR is used **exclusively for visual verification** in the GIS map. It is **never fed into either segmentation path**. Live deforestation inference always operates on the original 10-meter Sentinel-2 image.
 - **Clarification:** SwinIR scales a $512 \times 512$ image to a $2048 \times 2048$ grid for visualization. This is learned spatial super-resolution, **not physical 2.5-meter satellite sensor measurements**.
 
-### Physical Area Estimation (10 m GSD)
-Because Sentinel-2 Level-2A RGB bands provide a native 10-meter Ground Sample Distance:
-$$\text{Pixel Area} = 10\text{ m} \times 10\text{ m} = 100\text{ m}^2$$
-$$\text{Deforested Area (ha)} = \frac{\text{Changed Pixels} \times 100\text{ m}^2}{10,000\text{ m}^2/\text{ha}} = \text{Changed Pixels} \times 0.01\text{ ha}$$
-$$\text{Deforested Area (km}^2) = \frac{\text{Deforested Hectares}}{100}$$
+### AOI-Based Area Approximation
+For live Sentinel analyses, the backend estimates the spherical surface area of the AOI bounding box and divides it by the number of model output pixels. The resulting hectares and square kilometers are approximate because the calculation does not use a raster transform or per-pixel geodesic areas. Benchmark samples and ordinary uploads have no verified georeferencing, so their physical area fields are empty and their results are reported in pixels and percentages.
 
 ---
 
@@ -278,7 +294,7 @@ Evaluated on the Forest-Change dataset independent test split (**33 pairs, 2,162
 ### Operational Sentinel-2 Demo Inference
 When running inference on live Sentinel-2 imagery via `/api/sentinel/analyze`, the system outputs:
 - Predicted deforestation pixel count and percentage.
-- Estimated physical area in hectares and square kilometers based on 10 m GSD.
+- Approximate hectares and square kilometers from the live AOI bounding box; sample and upload workflows report pixels only.
 - **Important Distinction:** Live Sentinel-2 queries **do not have ground-truth masks**. Therefore, IoU, Dice, Precision, and Recall are not reported for live queries. Benchmark metrics apply strictly to the held-out test datasets.
 
 ---
@@ -296,7 +312,7 @@ When running inference on live Sentinel-2 imagery via `/api/sentinel/analyze`, t
 | **AOI-Specific SCL Cloud Statistics** | ✅ Implemented | Queries 20 m SCL band; classifies classes $\{3, 7, 8, 9, 10\}$ as cloud/obscured. |
 | **Client-Side Cloud Mask Overlay** | ✅ Implemented | Dynamic cyan overlay showing obscured pixels in the Leaflet map. |
 | **SwinIR 4× Super-Resolution** | ✅ Implemented | SwinIR-M classical SR ($4\times$); strictly isolated visualization tool. |
-| **Physical Area Estimation (Hectares)** | ✅ Implemented | Computed from Sentinel-2 10 m pixel dimensions ($0.01\text{ ha/pixel}$). |
+| **AOI-Based Area Approximation** | ✅ Implemented with limits | Live Sentinel results estimate area from the AOI bounding box; this is not per-pixel georeferenced measurement. Samples and uploads have no physical area estimate. |
 | **Interactive Leaflet Web GIS** | ✅ Implemented | React 18 interface with AOI drawing, swipe comparisons, and metric dashboard. |
 | **Automatic Cloud Masking During Inference** | ⏳ Planned | Cloudy pixels are currently passed into the model; masking them out is planned. |
 | **Domain Adaptation for Sentinel-2** | ⏳ Planned | Fine-tuning the Stage 1 forest segmenter on annotated Sentinel-2 L2A tiles. |
@@ -320,6 +336,8 @@ When running inference on live Sentinel-2 imagery via `/api/sentinel/analyze`, t
 ```
 Deforestation-Detection-from-Satellite-Images/
 ├── app.py                      # Production Flask REST API (Port 5000)
+├── backend/
+│   └── main.py                  # Separate FastAPI inference service (legacy/optional; not used by Vite)
 ├── PROJECT_REPORT.md           # Formal 27-section technical engineering report
 ├── README.md                   # System documentation and developer guide
 ├── package.json                # Root package configuration
@@ -474,10 +492,10 @@ The Flask backend provides 13 operational REST endpoints:
 | `/api/sentinel/search` | `GET` | `bbox`, `from`, `to`, `max_cloud` | Queries the Copernicus STAC catalog; returns a sorted array of historical acquisitions. |
 | `/api/sentinel/preview` | `GET` | `acquisition_id`, `bbox`, `width`, `height` | Queries the Process API; returns a true-color RGB base64-encoded PNG preview. |
 | `/api/sentinel/cloud-stats` | `GET` | `acquisition_id`, `bbox`, `resolution` | Retrieves the 20 m SCL band; returns AOI cloud %, clear %, and a breakdown by SCL class. |
-| `/api/sentinel/analyze` | `POST` | JSON: `image_before`, `image_after`, `bbox`, `threshold` | Executes Stage 2 inference on a Sentinel-2 image pair; returns a red mask overlay and affected area in hectares. |
+| `/api/sentinel/analyze` | `POST` | JSON: `image_before`, `image_after`, `bbox`, `threshold` | Executes Stage 2 inference; returns mask/overlay, pixel metrics, and approximate AOI-based area when a valid bbox is supplied. |
 | `/api/sentinel/superresolve` | `POST` | JSON: `image` (base64) | Executes SwinIR 4× super-resolution; returns a 4× enlarged base64-encoded PNG. |
 | `/api/sentinel/superresolve/status` | `GET` | None | Checks whether the `models/swinir_x4.pth` checkpoint is available on disk. |
-| `/api/gis/regions` | `GET` | None | Returns predefined global forest monitoring regions with center coordinates and zoom levels. |
+| `/api/gis/regions` | `GET` | None | Returns regions with verified spatial metadata; currently empty because bundled samples have no georeferenced region metadata. |
 | `/api/samples` | `GET` | None | Returns lists of available local dataset samples for Stage 1 and Stage 2 testing. |
 | `/api/predict/stage1` | `POST` | Form: `sample_path` or `file`, `threshold` | Executes Stage 1 U-Net segmentation; returns forest canopy mask and pixel area statistics. |
 | `/api/predict/stage2` | `POST` | Form: `sample_id` or `files`, `threshold` | Segments both dates with the Stage 1 U-Net and returns the T1-forest/T2-non-forest loss mask and pixel metrics. |
@@ -487,16 +505,16 @@ The Flask backend provides 13 operational REST endpoints:
 
 ## 🧪 Testing & Verification Suite
 
-The repository includes a comprehensive testing suite to verify individual components:
+The tracked tests cover core model/data regressions plus Sentinel and super-resolution integrations:
 
-### 1. Core Architecture Smoke Test
-Verifies dataset shapes, 6-channel and 9-channel tensor concatenation, model parameters, and loss function gradients:
+### 1. Focused ML regression tests
+Verifies U-Net shape handling and gradients, six/nine-channel temporal inputs, image-mask alignment, metric edge cases, and loss behavior:
 ```powershell
-.\venv\Scripts\python.exe smoke_test.py
+.\venv\Scripts\python.exe -m unittest tests.test_ml_core -v
 ```
-*Expected output: `All smoke tests PASSED`*
+Run the available offline tests and optional integrations together with `python -m unittest tests.test_ml_core test_stage2_uploads test_cloud_stats test_sen2naip -v`. The Sentinel cloud integration test skips its live request when credentials are absent or the external service is unavailable. Some root-level `test_*.py` files are manual scripts that call a separately running server and should not be included in automated discovery.
 
-### 2. SCL Cloud Statistics Unit Tests
+### 2. SCL Cloud Statistics Tests
 Tests parameter validation, Process API integration, and cloud percentage calculations:
 ```powershell
 .\venv\Scripts\python.exe test_cloud_stats.py
