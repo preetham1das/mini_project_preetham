@@ -444,7 +444,7 @@ export default function App() {
             />
           </PageFrame>
         ) : view === 'change' ? (
-          <PageFrame className="fw-page--change" title="Change Detection" description="Compare aligned T1 and T2 imagery with the Temporal U-Net. Live Sentinel-2 pairs are selected on the map.">
+          <PageFrame className="fw-page--change" title="Change Detection" description="Compare aligned T1 and T2 forest masks; loss is forest at T1 and non-forest at T2.">
             <Stage2View
                   samples={samples}
                   sentinelStatus={sentinelStatus}
@@ -546,7 +546,7 @@ function DashboardView({ history, regions, acquisitions, backendStatus, sentinel
         </section>
         <div className="fw-dashboard-grid">
           <section className="fw-card fw-activity-card"><div className="fw-section-head"><div><h2>Recent analysis activity</h2><p>Results recorded locally in this browser</p></div><button className="fw-text-button" onClick={() => onNavigate('history')}>View history <ArrowUpRight size={14} /></button></div>
-            {history.length ? <div className="fw-activity-list">{history.slice(0, 5).map((item) => <div className="fw-activity-row" key={item.id}><span className={`fw-activity-mark ${item.type === 'Forest analysis' ? 'forest' : 'loss'}`} /><div><strong>{item.type}</strong><small>{item.region || 'Analysis'} · {item.date || new Date(item.analyzedAt).toLocaleDateString()}</small></div><b>{item.lossHa != null ? `${item.lossHa} ha loss` : item.forestHa != null ? `${item.forestHa} ha canopy` : 'Completed'}</b></div>)}</div> : <EmptyState title="No completed analyses yet" text="Run a Forest U-Net or Temporal U-Net workflow to see results here." />}
+            {history.length ? <div className="fw-activity-list">{history.slice(0, 5).map((item) => <div className="fw-activity-row" key={item.id}><span className={`fw-activity-mark ${item.type === 'Forest analysis' ? 'forest' : 'loss'}`} /><div><strong>{item.type}</strong><small>{item.region || 'Analysis'} · {item.date || new Date(item.analyzedAt).toLocaleDateString()}</small></div><b>{item.lossHa != null ? `${item.lossHa} ha loss` : item.forestHa != null ? `${item.forestHa} ha canopy` : 'Completed'}</b></div>)}</div> : <EmptyState title="No completed analyses yet" text="Run a Forest U-Net or forest-loss workflow to see results here." />}
           </section>
           <section className="fw-card"><div className="fw-section-head"><div><h2>Service health</h2><p>Connectivity reported by the backend</p></div><ShieldCheck size={17} /></div>
             <ServiceRow label="Inference API" status={backendStatus === 'online' ? 'Online' : backendStatus === 'offline' ? 'Offline' : 'Checking'} tone={backendStatus} />
@@ -610,7 +610,7 @@ function AnalyticsView({ history, analytics }) {
   };
   const benchmarkSources = analytics?.stage1 && analytics?.stage2 ? '2 models' : analytics?.stage1 ? 'Forest U-Net' : analytics?.stage2 ? 'Temporal U-Net' : 'Unavailable';
   const forestRecords = history.filter((item) => Number.isFinite(Number(item.forestPct)));
-  return <div className="fw-reports"><section className="fw-card"><div className="fw-section-head"><div><h2>Analysis report</h2><p>Export measured results recorded in this browser. Benchmark metrics are separate.</p></div><button className="btn btn--ghost" onClick={exportCsv} disabled={!history.length}>Download CSV</button></div><div className="fw-report-kpis"><div><span>Saved analyses</span><strong>{history.length}</strong></div><div><span>Change analyses</span><strong>{history.filter((item) => item.type === 'Change detection').length}</strong></div><div><span>Measured loss runs</span><strong>{lossRecords.length}</strong></div><div><span>Benchmark sources</span><strong>{benchmarkSources}</strong></div></div></section><section className="fw-card"><div className="fw-section-head"><div><h2>Forest loss by analysis</h2><p>Hectares reported by Temporal U-Net runs</p></div></div><TrendChart records={lossRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Canopy cover by analysis</h2><p>Coverage reported by Forest U-Net runs</p></div></div><TrendChart metric="forestPct" unit="%" records={forestRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Regional results</h2><p>Recorded outputs, with no extrapolation across unsurveyed regions</p></div></div><HistoryTable history={history} /></section></div>;
+  return <div className="fw-reports"><section className="fw-card"><div className="fw-section-head"><div><h2>Analysis report</h2><p>Export measured results recorded in this browser. Benchmark metrics are separate.</p></div><button className="btn btn--ghost" onClick={exportCsv} disabled={!history.length}>Download CSV</button></div><div className="fw-report-kpis"><div><span>Saved analyses</span><strong>{history.length}</strong></div><div><span>Change analyses</span><strong>{history.filter((item) => item.type === 'Change detection').length}</strong></div><div><span>Measured loss runs</span><strong>{lossRecords.length}</strong></div><div><span>Benchmark sources</span><strong>{benchmarkSources}</strong></div></div></section><section className="fw-card"><div className="fw-section-head"><div><h2>Forest loss by analysis</h2><p>Hectares reported by post-classification runs</p></div></div><TrendChart records={lossRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Canopy cover by analysis</h2><p>Coverage reported by Forest U-Net runs</p></div></div><TrendChart metric="forestPct" unit="%" records={forestRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Regional results</h2><p>Recorded outputs, with no extrapolation across unsurveyed regions</p></div></div><HistoryTable history={history} /></section></div>;
 }
 
 function HistoryView({ history, children }) {
@@ -783,11 +783,11 @@ function Stage2View({
           <div>
             <div className="panel__title">Bi-Temporal Deforestation Detection</div>
             <div className="block__hint">
-              9-channel Temporal U-Net comparing earlier (T1) and later (T2) satellite imagery.
+              Runs the Forest U-Net on both dates; deforestation is forest at T1 and non-forest at T2.
             </div>
           </div>
           <span className="badge badge--violet">
-            <Layers size={11} /> Temporal U-Net · 9-ch
+            <Layers size={11} /> Post-classification · Forest U-Net
           </span>
         </div>
 
@@ -891,7 +891,7 @@ function Stage2View({
                 <div className="note note--info">
                   <Satellite size={13} />
                   <span>
-                    Select an Area of Interest (AOI) rectangle on the GIS Map and choose two Sentinel-2 historical acquisition dates across 2018–2026. The 9-channel Temporal U-Net analyzes radiometric changes in the identical geographic tile.
+                    Select an Area of Interest (AOI) rectangle on the GIS Map and choose two Sentinel-2 historical acquisition dates across 2018–2026. The Forest U-Net segments each date; only T1 forest that is non-forest at T2 is marked as loss.
                   </span>
                 </div>
 
@@ -1031,8 +1031,8 @@ function Stage2View({
             <div className="note note--info">
               <Satellite size={13} />
               <span>
-                {s2Results.pair_name} · live Sentinel-2 imagery analysed with the Temporal U-Net. Live scenes have
-                no ground-truth mask, so accuracy metrics apply to the benchmark split only.
+                {s2Results.pair_name} · live Sentinel-2 imagery analysed by independent T1/T2 Forest U-Net masks.
+                Live scenes have no ground-truth mask; benchmark metrics do not measure this result.
               </span>
             </div>
           )}

@@ -1365,7 +1365,7 @@ export default function InteractiveMap({
             </div>
 
             <p className="block__hint" style={{ marginBottom: 9 }}>
-              Pick a <strong>FROM</strong> and a <strong>TO</strong> acquisition to feed the 9-channel Temporal U-Net.
+              Pick a <strong>FROM</strong> and a <strong>TO</strong> acquisition for independent forest segmentation and post-classification comparison.
             </p>
 
             <div className="tile-pair">
@@ -1733,7 +1733,7 @@ export default function InteractiveMap({
             <div className="analytics-panel__title">
               <CheckCircle2 size={14} color="var(--emerald-bright)" /> Deforestation Results
             </div>
-            <span className="badge badge--green">Temporal U-Net</span>
+            <span className="badge badge--green">Post-classification</span>
           </div>
 
           <div className="analytics-panel__body">
@@ -1865,8 +1865,8 @@ export default function InteractiveMap({
             <div className="note note--warn">
               <AlertTriangle size={11} />
               <span>
-                9-channel inference on live Sentinel-2 L2A bands (B04, B03, B02). Seasonal differences and cloud cover
-                can affect the change signal.
+                The Stage 1 Forest U-Net segments both dates independently. Seasonal differences, clouds, and errors
+                in either forest mask can affect the loss result.
               </span>
             </div>
           </div>
