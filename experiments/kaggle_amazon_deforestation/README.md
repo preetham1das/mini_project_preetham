@@ -14,6 +14,11 @@ Source material: [author’s research notebooks](https://github.com/akhilchibber
 - `model.py`: two-stream late-fusion SegNet with separate Sentinel-1 and Sentinel-2 encoders/decoders.
 - `dataset.py`: GeoTIFF metadata/alignment checks, spatial grouping, patch indexing, train-only robust scaling and masked PyTorch loading.
 - `EXPERIMENT_REPORT.md`: status scaffold. It contains no fabricated training results; the notebook writes measured results after a real Colab run.
+- `research_metrics.json`: recorded V2 metrics supplied from the Colab report, shown separately from each inference result. It includes an audit note about the unresolved training patch-count discrepancy.
+
+## Use the trained model in ForestWatch
+
+The existing app exposes a separate **S1 + S2 Experiment** page at `#/kaggle-amazon` and the `/api/predict/kaggle-amazon` inference endpoint. Keep `late_fusion_segnet_v2_corrected_best.pt` and its matching `normalization.json` together under `checkpoints/kaggle_amazon/`. Upload two co-registered GeoTIFFs with the same CRS, affine transform, and dimensions: 2 Sentinel-1 bands and 4 Sentinel-2 bands. The endpoint returns preview images and metrics, plus a downloadable single-band GeoTIFF using the input grid/CRS and `255` for NoData. The research metrics are reported separately and are never calculated from uploaded images.
 
 ## Colab setup and run
 
