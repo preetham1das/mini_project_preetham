@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import InteractiveMap from './InteractiveMap.jsx';
 import EvaluationPanel from './EvaluationPanel.jsx';
+import { getDetectionMethodPresentation, getDetectionWarnings } from './stage2Presentation.js';
 
 export default function App() {
   const [view, setView] = useState(() => window.location.hash.replace(/^#\/?/, '') || 'dashboard');
@@ -160,6 +161,8 @@ export default function App() {
       stable_pct: data.stable_pct ?? (100 - deforestationPct),
       t1_image: data.before_image ?? data.t1_image,
       t2_image: data.after_image ?? data.t2_image,
+      acquisition_before: data.acquisition_before,
+      acquisition_after: data.acquisition_after,
       live_source: true,
     });
     setGisMode('stage2');
@@ -353,7 +356,7 @@ export default function App() {
 
     setLoading(true);
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000);
+    const timeoutId = setTimeout(() => controller.abort(), 180000);
 
     fetch('/api/sentinel/analyze', {
       method: 'POST',
@@ -364,6 +367,9 @@ export default function App() {
         image_after: afterImg,
         date_before: dateBefore,
         date_after: dateAfter,
+        acquisition_before: s2Results?.acquisition_before,
+        acquisition_after: s2Results?.acquisition_after,
+        detection_method: s2Results?.detection_method || 'temporal',
         bbox: bbox,
         threshold: threshold,
       }),
@@ -384,7 +390,7 @@ export default function App() {
         clearTimeout(timeoutId);
         setLoading(false);
         if (err.name === 'AbortError') {
-          alert('Live analysis timed out after 35 seconds. Please try again.');
+          alert('Live analysis timed out after 3 minutes. Please try again.');
         } else {
           alert('Failed to connect to backend: ' + err.message);
         }
@@ -1004,6 +1010,7 @@ function Stage2View({
   const [stage2Mode, setStage2Mode] = useState(
     s2Results?.live_source ? 'live' : (s2FileT1 || s2FileT2 ? 'upload' : s2Sample ? 'sample' : 'live')
   );
+  const resultMethod = getDetectionMethodPresentation(s2Results);
 
   return (
     <>
@@ -1012,11 +1019,11 @@ function Stage2View({
           <div>
             <div className="panel__title">Bi-Temporal Deforestation Detection</div>
             <div className="block__hint">
-              The Forest U-Net evaluates each date independently.
+              {s2Results ? resultMethod.description : 'Run an analysis to see which model produced its result.'}
             </div>
           </div>
           <span className="badge badge--violet">
-            <Layers size={11} /> Post-classification · Forest U-Net
+            <Layers size={11} /> {s2Results ? resultMethod.label : resultMethod.shortLabel}
           </span>
         </div>
 
@@ -1259,11 +1266,14 @@ function Stage2View({
 
 function LatestChangeResults({ results }) {
   if (!results) return null;
+  const methodPresentation = getDetectionMethodPresentation(results);
+  const warnings = getDetectionWarnings(results);
   return (
     <section className="fw-latest-results">
       <div className="fw-section-head">
         <div><h2>Latest change detection</h2><p>{results.pair_name || 'Most recent temporal image pair'}</p></div>
         {results.live_source && <span className="fw-results-badge">Live imagery · no ground-truth evaluation</span>}
+        <span className="fw-results-badge">{methodPresentation.label} · {results.model_status || 'complete'}</span>
       </div>
       <div className="stat-grid fw-change-results">
         <div className="stat stat--red">
@@ -1284,14 +1294,34 @@ function LatestChangeResults({ results }) {
           <div className="stat__value">{results.metrics.sample_iou} / {results.metrics.sample_dice}</div>
           <div className="stat__sub">Ground truth {Number(results.metrics.gt_defor_pixels).toLocaleString()} pixels</div>
         </div>}
+        {results.detection_method === 'compare' && <>
+          <div className="stat stat--cyan">
+            <span className="stat__label">Temporal U-Net</span>
+            <div className="stat__value">{results.temporal_deforestation_pct ?? 0}<span className="stat__unit">%</span></div>
+            <div className="stat__sub">{Number(results.temporal_deforestation_hectares ?? 0).toLocaleString()} ha · dataset-labelled loss prediction</div>
+          </div>
+          <div className="stat stat--green">
+            <span className="stat__label">Stage 1 baseline</span>
+            <div className="stat__value">{results.baseline_deforestation_pct ?? 0}<span className="stat__unit">%</span></div>
+            <div className="stat__sub">{Number(results.baseline_deforestation_hectares ?? 0).toLocaleString()} ha · T1 forest / T2 non-forest</div>
+          </div>
+        </>}
       </div>
       <div className="visual-grid fw-change-visuals">
         <VisualCard title="T1 · Before" src={results.t1_image || results.before_image} alt="Before image" />
         <VisualCard title="T2 · After" src={results.t2_image || results.after_image} alt="After image" />
-        <VisualCard title="Change mask" src={results.deforestation_mask} alt="Deforestation mask" />
+        {results.before_forest_mask && <VisualCard title="T1 forest mask · Stage 1" src={results.before_forest_mask} alt="Forest mask before" />}
+        {results.after_forest_mask && <VisualCard title="T2 forest mask · Stage 1" src={results.after_forest_mask} alt="Forest mask after" />}
+        <VisualCard title={`${methodPresentation.shortLabel} mask`} src={results.deforestation_mask} alt={`${methodPresentation.shortLabel} deforestation mask`} />
         <VisualCard title="Loss overlay" src={results.deforestation_overlay} alt="Deforestation overlay" />
+        {results.temporal_deforestation_mask && <VisualCard title="Temporal U-Net prediction" src={results.temporal_deforestation_mask} alt="Temporal U-Net deforestation mask" />}
+        {results.baseline_deforestation_mask && <VisualCard title="Stage 1 baseline" src={results.baseline_deforestation_mask} alt="Post-classification baseline mask" />}
       </div>
-      {results.model_note && <div className="note note--warn"><Cpu size={13} /><span>{results.model_note}</span></div>}
+      {results.prediction_output?.invalid_pixel_encoding && <div className="note note--info">
+        <Info size={13} /><span>Gray pixels in the selected prediction mask are invalid or cloud-masked; they are excluded from area totals.</span>
+      </div>}
+      {results.temporal_validation_iou != null && <div className="note note--info"><Info size={13} /><span>Checkpoint validation IoU: {Number(results.temporal_validation_iou).toFixed(3)} on Forest-Change validation data. This is a research metric, not a score for the live scene.</span></div>}
+      {warnings.map((warning, index) => <div className="note note--warn" key={`${results.detection_method || 'unknown'}-${index}`}><Cpu size={13} /><span>{warning}</span></div>)}
     </section>
   );
 }

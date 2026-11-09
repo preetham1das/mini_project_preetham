@@ -45,6 +45,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
 } from 'lucide-react';
+import { getDetectionMethodPresentation, getDetectionWarnings } from './stage2Presentation.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -279,6 +280,7 @@ export default function InteractiveMap({
   const [analysing,       setAnalysing]       = useState(false);
   const [analysisError,   setAnalysisError]   = useState('');
   const [analysisResult,  setAnalysisResult]  = useState(null);
+  const [analysisMethod, setAnalysisMethod] = useState('temporal');
   const [analysisOverlayVisible, setAnalysisOverlayVisible] = useState(true);
   const [overlayOpacity, setOverlayOpacity] = useState(0.55);
   const analysisLayerRef = useRef(null); // L.imageOverlay for analysis overlay
@@ -888,7 +890,8 @@ export default function InteractiveMap({
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000);
+    // Two selected-scene Process API requests can take longer than the preview calls.
+    const timeoutId = setTimeout(() => controller.abort(), 180000);
 
     try {
       const res = await fetch('/api/sentinel/analyze', {
@@ -896,12 +899,27 @@ export default function InteractiveMap({
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
+          acquisition_before: {
+            id: fromData.acq.id,
+            datetime: fromData.acq.datetime,
+            collection: fromData.acq.collection || collection,
+          },
+          acquisition_after: {
+            id: toData.acq.id,
+            datetime: toData.acq.datetime,
+            collection: toData.acq.collection || collection,
+          },
+          // Keep the selected preview pair as a compatibility fallback for
+          // older Flask workers that still route image-payload requests.
+          // Current workers prefer the acquisition records and fetch source
+          // Sentinel-2 data directly from Copernicus.
           image_before: fromData.image,
-          image_after:  toData.image,
-          date_before:  fromData.acq.datetime ? fromData.acq.datetime.slice(0, 10) : 'Unknown',
-          date_after:   toData.acq.datetime   ? toData.acq.datetime.slice(0, 10)   : 'Unknown',
-          bbox:         [west, south, east, north],
-          threshold:    stage2Threshold,
+          image_after: toData.image,
+          date_before: fromData.acq.datetime,
+          date_after: toData.acq.datetime,
+          bbox: [west, south, east, north],
+          threshold: stage2Threshold,
+          detection_method: analysisMethod,
         }),
       });
       clearTimeout(timeoutId);
@@ -937,7 +955,7 @@ export default function InteractiveMap({
     } catch (err) {
       clearTimeout(timeoutId);
       if (err.name === 'AbortError') {
-        setAnalysisError('Analysis request timed out after 35 seconds. Please try again.');
+        setAnalysisError('Analysis request timed out after 3 minutes. Please try again.');
       } else {
         setAnalysisError('Network error: ' + err.message);
       }
@@ -945,7 +963,7 @@ export default function InteractiveMap({
       clearTimeout(timeoutId);
       setAnalysing(false);
     }
-  }, [fromData, toData, aoiBounds, overlayOpacity, stage2Threshold, onStage2Result]);
+  }, [fromData, toData, aoiBounds, overlayOpacity, stage2Threshold, analysisMethod, collection, onStage2Result]);
 
   // Toggle analysis overlay visibility
   const toggleAnalysisOverlay = useCallback(() => {
@@ -1618,6 +1636,22 @@ export default function InteractiveMap({
             )}
 
             {/* Primary CTA */}
+            {fromData && toData && <div className="field" style={{ marginTop: 10 }}>
+              <label htmlFor="live-detection-method">Detection method</label>
+              <select
+                id="live-detection-method"
+                className="select"
+                value={analysisMethod}
+                onChange={(event) => setAnalysisMethod(event.target.value)}
+              >
+                <option value="temporal">Temporal U-Net · recommended</option>
+                <option value="compare">Compare with Stage 1 baseline</option>
+                <option value="baseline">Stage 1 post-classification baseline</option>
+              </select>
+              <div className="block__hint" style={{ marginTop: 5 }}>
+                The comparison mode runs both methods on the same clear pixels.
+              </div>
+            </div>}
             {fromData && toData && <button
               type="button"
               className={`btn btn--primary btn--block btn--cta ${canAnalyze ? '' : 'btn--ghost'}`}
@@ -1684,7 +1718,7 @@ export default function InteractiveMap({
             <div className="analytics-panel__title">
               <CheckCircle2 size={14} color="var(--emerald-bright)" /> Deforestation Results
             </div>
-            <span className="badge badge--green">Post-classification</span>
+            <span className="badge badge--green">{getDetectionMethodPresentation(analysisResult).label}</span>
           </div>
 
           <div className="analytics-panel__body">
@@ -1775,6 +1809,10 @@ export default function InteractiveMap({
                 <span className="legend__swatch" style={{ background: '#10B981' }} />
                 <span>Stable forest</span>
               </div>
+              {analysisResult.prediction_output?.invalid_pixel_encoding && <div className="legend__row">
+                <span className="legend__swatch" style={{ background: '#808080' }} />
+                <span>Invalid / masked pixel</span>
+              </div>}
             </div>
 
             {/* Comparison previews */}
@@ -1813,13 +1851,9 @@ export default function InteractiveMap({
               </div>
             </div>
 
-            <div className="note note--warn">
-              <AlertTriangle size={11} />
-              <span>
-                The Stage 1 Forest U-Net segments both dates independently. Seasonal differences, clouds, and errors
-                in either forest mask can affect the loss result.
-              </span>
-            </div>
+            {getDetectionWarnings(analysisResult).map((warning, index) => <div className="note note--warn" key={`${analysisResult.detection_method || 'unknown'}-${index}`}>
+              <AlertTriangle size={11} /><span>{warning}</span>
+            </div>)}
           </div>
         </aside>
       )}

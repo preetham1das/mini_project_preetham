@@ -2,6 +2,7 @@ import time
 import base64
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -53,6 +54,7 @@ if str(src_dir) not in sys.path:
 from model import UNet, CHECKPOINT_PATH
 from metrics import THRESHOLD
 from temporal_inference import predict_temporal_forest_masks
+from temporal_model import TemporalUNet
 from experiments.kaggle_amazon_deforestation.model import LateFusionSegNet
 from experiments.kaggle_amazon_deforestation.dataset import (
     resolve_sentinel1_bands,
@@ -67,7 +69,10 @@ DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
 KAGGLE_AMAZON_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "kaggle_amazon" / "late_fusion_segnet_v2_corrected_best.pt"
 KAGGLE_AMAZON_NORMALIZATION = Path(__file__).resolve().parent / "checkpoints" / "kaggle_amazon" / "normalization.json"
+TEMPORAL_MODEL_CHECKPOINT = Path(__file__).resolve().parent / "models" / "best_temporal_model.pth"
 kaggle_amazon_model = None
+temporal_model = None
+temporal_model_validation_iou = None
 
 
 def get_kaggle_amazon_model():
@@ -240,8 +245,30 @@ def parse_geographic_bbox(value):
     return [west, south, east, north]
 
 
+def remap_temporal_checkpoint_keys(state_dict):
+    """Translate legacy decoder names to current names without altering weights."""
+    aliases = {f"cu{i}.": f"conv_up{i}." for i in range(1, 5)}
+    mapped = {}
+    for name, value in state_dict.items():
+        for old, new in aliases.items():
+            if name.startswith(old):
+                name = new + name[len(old):]
+                break
+        if name in mapped:
+            raise ValueError(f"Duplicate Temporal U-Net parameter after key mapping: {name}")
+        mapped[name] = value
+    return mapped
+
+
+def build_temporal_input(t1, t2):
+    """Build the exact training input [RGB T1, RGB T2, |T1-T2|]."""
+    if t1.shape != t2.shape or t1.ndim != 4 or t1.shape[1] != 3:
+        raise ValueError("Temporal inputs must be aligned (N, 3, H, W) RGB tensors.")
+    return torch.cat((t1, t2, torch.abs(t1 - t2)), dim=1)
+
+
 def load_models():
-    global stage1_model
+    global stage1_model, temporal_model, temporal_model_validation_iou
     
     # 1. Load Stage 1 UNet
     stage1_path = Path(CHECKPOINT_PATH)
@@ -253,6 +280,36 @@ def load_models():
         print(f"[OK] Loaded Stage 1 U-Net from {stage1_path}")
     else:
         print(f"[WARNING] Stage 1 checkpoint not found at {stage1_path}")
+
+    temporal_model = None
+    temporal_model_validation_iou = None
+    if TEMPORAL_MODEL_CHECKPOINT.is_file():
+        try:
+            checkpoint = torch.load(TEMPORAL_MODEL_CHECKPOINT, map_location=DEVICE, weights_only=True)
+            config = checkpoint.get("config") or {}
+            if config.get("in_channels") != 9 or not config.get("diff_channels"):
+                raise ValueError("Expected the trained 9-channel [T1,T2,|T1-T2|] configuration.")
+            state_dict = checkpoint.get("model_state_dict") or checkpoint.get("state_dict")
+            if not isinstance(state_dict, dict):
+                raise ValueError("Checkpoint has no model_state_dict.")
+            # Checkpoint predates the current class's decoder attribute names. This
+            # strictly maps equivalent module names; no tensor values are changed.
+            compatible_state = remap_temporal_checkpoint_keys(state_dict)
+            candidate_model = TemporalUNet(
+                in_channels=9,
+                out_channels=1,
+                init_features=int(config.get("init_features", 32)),
+                bottleneck_dropout=float(config.get("bottleneck_dropout", 0.0)),
+            ).to(DEVICE)
+            candidate_model.load_state_dict(compatible_state, strict=True)
+            candidate_model.eval()
+            temporal_model = candidate_model
+            temporal_model_validation_iou = checkpoint.get("best_val_iou")
+            print(f"[OK] Loaded 9-channel Temporal U-Net from {TEMPORAL_MODEL_CHECKPOINT}")
+        except Exception as exc:
+            print(f"[WARNING] Temporal U-Net unavailable; other application features remain available: {exc}")
+    else:
+        print(f"[WARNING] Temporal U-Net checkpoint not found at {TEMPORAL_MODEL_CHECKPOINT}")
 
 def array_to_base64_png(np_img):
     """Converts numpy image array (RGB or RGBA) to base64 PNG data string."""
@@ -1437,12 +1494,474 @@ function evaluatePixel(sample) {
     })
 
 
+def _fetch_sentinel2_analysis_image(acquisition, bbox, output_size=(480, 480)):
+    """Fetch selected Sentinel-2 acquisition pixels, not the browser preview image.
+
+    Returns RGB reflectance rendered with the same 2.5 gain used by the map's
+    existing Process API evalscript, plus a validity mask and grid metadata.
+    """
+    if not isinstance(acquisition, dict) or not acquisition.get("id") or not acquisition.get("datetime"):
+        raise ValueError("Each selected scene must include its acquisition id and exact datetime.")
+
+    try:
+        acquired_at = datetime.fromisoformat(str(acquisition["datetime"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The selected scene has an invalid acquisition datetime.") from exc
+    if acquired_at.tzinfo is None:
+        acquired_at = acquired_at.replace(tzinfo=timezone.utc)
+    time_from = (acquired_at - timedelta(minutes=10)).astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    time_to = (acquired_at + timedelta(minutes=10)).astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    collection = str(acquisition.get("collection") or "sentinel-2-l2a").lower()
+    if collection in {"l2a", "sentinel-2-l2a"}:
+        collection = "sentinel-2-l2a"
+        with_scl = True
+    else:
+        raise ValueError("Live model analysis requires Sentinel-2 L2A so cloud and shadow pixels can be masked.")
+
+    token, auth_error, auth_status = get_sentinel_token()
+    if not token:
+        raise RuntimeError((auth_error or {}).get("error", "Sentinel authentication failed."))
+
+    bands = '["B04", "B03", "B02", "dataMask", "SCL"]' if with_scl else '["B04", "B03", "B02", "dataMask"]'
+    units = '["REFLECTANCE", "REFLECTANCE", "REFLECTANCE", "DN", "DN"]' if with_scl else '["REFLECTANCE", "REFLECTANCE", "REFLECTANCE", "DN"]'
+    scl_test = " && ![0, 1, 3, 7, 8, 9, 10, 11].includes(sample.SCL)" if with_scl else ""
+    evalscript = f"""//VERSION=3
+function setup() {{
+  return {{input: [{{bands: {bands}, units: {units}}}],
+          output: {{bands: 4, sampleType: "FLOAT32", nodataValue: -9999}}}};
+}}
+function evaluatePixel(sample) {{
+  var valid = sample.dataMask === 1{scl_test};
+  return [sample.B04, sample.B03, sample.B02, valid ? 1 : 0];
+}}
+"""
+    base_url = os.environ.get("SENTINEL_BASE_URL", SENTINEL_BASE_URL).rstrip("/")
+    width, height = output_size
+    payload = {
+        "input": {
+            "bounds": {
+                "bbox": bbox,
+                "properties": {"crs": "http://www.opengis.net/def/crs/EPSG/0/4326"},
+            },
+            "data": [{
+                "type": collection,
+                "dataFilter": {
+                    "timeRange": {"from": time_from, "to": time_to},
+                    "mosaickingOrder": "mostRecent",
+                },
+            }],
+        },
+        "output": {
+            "width": width,
+            "height": height,
+            "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
+        },
+        "evalscript": evalscript,
+    }
+    try:
+        response = requests.post(
+            f"{base_url}/process", json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "image/tiff"},
+            timeout=90,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Could not retrieve the selected Sentinel-2 scene: {exc}") from exc
+    if not response.ok:
+        raise RuntimeError(f"Sentinel Hub could not retrieve the selected scene (HTTP {response.status_code}).")
+
+    try:
+        with MemoryFile(response.content) as mem, mem.open() as src:
+            if src.count != 4 or src.width != width or src.height != height or src.crs is None:
+                raise ValueError("Sentinel Hub returned an unexpected image grid or band count.")
+            data = src.read().astype(np.float32)
+            raster_valid = np.all(src.read_masks([1, 2, 3, 4]) > 0, axis=0)
+            metadata = {
+                "crs": src.crs.to_string(),
+                "transform": [float(value) for value in src.transform[:6]],
+                "width": src.width,
+                "height": src.height,
+                "bounds": [float(value) for value in src.bounds],
+            }
+    except (rasterio.errors.RasterioError, OSError) as exc:
+        raise RuntimeError("Sentinel Hub returned an unreadable analysis GeoTIFF.") from exc
+
+    valid = raster_valid & (data[3] > 0.5) & np.all(np.isfinite(data[:3]), axis=0)
+    # Convert physical reflectance to the app's existing RGB display range using
+    # its preview gain; the model's training PNG rendering is not independently
+    # calibrated to this reflectance source, so live predictions stay exploratory.
+    rgb = np.clip(np.moveaxis(data[:3], 0, -1) * 2.5, 0.0, 1.0)
+    # Keep masked cloud/NoData values from becoming artificial black inputs;
+    # predictions over these pixels are excluded using the returned valid mask.
+    if valid.any():
+        rgb[~valid] = np.median(rgb[valid], axis=0)
+    else:
+        rgb[:] = 0.0
+    scene_metadata = {
+        "id": str(acquisition["id"]),
+        "acquisition_id": str(acquisition["id"]),
+        "datetime": acquired_at.isoformat(),
+        "collection": collection,
+        "cloud_mask_applied": with_scl,
+    }
+    return rgb, valid, metadata, scene_metadata
+
+
+def _resize_rgb_for_temporal_model(rgb, valid, target_size=TARGET_SIZE):
+    """Resize RGB using only valid source pixels and return a conservative mask."""
+    rgb = np.asarray(rgb, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool).copy()
+    valid &= np.all(np.isfinite(rgb), axis=-1)
+    rgb = np.where(valid[..., None], np.clip(rgb, 0.0, 1.0), 0.0)
+    coverage = Image.fromarray(valid.astype(np.float32), mode="F").resize(
+        target_size, Image.Resampling.BILINEAR
+    )
+    coverage = np.asarray(coverage, dtype=np.float32)
+    resized = np.zeros((*target_size[::-1], 3), dtype=np.float32)
+    for channel in range(3):
+        numerator = Image.fromarray(rgb[..., channel] * valid, mode="F").resize(
+            target_size, Image.Resampling.BILINEAR
+        )
+        numerator = np.asarray(numerator, dtype=np.float32)
+        resized[..., channel] = np.divide(
+            numerator, coverage, out=np.zeros_like(numerator), where=coverage > 1e-6
+        )
+    # Mark an output pixel valid only when its bilinear source footprint is clear.
+    resized_valid = coverage >= (1.0 - 1e-6)
+    resized[~resized_valid] = 0.0
+    image = np.rint(np.clip(resized, 0.0, 1.0) * 255.0).astype(np.uint8).astype(np.float32) / 255.0
+    return torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0), resized_valid, image
+
+
+def _prediction_gsd_metadata(bbox, size=TARGET_SIZE):
+    """Estimate live model-pixel ground dimensions from an EPSG:4326 bbox."""
+    if bbox is None:
+        return None
+    west, south, east, north = bbox
+    width, height = size
+    center_lat = (south + north) / 2.0
+    semi_major = 6_378_137.0
+    eccentricity_sq = 6.6943799901413165e-3
+    sin_latitude = math.sin(math.radians(center_lat))
+    denominator = math.sqrt(1.0 - eccentricity_sq * sin_latitude ** 2)
+    prime_vertical_radius = semi_major / denominator
+    meridional_radius = semi_major * (1.0 - eccentricity_sq) / denominator ** 3
+    horizontal_m = (
+        prime_vertical_radius * math.cos(math.radians(center_lat))
+        * math.radians(east - west)
+    )
+    vertical_m = meridional_radius * math.radians(north - south)
+    horizontal_gsd = abs(horizontal_m) / width
+    vertical_gsd = abs(vertical_m) / height
+    reported_training_model_gsd = 30.0 * 480.0 / 256.0
+    return {
+        "horizontal_m_per_pixel_at_center_latitude": horizontal_gsd,
+        "vertical_m_per_pixel": vertical_gsd,
+        "calculation": "WGS84 ellipsoid local-scale approximation at bbox center divided by prediction dimensions",
+        "training_source_gsd_meters": None,
+        "training_source_gsd_reported_meters_approx": 30.0,
+        "training_model_input_gsd_estimate_meters_approx": reported_training_model_gsd,
+        "live_to_reported_training_model_gsd_estimate_ratio": {
+            "horizontal": horizontal_gsd / reported_training_model_gsd,
+            "vertical": vertical_gsd / reported_training_model_gsd,
+        },
+        "training_scale_comparable": False,
+        "training_scale_note": "Project documentation reports approximately 30 m source pixels, but local PNGs have no georeferencing; after 480-to-256 resizing that implies about 56.25 m per model pixel only if the reported source scale is accurate.",
+    }
+
+
+def _sentinel_analysis_error(message, status, requested_method=None, resolved_method=None):
+    """Keep the analysis response contract stable when a prediction cannot run."""
+    model_used = {
+        "temporal": "temporal_unet",
+        "baseline": "stage1_post_classification",
+        "compare": "temporal_unet_and_stage1_post_classification",
+    }.get(resolved_method)
+    checkpoint_info = {}
+    if resolved_method in {"temporal", "compare"}:
+        checkpoint_info["temporal_unet"] = {
+            "name": TEMPORAL_MODEL_CHECKPOINT.name,
+            "loaded": temporal_model is not None,
+            "validation_iou": temporal_model_validation_iou,
+        }
+    if resolved_method in {"baseline", "compare"}:
+        checkpoint_info["stage1"] = {"name": Path(CHECKPOINT_PATH).name, "loaded": stage1_model is not None}
+    return jsonify({
+        "success": False,
+        "error": message,
+        "detection_method": resolved_method,
+        "method_selection": {
+            "requested": requested_method,
+            "resolved": resolved_method,
+            "default_applied": requested_method is None and resolved_method is not None,
+        },
+        "model_used": model_used,
+        "model_status": "not run",
+        "checkpoint_info": checkpoint_info,
+        "prediction_output": None,
+        "warnings": [],
+        "limitations": ["No prediction was produced for this request."],
+    }), status
+
+
+def _geodesic_mask_area_hectares(mask, valid, bbox):
+    """Sum WGS84 ellipsoid pixel areas row by row for an EPSG:4326 bbox grid."""
+    height, width = mask.shape
+    west, south, east, north = bbox
+    lon_step = (east - west) / width
+    lat_step = (north - south) / height
+    # Exact area between two parallels on the WGS84 ellipsoid. Using a
+    # per-row latitude term matters because longitude degrees shrink poleward.
+    semi_major = 6_378_137.0
+    eccentricity_sq = 6.6943799901413165e-3
+    eccentricity = eccentricity_sq ** 0.5
+
+    def area_primitive(latitude_radians):
+        sin_latitude = math.sin(latitude_radians)
+        return (
+            sin_latitude / (1.0 - eccentricity_sq * sin_latitude ** 2)
+            + math.atanh(eccentricity * sin_latitude) / eccentricity
+        )
+
+    longitude_width = math.radians(lon_step)
+    area_constant = semi_major ** 2 * (1.0 - eccentricity_sq) * longitude_width / 2.0
+    area_m2 = 0.0
+    for row in range(height):
+        north_edge = math.radians(north - row * lat_step)
+        south_edge = math.radians(north - (row + 1) * lat_step)
+        pixel_area = area_constant * (area_primitive(north_edge) - area_primitive(south_edge))
+        area_m2 += pixel_area * int(np.count_nonzero((mask[row] == 1) & valid[row]))
+    return area_m2 / 10_000.0
+
+
+def _analyze_live_temporal_pair(data):
+    """Analyze selected Sentinel-2 scenes with the temporal model and optional baseline.
+
+    Positive Temporal U-Net pixels follow the Forest-Change training mask mapping
+    (class 1 = dataset-labelled deforestation). Live outputs remain exploratory
+    because the live Sentinel-2 radiometry differs from the PNG training domain.
+    """
+    requested_method = data.get("detection_method")
+    method = "temporal" if requested_method is None else str(requested_method).strip().lower()
+    try:
+        bbox = parse_geographic_bbox(data.get("bbox"))
+        threshold = parse_probability_threshold(data.get("threshold", 0.5))
+        if method not in {"temporal", "baseline", "compare"}:
+            raise ValueError("Detection method must be temporal, baseline, or compare.")
+        if method != "baseline" and temporal_model is None:
+            return _sentinel_analysis_error(
+                "The trained 9-channel Temporal U-Net checkpoint is not available or could not be loaded.",
+                503, requested_method, method,
+            )
+        if method in {"baseline", "compare"} and stage1_model is None:
+            return _sentinel_analysis_error(
+                "The Stage-1 U-Net is required for the post-classification baseline but is not loaded.",
+                503, requested_method, method,
+            )
+
+        acquisition_before = data.get("acquisition_before")
+        acquisition_after = data.get("acquisition_after")
+        if not isinstance(acquisition_before, dict) or not isinstance(acquisition_after, dict):
+            raise ValueError("Select both a before and after Sentinel-2 acquisition.")
+        before_at = datetime.fromisoformat(str(acquisition_before.get("datetime", "")).replace("Z", "+00:00"))
+        after_at = datetime.fromisoformat(str(acquisition_after.get("datetime", "")).replace("Z", "+00:00"))
+        if before_at.tzinfo is None:
+            before_at = before_at.replace(tzinfo=timezone.utc)
+        if after_at.tzinfo is None:
+            after_at = after_at.replace(tzinfo=timezone.utc)
+        if before_at >= after_at:
+            raise ValueError("The T1 acquisition must be earlier than the T2 acquisition.")
+        rgb_before, valid_before, grid_before, meta_before = _fetch_sentinel2_analysis_image(acquisition_before, bbox)
+        rgb_after, valid_after, grid_after, meta_after = _fetch_sentinel2_analysis_image(acquisition_after, bbox)
+        if grid_before["crs"] != grid_after["crs"] or grid_before["transform"] != grid_after["transform"] or (grid_before["width"], grid_before["height"]) != (grid_after["width"], grid_after["height"]):
+            raise ValueError("The selected Sentinel-2 scenes did not return the same spatial grid.")
+
+        t1, valid_t1, display_t1 = _resize_rgb_for_temporal_model(rgb_before, valid_before)
+        t2, valid_t2, display_t2 = _resize_rgb_for_temporal_model(rgb_after, valid_after)
+        valid = valid_t1 & valid_t2
+        if not valid.any():
+            raise ValueError("The selected dates have no mutually clear, valid pixels in this AOI.")
+        if float(valid.mean()) < 0.25:
+            raise ValueError("Less than 25% of the AOI is clear on both dates. Choose different acquisitions or a smaller AOI.")
+
+        t1 = t1.to(DEVICE)
+        t2 = t2.to(DEVICE)
+        temporal_mask = np.zeros(TARGET_SIZE, dtype=np.uint8)
+        baseline_mask = np.zeros(TARGET_SIZE, dtype=np.uint8)
+        before_forest = after_forest = None
+        with torch.inference_mode():
+            if method != "baseline":
+                temporal_input = build_temporal_input(t1, t2)
+                logits = temporal_model(temporal_input)
+                temporal_mask = (torch.sigmoid(logits.float())[0, 0].cpu().numpy() > threshold).astype(np.uint8)
+            if method in {"baseline", "compare"} and stage1_model is not None:
+                logits_t1 = stage1_model(t1)
+                logits_t2 = stage1_model(t2)
+                before_forest = (torch.sigmoid(logits_t1.float())[0, 0].cpu().numpy() > threshold).astype(np.uint8)
+                after_forest = (torch.sigmoid(logits_t2.float())[0, 0].cpu().numpy() > threshold).astype(np.uint8)
+                baseline_mask = ((before_forest == 1) & (after_forest == 0)).astype(np.uint8)
+
+        temporal_mask[~valid] = 0
+        baseline_mask[~valid] = 0
+        if before_forest is not None:
+            before_forest[~valid] = 0
+            after_forest[~valid] = 0
+        chosen_mask = baseline_mask if method == "baseline" else temporal_mask
+        total_pixels = int(valid.sum())
+        loss_pixels = int(np.count_nonzero((chosen_mask == 1) & valid))
+        loss_pct = round(100.0 * loss_pixels / total_pixels, 2)
+        loss_ha = _geodesic_mask_area_hectares(chosen_mask, valid, bbox)
+        overlay = display_t2.copy()
+        loss_pixels_mask = (chosen_mask == 1) & valid
+        overlay[loss_pixels_mask] = 0.45 * overlay[loss_pixels_mask] + 0.55 * np.array([0.937, 0.267, 0.267], dtype=np.float32)
+        overlay[~valid] = 0.45 * overlay[~valid] + 0.55 * np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+        def color_mask(mask, color=(239, 68, 68)):
+            canvas = np.zeros((*mask.shape, 3), dtype=np.uint8)
+            canvas[(mask == 1) & valid] = color
+            canvas[~valid] = (128, 128, 128)
+            return array_to_base64_png(canvas)
+
+        temporal_pixels = int(np.count_nonzero((temporal_mask == 1) & valid))
+        baseline_pixels = int(np.count_nonzero((baseline_mask == 1) & valid))
+        temporal_pct = round(100.0 * temporal_pixels / total_pixels, 2) if total_pixels else 0.0
+        baseline_pct = round(100.0 * baseline_pixels / total_pixels, 2) if total_pixels else 0.0
+        temporal_area_ha = _geodesic_mask_area_hectares(temporal_mask, valid, bbox)
+        baseline_area_ha = _geodesic_mask_area_hectares(baseline_mask, valid, bbox)
+        warnings = []
+        if method in {"temporal", "compare"}:
+            warnings.append(
+                "Temporal U-Net predicts class 1 is dataset-labelled deforestation and was trained on "
+                "Forest-Change RGB PNGs; its source-rendering equivalence "
+                "to Sentinel-2 L2A reflectance and live performance have not been validated. The existing "
+                "2.5 gain clips any band above 0.4 reflectance; the saturation impact on live scenes is unknown."
+            )
+            warnings.append(
+                "The model-pixel ground scale is AOI-dependent and the local training PNGs have no "
+                "georeferencing for a verified scale comparison."
+            )
+        if method in {"baseline", "compare"}:
+            warnings.append(
+                "The Stage-1 U-Net was trained on a different image domain; independent Sentinel-2 "
+                "ground-truth validation has not been performed."
+            )
+        model_note = " ".join(warnings)
+        model_used = {
+            "temporal": "temporal_unet",
+            "baseline": "stage1_post_classification",
+            "compare": "temporal_unet_and_stage1_post_classification",
+        }[method]
+        selected_checkpoint_info = {
+            "temporal_unet": {
+                "name": TEMPORAL_MODEL_CHECKPOINT.name,
+                "loaded": temporal_model is not None,
+                "validation_iou": temporal_model_validation_iou,
+            },
+            "stage1": {"name": Path(CHECKPOINT_PATH).name, "loaded": stage1_model is not None},
+        }
+        if method == "temporal":
+            checkpoint_info = {"temporal_unet": selected_checkpoint_info["temporal_unet"]}
+        elif method == "baseline":
+            checkpoint_info = {"stage1": selected_checkpoint_info["stage1"]}
+        else:
+            checkpoint_info = selected_checkpoint_info
+        return jsonify({
+            "success": True,
+            "date_before": meta_before["datetime"][:10],
+            "date_after": meta_after["datetime"][:10],
+            "acquisition_before": meta_before,
+            "acquisition_after": meta_after,
+            "threshold": threshold,
+            "detection_method": method,
+            "method_selection": {
+                "requested": data.get("detection_method"),
+                "resolved": method,
+                "default_applied": data.get("detection_method") is None,
+            },
+            "model_used": model_used,
+            "model_name": (
+                "Stage 1 post-classification baseline" if method == "baseline" else
+                "Temporal U-Net (9-channel)" if method == "temporal" else
+                "Temporal U-Net + Stage 1 post-classification comparison"
+            ),
+            "model_status": "inference complete",
+            "checkpoint_info": checkpoint_info,
+            "temporal_validation_iou": temporal_model_validation_iou if method != "baseline" else None,
+            "total_pixels": total_pixels,
+            "valid_pixels": total_pixels,
+            "valid_pixel_pct": round(100.0 * valid.mean(), 2),
+            "defor_pixels": loss_pixels,
+            "deforestation_pct": loss_pct,
+            "stable_pixels": total_pixels - loss_pixels,
+            "stable_pct": round(100.0 - loss_pct, 2),
+            "deforestation_hectares": round(loss_ha, 4),
+            "area_estimate_method": "WGS84 geodesic pixel area summed row-by-row on the selected AOI grid; estimate, not ground truth",
+            "temporal_deforestation_pixels": temporal_pixels,
+            "baseline_deforestation_pixels": baseline_pixels,
+            "temporal_deforestation_pct": temporal_pct,
+            "baseline_deforestation_pct": baseline_pct,
+            "temporal_deforestation_hectares": round(temporal_area_ha, 4),
+            "baseline_deforestation_hectares": round(baseline_area_ha, 4),
+            "before_forest_mask": color_mask(before_forest) if before_forest is not None else None,
+            "after_forest_mask": color_mask(after_forest) if after_forest is not None else None,
+            "temporal_deforestation_mask": color_mask(temporal_mask) if method != "baseline" else None,
+            "baseline_deforestation_mask": color_mask(baseline_mask) if method in {"baseline", "compare"} else None,
+            "before_image": array_to_base64_png(np.rint(display_t1 * 255).astype(np.uint8)),
+            "after_image": array_to_base64_png(np.rint(display_t2 * 255).astype(np.uint8)),
+            "deforestation_mask": color_mask(chosen_mask),
+            "valid_mask": array_to_base64_png((valid.astype(np.uint8) * 255)),
+            "deforestation_overlay": array_to_base64_png(np.rint(np.clip(overlay, 0, 1) * 255).astype(np.uint8)),
+            "difference_image": array_to_base64_png(np.rint(np.abs(display_t2 - display_t1) * 255).astype(np.uint8)),
+            "valid_mask_pct": round(100.0 * valid.mean(), 2),
+            "geospatial": {
+                "crs": grid_before["crs"],
+                "bounds": bbox,
+                "source_transform": grid_before["transform"],
+                "source_size": [grid_before["width"], grid_before["height"]],
+                "prediction_size": [TARGET_SIZE[0], TARGET_SIZE[1]],
+                "prediction_transform": [bbox[0], (bbox[2] - bbox[0]) / TARGET_SIZE[0], 0.0, bbox[3], 0.0, -(bbox[3] - bbox[1]) / TARGET_SIZE[1]],
+                "prediction_gsd": _prediction_gsd_metadata(bbox),
+            },
+            "prediction_output": {
+                "format": "PNG data URL",
+                "size": [TARGET_SIZE[0], TARGET_SIZE[1]],
+                "class_encoding": {"0": "no predicted deforestation", "1": "predicted deforestation"},
+                "invalid_pixel_encoding": {"mask_rgb": [128, 128, 128], "valid_mask_value": 0},
+                "valid_pixels": total_pixels,
+                "total_pixels": int(valid.size),
+            },
+            "validity": {
+                "t1_valid_pixel_pct": round(100.0 * valid_t1.mean(), 2),
+                "t2_valid_pixel_pct": round(100.0 * valid_t2.mean(), 2),
+                "joint_valid_pixel_pct": round(100.0 * valid.mean(), 2),
+                "area_excludes_invalid_pixels": True,
+            },
+            "gis": {"bounds": [[bbox[1], bbox[0]], [bbox[3], bbox[2]]], "center": [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2]},
+            "model_note": model_note,
+            "warnings": warnings,
+            "limitations": [
+                "No independent Sentinel-2 labelled-pair evaluation is available for this response.",
+                "Pixel scale depends on the AOI; training source resolution cannot be verified from local PNG metadata.",
+            ],
+        }), 200
+    except ValueError as exc:
+        return _sentinel_analysis_error(str(exc), 400, requested_method, method)
+    except RuntimeError as exc:
+        return _sentinel_analysis_error(str(exc), 502, requested_method, method)
+    except Exception as exc:
+        app.logger.exception("Live Temporal U-Net inference failed")
+        return _sentinel_analysis_error(f"Live analysis failed: {exc}", 500, requested_method, method)
+
+
 @app.route("/api/sentinel/analyze", methods=["POST"])
 def analyze_sentinel_deforestation():
     """
-    Runs post-classification deforestation analysis on two Sentinel-2 images.
+    Runs live Temporal U-Net inference for selected acquisitions, or keeps the
+    legacy Stage-1 post-classification path for existing image-payload callers.
 
-    Accepts JSON body:
+    Live requests use selected acquisition records and an AOI bbox. The backend
+    fetches the scene data directly from Copernicus so the browser preview is
+    never treated as model input. Legacy callers may still send:
       {
         "image_before": "data:image/png;base64,...",   // T1 (FROM date)
         "image_after":  "data:image/png;base64,...",   // T2 (TO date)
@@ -1452,25 +1971,44 @@ def analyze_sentinel_deforestation():
         "threshold":    0.5    // optional, default 0.5
       }
 
-    Preprocessing for both dates:
-      - Convert to RGB
-      - Resize to 256x256 with BILINEAR resampling
-      - Normalize [0,255] -> [0.0, 1.0]
-      - Predict forest masks independently, then classify T1 forest / T2 non-forest as loss
-
-    Returns JSON with deforestation mask, overlay, and area metrics.
-    Includes an explicit model-domain disclosure.
+    The direct live path runs the trained nine-channel model and can optionally
+    compute the retained Stage-1 post-classification baseline for comparison.
     """
-    if stage1_model is None:
-        return jsonify({
-            "success": False,
-            "error": "Stage 1 forest segmentation model is not loaded."
-        }), 500
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict) or not data:
+        return _sentinel_analysis_error("Expected JSON body.", 400)
+    raw_method = data.get("detection_method")
+    method = "temporal" if raw_method is None else str(raw_method).strip().lower()
+    if method not in {"temporal", "baseline", "compare"}:
+        return _sentinel_analysis_error(
+            "detection_method must be one of: temporal, baseline, compare.", 400, raw_method
+        )
+
+    has_acquisition_before = bool(data.get("acquisition_before"))
+    has_acquisition_after = bool(data.get("acquisition_after"))
+    if has_acquisition_before != has_acquisition_after:
+        has_image_pair = bool(data.get("image_before")) and bool(data.get("image_after"))
+        if not has_image_pair:
+            return _sentinel_analysis_error(
+                "Provide both acquisition_before and acquisition_after, or both image_before and image_after.",
+                400, raw_method, method,
+            )
+    if has_acquisition_before and has_acquisition_after:
+        return _analyze_live_temporal_pair(data)
+
+    if method in {"temporal", "compare"} and temporal_model is None:
+        return _sentinel_analysis_error(
+            "The Temporal U-Net checkpoint is not loaded; the requested detection method cannot run.",
+            503, raw_method, method,
+        )
+    if method in {"baseline", "compare"} and stage1_model is None:
+        return _sentinel_analysis_error(
+            "The Stage-1 checkpoint is not loaded; the requested detection method cannot run.",
+            503, raw_method, method,
+        )
 
     # -- Parse JSON body -------------------------------------------------------
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"success": False, "error": "Expected JSON body."}), 400
+    # Legacy image-payload callers continue to use the Stage-1 baseline path.
 
     img_before_b64 = data.get("image_before", "")
     img_after_b64  = data.get("image_after",  "")
@@ -1480,18 +2018,18 @@ def analyze_sentinel_deforestation():
     try:
         threshold = parse_probability_threshold(data.get("threshold", 0.5))
     except ValueError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 400
+        return _sentinel_analysis_error(str(exc), 400, raw_method, method)
     if bbox is not None:
         try:
             bbox = parse_geographic_bbox(bbox)
         except ValueError as exc:
-            return jsonify({"success": False, "error": str(exc)}), 400
+            return _sentinel_analysis_error(str(exc), 400, raw_method, method)
 
     if not img_before_b64 or not img_after_b64:
-        return jsonify({
-            "success": False,
-            "error": "Both image_before and image_after are required."
-        }), 400
+        return _sentinel_analysis_error(
+            "Provide both acquisition_before and acquisition_after, or both image_before and image_after.",
+            400, raw_method, method,
+        )
 
     # -- Decode base64 PNG images -----------------------------------------------
     def decode_b64_image(b64_str, label):
@@ -1507,11 +2045,11 @@ def analyze_sentinel_deforestation():
 
     pil_before, err = decode_b64_image(img_before_b64, "image_before")
     if err:
-        return jsonify({"success": False, "error": err}), 400
+        return _sentinel_analysis_error(err, 400, raw_method, method)
 
     pil_after, err = decode_b64_image(img_after_b64, "image_after")
     if err:
-        return jsonify({"success": False, "error": err}), 400
+        return _sentinel_analysis_error(err, 400, raw_method, method)
     # Both images are resized to TARGET_SIZE (256, 256) below, so small
     # preview dimension variations (e.g. from aspect ratio rounding) are handled safely.
     if pil_before.size != pil_after.size:
@@ -1526,9 +2064,20 @@ def analyze_sentinel_deforestation():
     t1_tensor = torch.from_numpy(img_t1).permute(2, 0, 1).unsqueeze(0)
     t2_tensor = torch.from_numpy(img_t2).permute(2, 0, 1).unsqueeze(0)
 
-    _, _, pred_mask = predict_temporal_forest_masks(
-        stage1_model, t1_tensor, t2_tensor, DEVICE, threshold
-    )
+    temporal_mask = None
+    baseline_mask = None
+    with torch.inference_mode():
+        if method in {"temporal", "compare"}:
+            temporal_input = build_temporal_input(t1_tensor.to(DEVICE), t2_tensor.to(DEVICE))
+            temporal_logits = temporal_model(temporal_input)
+            temporal_mask = (torch.sigmoid(temporal_logits.float())[0, 0].cpu().numpy() > threshold).astype(np.uint8)
+        if method in {"baseline", "compare"}:
+            before_logits = stage1_model(t1_tensor.to(DEVICE))
+            after_logits = stage1_model(t2_tensor.to(DEVICE))
+            before_mask = (torch.sigmoid(before_logits.float())[0, 0].cpu().numpy() > threshold).astype(np.uint8)
+            after_mask = (torch.sigmoid(after_logits.float())[0, 0].cpu().numpy() > threshold).astype(np.uint8)
+            baseline_mask = ((before_mask == 1) & (after_mask == 0)).astype(np.uint8)
+    pred_mask = baseline_mask if method == "baseline" else temporal_mask
 
     # -- Metrics ---------------------------------------------------------------
     total_pixels  = int(pred_mask.size)
@@ -1575,8 +2124,50 @@ def analyze_sentinel_deforestation():
     diff_np = np.abs(img_t2 - img_t1)
     diff_b64 = array_to_base64_png(diff_np)
 
-    return jsonify({
+    warnings = []
+    if method in {"temporal", "compare"}:
+        warnings.append(
+            "Legacy image-payload inputs have no Sentinel-2 SCL validity mask; all pixels are treated as valid. "
+            "Independent Sentinel-2 ground-truth validation has not been performed."
+        )
+        warnings.append(
+            "Uploaded RGB rendering and ground sampling distance are not calibrated against the Temporal U-Net training PNGs."
+        )
+    if method in {"baseline", "compare"}:
+        warnings.append(
+            "The Stage-1 U-Net was trained on a different image domain; independent Sentinel-2 ground-truth validation has not been performed."
+        )
+    model_used = {
+        "temporal": "temporal_unet",
+        "baseline": "stage1_post_classification",
+        "compare": "temporal_unet_and_stage1_post_classification",
+    }[method]
+    checkpoint_info = {}
+    if method in {"temporal", "compare"}:
+        checkpoint_info["temporal_unet"] = {
+            "name": TEMPORAL_MODEL_CHECKPOINT.name,
+            "loaded": temporal_model is not None,
+            "validation_iou": temporal_model_validation_iou,
+        }
+    if method in {"baseline", "compare"}:
+        checkpoint_info["stage1"] = {"name": Path(CHECKPOINT_PATH).name, "loaded": stage1_model is not None}
+    response = {
         "success": True,
+        "detection_method": method,
+        "method_selection": {
+            "requested": raw_method,
+            "resolved": method,
+            "default_applied": raw_method is None,
+        },
+        "model_used": model_used,
+        "model_name": (
+            "Stage 1 post-classification baseline" if method == "baseline" else
+            "Temporal U-Net (9-channel)" if method == "temporal" else
+            "Temporal U-Net + Stage 1 post-classification comparison"
+        ),
+        "model_status": "inference complete",
+        "checkpoint_info": checkpoint_info,
+        "temporal_validation_iou": temporal_model_validation_iou if method != "baseline" else None,
         "date_before": date_before,
         "date_after":  date_after,
         "threshold": threshold,
@@ -1594,15 +2185,34 @@ def analyze_sentinel_deforestation():
         "deforestation_mask":  mask_b64,
         "deforestation_overlay": overlay_b64,
         "difference_image":    diff_b64,
-        "model_note": (
-            "Post-classification comparison: the Stage 1 U-Net was trained "
-            "on the Amazon Forest Dataset, not Sentinel-2 imagery. Errors in "
-            "either per-date forest mask can affect the loss result. Results "
-            "are indicative, not validated. "
-            "Do not use for regulatory or scientific decisions without "
-            "independent ground-truth validation."
-        )
-    })
+        "temporal_deforestation_mask": (
+            array_to_base64_png(np.where(temporal_mask[..., None] == 1, [239, 68, 68], [0, 0, 0]).astype(np.uint8))
+            if temporal_mask is not None else None
+        ),
+        "baseline_deforestation_mask": (
+            array_to_base64_png(np.where(baseline_mask[..., None] == 1, [239, 68, 68], [0, 0, 0]).astype(np.uint8))
+            if baseline_mask is not None else None
+        ),
+        "prediction_output": {
+            "format": "PNG data URL",
+            "size": [TARGET_SIZE[0], TARGET_SIZE[1]],
+            "class_encoding": {"0": "no predicted deforestation", "1": "predicted deforestation"},
+            "invalid_pixel_encoding": None,
+            "all_pixels_treated_as_valid": True,
+            "geospatial_bounds": gis_bounds_obj["bounds"] if gis_bounds_obj else None,
+            "gsd": _prediction_gsd_metadata(bbox),
+        },
+        "warnings": warnings,
+        "limitations": [
+            "Image-payload requests contain no per-pixel cloud/shadow validity mask; all pixels are included in statistics and area estimates.",
+            "Image payloads do not establish CRS, co-registration, or source ground sampling distance.",
+        ],
+        "model_note": " ".join(warnings),
+    }
+    if method == "compare":
+        response["temporal_deforestation_pixels"] = int(np.count_nonzero(temporal_mask))
+        response["baseline_deforestation_pixels"] = int(np.count_nonzero(baseline_mask))
+    return jsonify(response)
 
 
 # ── SwinIR super-resolution (visualization only) ──────────────────────────────
