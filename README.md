@@ -50,28 +50,20 @@ Automating deforestation detection from satellite imagery must account for **sev
 
 This project provides a two-stage post-classification inference workflow and separately benchmarks a direct temporal model:
 1. **Stage 1 (Static Canopy Delineation):** A 3-channel convolutional U-Net trained on the Amazon Forest Dataset to segment baseline forest cover.
-<<<<<<< HEAD
 2. **Stage 2 (Bi-Temporal Change Detection):** Reuses the Stage 1 U-Net independently on $T_1$ and $T_2$; a pixel is deforestation only when it is forest at $T_1$ and non-forest at $T_2$. The separately trained Temporal U-Net remains available for benchmark training and evaluation, but is not used by the live inference endpoints.
-3. **Live Earth Observation:** A direct integration with the European Copernicus Data Space Ecosystem to query live Sentinel-2 L2A surface reflectance imagery, quantify AOI-specific cloud obscuration using the official Scene Classification Layer (SCL), and execute live deforestation inference with physical area reporting in hectares.
-=======
-2. **Stage 2 (Bi-Temporal Change Detection):** A 9-channel Temporal U-Net trained on the Forest-Change dataset that ingests pre-change imagery ($T_1$), post-change imagery ($T_2$), and an explicit absolute difference tensor ($|T_1 - T_2|$) to detect forest loss directly.
-3. **Live Earth Observation:** A direct integration with the European Copernicus Data Space Ecosystem to query Sentinel-2 imagery, quantify AOI-specific cloud obscuration using the Scene Classification Layer (SCL), and run live deforestation inference. Live area is an AOI-bounds approximation; benchmark samples and ordinary uploads report pixel counts without physical area.
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
-4. **SwinIR Super-Resolution:** An architecturally isolated Swin Transformer module providing 4× spatial magnification for visual inspection without affecting model inference.
+3. **Live Earth Observation:** Integrates Copernicus Data Space to search Sentinel-2 scenes, compute AOI-specific cloud statistics from SCL, and run the post-classification workflow. The live hectares figure is an estimate based on the selected AOI and image grid, not a ground-truth measurement.
+4. **Separate Temporal Model Experiment:** The 9-channel Temporal U-Net consumes $T_1$, $T_2$, and $|T_1-T_2|$ for its own training and evaluation path. It is not the model used by live Sentinel-2 inference.
+5. **SwinIR Super-Resolution:** An architecturally isolated Swin Transformer module providing 4× spatial magnification for visual inspection without affecting model inference.
 
 ---
 
 ## ✨ Key Features
 
-<<<<<<< HEAD
 - **Post-Classification Forest-Loss Rule:** Runs the Stage 1 forest segmenter on each date and marks only pixels that change from forest to non-forest. Since it depends on two independent predictions, segmentation errors can propagate into the loss mask.
-- **Temporal Benchmark Training:** The separate temporal model combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$), Focal Loss ($\gamma = 2.0, \alpha = 0.75$), and Soft Dice Loss to train on rare change events; it is not used by current inference endpoints.
-=======
-- **Direct Temporal Modeling:** Overcomes the failure modes of post-classification subtraction by processing bi-temporal image pairs through an end-to-end 9-channel architecture.
+- **Separate Temporal U-Net Experiment:** The model accepts a 9-channel tensor made from two RGB dates plus their absolute difference. It is trained and evaluated separately; it does not replace the live post-classification route.
 - **Robust U-Net Spatial Shapes:** Both U-Nets pad only the bottom/right edges to a multiple of 16 and crop logits to the original dimensions, so odd-sized inputs work without changing learned checkpoint weights.
 - **Explicit Change Prior:** Ingests the absolute difference tensor $|T_1 - T_2|$ alongside raw RGB channels, giving early convolutional layers a direct inductive bias for spectral change detection.
 - **Severe Class Imbalance Mitigation:** Combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$) and Focal Loss ($\gamma = 2.0, \alpha = 0.75$) with per-image Soft Dice Loss to reduce domination by samples with different foreground prevalence.
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
 - **Live Copernicus Data Space Integration:** Authenticated OAuth2 integration querying the Sentinel-2 L2A STAC catalog and retrieving dynamically rendered true-color RGB tiles via the Process API.
 - **AOI-Specific Cloud Statistics:** Extracts the 20-meter Scene Classification Layer (SCL) to compute cloud obscuration percentages specifically within the user's drawn bounding box, distinguishing local cloud cover from tile-wide catalog estimates.
 - **Client-Side Cloud Mask Overlay:** Generates a cyan-tinted map overlay showing obscured pixels to alert analysts before running inference.
@@ -152,19 +144,12 @@ sequenceDiagram
 
     User->>Map: Click "Analyze Deforestation"
     Map->>Server: POST /api/sentinel/analyze (T1, T2, bbox, threshold)
-<<<<<<< HEAD
     Server->>Model: Predict forest mask for T1
     Model-->>Server: Return T1 forest mask
     Server->>Model: Predict forest mask for T2
     Model-->>Server: Return T2 forest mask
     Server->>Server: Mark T1 forest AND T2 non-forest pixels
-    Server->>Server: Calculate Hectares (10m GSD) & Generate Red Overlay
-=======
-    Server->>Server: Construct 9-channel tensor [T1, T2, |T1-T2|]
-    Server->>Model: Execute Stage 2 Model Inference
-    Model-->>Server: Return Deforestation Mask & Logits
-    Server->>Server: Estimate AOI area and generate red overlay
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
+    Server->>Server: Estimate affected area from available spatial metadata & generate red overlay
     Server-->>Map: Return Mask, Affected Area, and Stats
     Map-->>User: Render Semi-Transparent Red Mask on Satellite Base
 ```

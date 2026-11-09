@@ -20,6 +20,12 @@ Source material: [author’s research notebooks](https://github.com/akhilchibber
 
 The existing app exposes a separate **S1 + S2 Experiment** page at `#/kaggle-amazon` and the `/api/predict/kaggle-amazon` inference endpoint. Keep `late_fusion_segnet_v2_corrected_best.pt` and its matching `normalization.json` together under `checkpoints/kaggle_amazon/`. Upload two co-registered GeoTIFFs with the same CRS, affine transform, and dimensions: 2 Sentinel-1 bands and 4 Sentinel-2 bands. The endpoint returns preview images and metrics, plus a downloadable single-band GeoTIFF using the input grid/CRS and `255` for NoData. The research metrics are reported separately and are never calculated from uploaded images.
 
+### Live Sentinel-1 retrieval and calibration status
+
+The experiment page can retrieve Sentinel-1 GRD VV/VH from the Copernicus Data Space Process API. Upload the four-band Sentinel-2 GeoTIFF first; its footprint, CRS, dimensions, and affine transform define the requested AOI and output grid. Choose a date interval of up to 90 days. The backend reuses the application's existing OAuth helper, searches the Sentinel-1 Catalog, requests dual polarization (`DV`), and returns a float32 GeoTIFF with bands ordered `VV`, `VH` and NoData `-9999`.
+
+The retrieved product explicitly uses `GAMMA0_ELLIPSOID` in `LINEAR_POWER` units. **It is intentionally blocked from V2 inference for now.** The Colab V2 loader reads the Kaggle Sentinel-1 rasters directly as stored and applies the saved train-only percentiles, but neither the notebook nor saved experiment artifacts record the source coefficient/units. The reported V2 ranges also include negative values, which cannot be the Sentinel Hub linear-power values. Do not remove this guard or treat gamma0 linear power as compatible until the original Kaggle raster metadata/calibration has been verified and the preprocessing is reproduced.
+
 ## Colab setup and run
 
 1. Open `kaggle_amazon_colab.ipynb` in Google Colab. Select **Runtime → Change runtime type → T4 GPU** (or any available free GPU). The notebook checks the assigned device and VRAM; no paid runtime is enabled or required by the code.

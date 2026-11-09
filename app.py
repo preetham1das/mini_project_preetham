@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+import tarfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,7 +42,8 @@ import numpy as np
 from PIL import Image
 import torch
 import rasterio
-from rasterio.warp import transform_bounds
+from rasterio.warp import transform_bounds, reproject, Resampling
+from rasterio.io import MemoryFile
 
 # Ensure src directory is in sys.path
 src_dir = Path(__file__).resolve().parent / "src"
@@ -2014,6 +2016,223 @@ def predict_stage2():
     })
 
 
+@app.route("/api/kaggle-amazon/sentinel1", methods=["POST"])
+def retrieve_kaggle_sentinel1():
+    """Download numeric VV/VH backscatter on the uploaded S2 raster grid.
+
+    Authentication is shared with the existing Copernicus integration. The
+    output is deliberately tagged as calibration-unverified because the V2
+    Kaggle training files do not record the SAR coefficient/units they used.
+    """
+    s2_upload = request.files.get("sentinel2")
+    start_date = (request.form.get("start_date") or "").strip()
+    end_date = (request.form.get("end_date") or "").strip()
+    if not s2_upload:
+        return jsonify({"error": "Upload the four-band Sentinel-2 GeoTIFF first; its footprint defines the area of interest and output grid."}), 400
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        if start > end:
+            raise ValueError("Start date must be on or before end date.")
+        if (end - start).days > 90:
+            raise ValueError("Choose an acquisition window of 90 days or less.")
+
+        handle = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+        s2_path = Path(handle.name)
+        handle.close()
+        try:
+            s2_upload.save(str(s2_path))
+            with rasterio.open(s2_path) as s2_src:
+                if s2_src.count != 4 or s2_src.crs is None:
+                    raise ValueError("AOI reference must be a four-band Sentinel-2 GeoTIFF with a defined CRS.")
+                if s2_src.width * s2_src.height > 25_000_000 or max(s2_src.width, s2_src.height) > 5000:
+                    raise ValueError("Sentinel-2 grid is too large for one Process API request (limit: 5,000 pixels per side and 25 million pixels total). Clip the raster to the selected AOI first.")
+                epsg = s2_src.crs.to_epsg()
+                if epsg is None:
+                    raise ValueError("The Sentinel-2 reference CRS must resolve to an EPSG code for Process API alignment.")
+                source_bounds = tuple(s2_src.bounds)
+                west, south, east, north = transform_bounds(s2_src.crs, "EPSG:4326", *source_bounds, densify_pts=21)
+                if west >= east or south >= north:
+                    raise ValueError("Sentinel-2 AOI bounds are invalid.")
+                target = {
+                    "width": s2_src.width, "height": s2_src.height,
+                    "crs": s2_src.crs, "transform": s2_src.transform,
+                    "profile": s2_src.profile.copy(),
+                }
+        finally:
+            s2_path.unlink(missing_ok=True)
+
+        token, auth_error, auth_status = get_sentinel_token()
+        if not token:
+            return jsonify(auth_error or {"error": "Sentinel OAuth authentication failed."}), auth_status
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        time_range = f"{start.isoformat()}T00:00:00Z/{end.isoformat()}T23:59:59Z"
+
+        # Catalog lookup prevents treating a syntactically valid but empty
+        # Process API request as successful. Process API remains authoritative.
+        catalog = requests.post(
+            "https://sh.dataspace.copernicus.eu/catalog/v1/search",
+            headers=headers,
+            json={"bbox": [west, south, east, north], "datetime": time_range,
+                  "collections": ["sentinel-1-grd"], "limit": 100},
+            timeout=45,
+        )
+        if not catalog.ok:
+            app.logger.warning("Sentinel-1 Catalog API returned HTTP %s", catalog.status_code)
+            return jsonify({"error": "Sentinel-1 availability search failed. Check the date range and try again."}), 502
+        features = (catalog.json() or {}).get("features") or []
+        if not features:
+            return jsonify({"error": "No Sentinel-1 GRD acquisitions cover this AOI and date range."}), 422
+        dual_features = []
+        for feature in features:
+            props = feature.get("properties") or {}
+            polarization = props.get("s1:polarization") or props.get("sar:polarizations") or props.get("polarization")
+            if polarization is None:
+                dual_features.append(feature)  # The Process API DV filter performs the final check.
+            elif isinstance(polarization, str) and polarization.upper() in {"DV", "VV+VH", "VH+VV"}:
+                dual_features.append(feature)
+            elif isinstance(polarization, (list, tuple)) and {str(v).upper() for v in polarization} >= {"VV", "VH"}:
+                dual_features.append(feature)
+        if not dual_features:
+            return jsonify({"error": "Scenes were found, but none report the required dual VV+VH (DV) polarization for this AOI and date range."}), 422
+
+        evalscript = """//VERSION=3
+function setup() {
+  return {
+    input: [{bands: [\"VV\", \"VH\", \"dataMask\"], units: [\"LINEAR_POWER\", \"LINEAR_POWER\", \"DN\"]}],
+    mosaicking: Mosaicking.ORBIT,
+    output: {id: \"default\", bands: 2, sampleType: \"FLOAT32\", nodataValue: -9999}
+  };
+}
+function preProcessScenes(collections) {
+  collections.scenes.orbits.sort(function(a, b) {
+    return new Date(b.dateFrom).getTime() - new Date(a.dateFrom).getTime();
+  });
+  return collections;
+}
+function evaluatePixel(samples) {
+  for (var i = 0; i < samples.length; i++) {
+    if (samples[i].dataMask === 1) return [samples[i].VV, samples[i].VH];
+  }
+  return [-9999, -9999];
+}
+function updateOutputMetadata(scenes, inputMetadata, outputMetadata) {
+  outputMetadata.userData = {orbits: scenes.orbits};
+}
+"""
+        process_payload = {
+            "input": {
+                "bounds": {
+                    "bbox": list(source_bounds),
+                    "properties": {"crs": f"http://www.opengis.net/def/crs/EPSG/0/{epsg}"},
+                },
+                "data": [{
+                    "type": "sentinel-1-grd",
+                    "dataFilter": {
+                        "timeRange": {"from": f"{start.isoformat()}T00:00:00Z", "to": f"{end.isoformat()}T23:59:59Z"},
+                        "acquisitionMode": "IW", "polarization": "DV",
+                        "resolution": "HIGH", "mosaickingOrder": "mostRecent",
+                    },
+                    "processing": {"backCoeff": "GAMMA0_ELLIPSOID", "orthorectify": True},
+                }],
+            },
+            "output": {
+                "width": target["width"], "height": target["height"],
+                "responses": [
+                    {"identifier": "default", "format": {"type": "image/tiff"}},
+                    {"identifier": "userdata", "format": {"type": "application/json"}},
+                ],
+            },
+            "evalscript": evalscript,
+        }
+        process = requests.post(
+            "https://sh.dataspace.copernicus.eu/process/v1",
+            headers={**headers, "Accept": "application/tar"},
+            json=process_payload, timeout=180,
+        )
+        if not process.ok:
+            app.logger.warning("Sentinel-1 Process API returned HTTP %s", process.status_code)
+            return jsonify({"error": "Sentinel Hub could not create a VV/VH GeoTIFF for this AOI and date range. Try a smaller AOI or a shorter date range."}), 422 if process.status_code in (400, 404, 422) else 502
+
+        with tarfile.open(fileobj=io.BytesIO(process.content), mode="r:*") as archive:
+            tiff_member = next((member for member in archive.getmembers() if member.isfile() and member.name.lower().endswith((".tif", ".tiff"))), None)
+            metadata_member = next((member for member in archive.getmembers() if member.isfile() and member.name.rsplit("/", 1)[-1] == "userdata.json"), None)
+            if tiff_member is None:
+                raise ValueError("Sentinel Hub returned no GeoTIFF for the selected AOI and dates.")
+            tiff_bytes = archive.extractfile(tiff_member).read()
+            scene_metadata = json.load(archive.extractfile(metadata_member)) if metadata_member else {}
+
+        with MemoryFile(tiff_bytes) as memory_file, memory_file.open() as source:
+            if source.count != 2:
+                raise ValueError(f"Sentinel Hub returned {source.count} bands; exactly VV and VH are required.")
+            downloaded = source.read().astype(np.float32)
+            downloaded_valid = np.all(source.read_masks() > 0, axis=0) & np.all(np.isfinite(downloaded), axis=0) & np.all(downloaded != -9999, axis=0)
+            if not downloaded_valid.any():
+                return jsonify({"error": "Sentinel-1 catalog items exist, but the Process API returned no valid VV/VH pixels. Try another date range or AOI."}), 422
+            aligned = np.full((2, target["height"], target["width"]), -9999.0, dtype=np.float32)
+            for band in range(2):
+                reproject(
+                    source=downloaded[band], destination=aligned[band],
+                    src_transform=source.transform, src_crs=source.crs,
+                    src_nodata=-9999, dst_transform=target["transform"],
+                    dst_crs=target["crs"], dst_nodata=-9999,
+                    resampling=Resampling.bilinear,
+                )
+            output_valid = np.all(np.isfinite(aligned), axis=0) & np.all(aligned != -9999, axis=0)
+            if not output_valid.any():
+                return jsonify({"error": "The downloaded VV/VH data do not overlap the Sentinel-2 reference grid."}), 422
+            profile = target["profile"]
+            profile.update(driver="GTiff", count=2, dtype="float32", nodata=-9999, compress="deflate")
+            output = io.BytesIO()
+            with MemoryFile() as aligned_file:
+                with aligned_file.open(**profile) as destination:
+                    destination.write(aligned)
+                    destination.set_band_description(1, "VV")
+                    destination.set_band_description(2, "VH")
+                    destination.update_tags(
+                        source="Sentinel Hub Process API", collection="sentinel-1-grd",
+                        polarization="DV", band_order="VV,VH",
+                        backscatter_coefficient="GAMMA0_ELLIPSOID",
+                        units="LINEAR_POWER (unitless)",
+                        sentinel1_calibration_status="UNVERIFIED_FOR_KAGGLE_V2",
+                        training_ranges="checkpoints/kaggle_amazon/normalization.json",
+                        acquisition_window=time_range,
+                        catalog_item_count=str(len(dual_features)),
+                    )
+                output.write(aligned_file.read())
+            output.seek(0)
+
+        orbit_dates = []
+        for orbit in (scene_metadata.get("orbits") or []):
+            for tile in orbit.get("tiles") or []:
+                date_value = tile.get("date")
+                if date_value and date_value not in orbit_dates:
+                    orbit_dates.append(date_value)
+        app.logger.info("Retrieved Sentinel-1 VV/VH on S2 grid; catalog items=%d, valid pixels=%d", len(dual_features), int(output_valid.sum()))
+        response = send_file(output, mimetype="image/tiff", as_attachment=True, download_name="sentinel1_VV_VH_GAMMA0_ELLIPSOID.tif")
+        response.headers["X-Sentinel1-Metadata"] = json.dumps({
+            "bands": ["VV", "VH"], "backscatter_coefficient": "GAMMA0_ELLIPSOID",
+            "units": "LINEAR_POWER (unitless)", "polarization": "DV",
+            "acquisition_window": time_range, "acquisition_dates": orbit_dates,
+            "catalog_item_count": len(dual_features), "valid_pixels": int(output_valid.sum()),
+            "width": target["width"], "height": target["height"], "crs": target["crs"].to_string(),
+            "aligned_to_sentinel2": True, "calibration_compatible_with_kaggle_v2": False,
+            "calibration_note": "The V2 training rasters contain no recorded backscatter coefficient or units. The saved training ranges include negative values, unlike Sentinel Hub LINEAR_POWER; do not run this file through V2 inference until the training source calibration is verified.",
+        })
+        return response
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (tarfile.TarError, rasterio.errors.RasterioError, OSError, KeyError, StopIteration) as exc:
+        app.logger.exception("Sentinel-1 Process API result validation failed")
+        return jsonify({"error": f"Could not validate the Sentinel-1 GeoTIFF response: {exc}"}), 502
+    except requests.RequestException as exc:
+        app.logger.warning("Sentinel-1 service request failed: %s", exc.__class__.__name__)
+        return jsonify({"error": "Sentinel-1 service is temporarily unreachable. Please retry shortly."}), 502
+    except Exception as exc:
+        app.logger.exception("Sentinel-1 retrieval failed")
+        return jsonify({"error": f"Sentinel-1 retrieval failed: {exc}"}), 500
+
+
 @app.route("/api/predict/kaggle-amazon", methods=["POST"])
 def predict_kaggle_amazon():
     """Infer with the separate dual-stream model on aligned S1/S2 GeoTIFFs."""
@@ -2043,6 +2262,12 @@ def predict_kaggle_amazon():
                     raise ValueError("Input rasters cannot be empty.")
 
                 # Resolve and validate bands based on metadata and physics
+                if s1_src.tags().get("sentinel1_calibration_status") == "UNVERIFIED_FOR_KAGGLE_V2":
+                    raise ValueError(
+                        "This retrieved Sentinel-1 file is not calibrated to the V2 training data. "
+                        "The download is GAMMA0_ELLIPSOID LINEAR_POWER, but the original V2 training rasters do not record their coefficient/units and their saved ranges do not match linear power. "
+                        "Use a Sentinel-1 file processed with the verified training configuration before running inference."
+                    )
                 s1_raw, s1_valid, s1_info = resolve_sentinel1_bands(s1_src)
                 s2_raw, s2_valid, s2_info = resolve_sentinel2_bands(s2_src)
                 app.logger.info("Kaggle Amazon S1: %s", s1_info)

@@ -1138,6 +1138,9 @@ export default function InteractiveMap({
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
+  // Let users continue from drawing an AOI without leaving the GIS map.
+  const showAcquisitionWorkflow = workspace === 'acquisition' || (workspace === 'map' && Boolean(aoiBounds));
+
   return (
     <div className={`map-stage ${drawerOpen ? '' : 'is-drawer-collapsed'}`}>
 
@@ -1167,26 +1170,6 @@ export default function InteractiveMap({
 
         <span className="divider-v" />
 
-        {!isDrawing ? (
-          <>
-            <button type="button" className="btn btn--sm btn--ghost" onClick={startDrawing}>
-              <Square size={12} /> Draw AOI
-            </button>
-            <button
-              type="button"
-              className="btn btn--sm btn--ghost"
-              onClick={loadAmazonPreset}
-              title="Amazon deforestation hotspot (-3.465°, -62.215°)"
-            >
-              <MapPin size={12} /> Amazon
-            </button>
-          </>
-        ) : (
-          <button type="button" className="btn btn--sm btn--danger" onClick={cancelDrawing}>
-            <X size={12} /> Cancel
-          </button>
-        )}
-
         {aoiBounds && !isDrawing && (
           <>
             <button type="button" className="icon-btn" onClick={fitToAoi} title="Fit map to AOI">
@@ -1215,7 +1198,7 @@ export default function InteractiveMap({
       <aside className={`drawer ${drawerOpen ? '' : 'is-collapsed'}`} aria-hidden={!drawerOpen}>
         <div className="drawer__head">
           <div className="drawer__title">
-            <Satellite size={14} color="var(--cyan-bright)" /> {workspace === 'acquisition' ? 'Area & imagery' : 'Map controls'}
+            <Satellite size={14} color="var(--cyan-bright)" /> {showAcquisitionWorkflow ? 'Acquisition workflow' : 'Map controls'}
           </div>
           <button
             type="button"
@@ -1229,7 +1212,6 @@ export default function InteractiveMap({
 
         <div className="drawer__body">
 
-          {/* ── Area of Interest ─────────────────────────────── */}
           <div className="block">
             <div className="block__head">
               <div className="block__title">
@@ -1237,23 +1219,26 @@ export default function InteractiveMap({
               </div>
               {aoiBounds && <span className="badge badge--amber">AOI set</span>}
             </div>
-
-            {isDrawing ? (
-              <div className="note note--warn">
-                <Info size={12} />
-                <span>Click and drag on the map to draw your AOI rectangle.</span>
-              </div>
-            ) : (
+            {!isDrawing ? (
               <div className="row" style={{ gap: 6 }}>
                 <button type="button" className="btn btn--sm btn--ghost" style={{ flex: 1 }} onClick={startDrawing}>
-                  <Square size={12} /> Draw
+                  <Square size={12} /> Draw AOI
                 </button>
-                <button type="button" className="btn btn--sm btn--ghost" style={{ flex: 1 }} onClick={loadAmazonPreset}>
+                <button
+                  type="button"
+                  className="btn btn--sm btn--ghost"
+                  style={{ flex: 1 }}
+                  onClick={loadAmazonPreset}
+                  title="Amazon deforestation hotspot (-3.465°, -62.215°)"
+                >
                   <MapPin size={12} /> Amazon
                 </button>
               </div>
+            ) : (
+              <button type="button" className="btn btn--sm btn--danger" style={{ width: '100%' }} onClick={cancelDrawing}>
+                <X size={12} /> Cancel drawing
+              </button>
             )}
-
             {aoiBounds && !isDrawing && (() => {
               const [w, s, e, n] = bboxFromLatLngBounds(aoiBounds);
               return (
@@ -1262,15 +1247,9 @@ export default function InteractiveMap({
                 </div>
               );
             })()}
-
-            {!aoiBounds && !isDrawing && (
-              <div className="block__hint" style={{ marginTop: 7 }}>
-                Draw a rectangle or load the Amazon preset to begin.
-              </div>
-            )}
           </div>
 
-          {workspace === 'acquisition' && <>
+          {showAcquisitionWorkflow && <>
           {/* ── Sentinel-2 search ────────────────────────────── */}
           <div className="block">
             <div className="block__head">
@@ -1330,12 +1309,6 @@ export default function InteractiveMap({
               )}
             </button>
 
-            {!aoiBounds && (
-              <div className="block__hint" style={{ marginTop: 7, textAlign: 'center' }}>
-                Draw an AOI first to search imagery.
-              </div>
-            )}
-
             {searchError && (
               <div className="note note--error" style={{ marginTop: 8 }}>
                 <AlertTriangle size={11} />
@@ -1346,13 +1319,13 @@ export default function InteractiveMap({
             {acquisitions.length > 0 && (
               <div className="block__hint" style={{ marginTop: 8 }}>
                 <strong style={{ color: 'var(--emerald-bright)' }}>{acquisitions.length}</strong> acquisition
-                {acquisitions.length !== 1 ? 's' : ''} found — select FROM / TO on the timeline below.
+                {acquisitions.length !== 1 ? 's' : ''} found.
               </div>
             )}
           </div>
 
           {/* ── Before / After workflow ──────────────────────── */}
-          <div className="block">
+          {acquisitions.length > 0 && <div className="block">
             <div className="block__head">
               <div className="block__title">
                 <GitCompare size={14} color="var(--emerald-bright)" /> Before / After
@@ -1365,7 +1338,7 @@ export default function InteractiveMap({
             </div>
 
             <p className="block__hint" style={{ marginBottom: 9 }}>
-              Pick a <strong>FROM</strong> and a <strong>TO</strong> acquisition for independent forest segmentation and post-classification comparison.
+              Select one T1 and one T2 scene from the timeline.
             </p>
 
             <div className="tile-pair">
@@ -1426,7 +1399,7 @@ export default function InteractiveMap({
                     </div>
                   </>
                 ) : (
-                  <div className="block__hint">Click “Set FROM” in the timeline</div>
+                  <div className="block__hint">No date selected</div>
                 )}
               </div>
 
@@ -1487,7 +1460,7 @@ export default function InteractiveMap({
                     </div>
                   </>
                 ) : (
-                  <div className="block__hint">Click “Set TO” in the timeline</div>
+                  <div className="block__hint">No date selected</div>
                 )}
               </div>
             </div>
@@ -1639,43 +1612,23 @@ export default function InteractiveMap({
                 )}
 
                 <div className="block__hint" style={{ marginTop: 7, fontSize: 10 }}>
-                  Super-resolution increases display pixel density; it does not create true 2.5 m measurements.
+                  4× upscaling improves display detail, not source resolution.
                 </div>
               </>
             )}
 
             {/* Primary CTA */}
-            <button
+            {fromData && toData && <button
               type="button"
               className={`btn btn--primary btn--block btn--cta ${canAnalyze ? '' : 'btn--ghost'}`}
               style={{ marginTop: 11 }}
               disabled={!canAnalyze || analysing}
               onClick={runAnalysis}
             >
-              {analysing ? (
-                <>
-                  <span className="btn__spinner" /> Analysing Forest Change…
-                </>
-              ) : (
-                <>
-                  <Activity size={16} /> Run Deforestation Analysis
-                </>
-              )}
-            </button>
+              {analysing ? <><span className="btn__spinner" /> Analysing Forest Change…</> : <><Activity size={16} /> Run Deforestation Analysis</>}
+            </button>}
 
             {/* Validation hints */}
-            {!aoiBounds && (
-              <div className="block__hint" style={{ marginTop: 6, textAlign: 'center' }}>
-                Draw an AOI on the map to begin.
-              </div>
-            )}
-            {aoiBounds && (!fromData || !toData) && (
-              <div className="block__hint" style={{ marginTop: 6, textAlign: 'center' }}>
-                {!fromData && !toData && 'Select both FROM and TO dates from the timeline.'}
-                {fromData && !toData && 'Now select a TO date from the timeline.'}
-                {!fromData && toData && 'Now select a FROM date from the timeline.'}
-              </div>
-            )}
             {((fromData?.acq?.id && toData?.acq?.id && fromData.acq.id === toData.acq.id) ||
               (fromIdx !== null && toIdx !== null && fromIdx === toIdx)) && (
               <div className="note note--warn" style={{ marginTop: 7 }}>
@@ -1697,17 +1650,15 @@ export default function InteractiveMap({
                 <span>{analysisError}</span>
               </div>
             )}
-          </div>
+          </div>}
 
           </>}
 
-          {/* Legend */}
-          <div className="block">
-            <div className="block__head" style={{ marginBottom: 8 }}>
-              <div className="block__title">
-                <Layers size={13} color="var(--text-dim)" /> Layer legend
-              </div>
-            </div>
+          {/* Keep the legend available without taking space from the workflow. */}
+          <details className="block map-layer-legend">
+            <summary className="block__title">
+              <Layers size={13} color="var(--text-dim)" /> Layer legend
+            </summary>
             <div className="legend" style={{ background: 'transparent', border: 'none', padding: 0, gap: 9 }}>
               {[
                 { color: '#F59E0B', label: 'AOI boundary' },
@@ -1721,7 +1672,7 @@ export default function InteractiveMap({
                 </div>
               ))}
             </div>
-          </div>
+          </details>
 
         </div>
       </aside>
@@ -1874,7 +1825,7 @@ export default function InteractiveMap({
       )}
 
       {/* ─── Timeline dock ──────────────────────────────────────── */}
-      {workspace === 'acquisition' && acquisitions.length > 0 && (
+      {showAcquisitionWorkflow && acquisitions.length > 0 && (
         <div className="timeline-dock">
           <div className="timeline-dock__head">
             <div className="row">
