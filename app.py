@@ -50,11 +50,13 @@ if str(src_dir) not in sys.path:
 
 from model import UNet, CHECKPOINT_PATH
 from metrics import THRESHOLD
-<<<<<<< HEAD
 from temporal_inference import predict_temporal_forest_masks
-=======
 from experiments.kaggle_amazon_deforestation.model import LateFusionSegNet
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
+from experiments.kaggle_amazon_deforestation.dataset import (
+    resolve_sentinel1_bands,
+    resolve_sentinel2_bands,
+    align_sentinel_pair,
+)
 
 app = Flask(__name__)
 CORS(app)
