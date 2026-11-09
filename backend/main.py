@@ -14,6 +14,12 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.model import UNet
 from src.temporal_model import TemporalUNet
+from backend.sentinel_service import (
+    geodesic_area_hectares,
+    parse_bbox,
+    predict_directional_deforestation,
+    rgba_mask_to_data_uri,
+)
 
 # --------------------------------------------------
 # Configuration
@@ -78,51 +84,48 @@ checkpoint = torch.load(
     weights_only=True,
 )
 
-model = UNet(
+forest_model = UNet(
     in_channels=3,
     out_channels=1,
     init_features=32
 ).to(DEVICE)
 
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
+forest_model.load_state_dict(checkpoint["model_state_dict"])
+forest_model.eval()
 
-print("Stage 1 U-Net model loaded successfully.")
-
+print("Stage 1 forest U-Net model loaded successfully.")
 
 print("Loading Stage 2 Temporal U-Net model...")
 if not TEMPORAL_CHECKPOINT_PATH.exists():
     raise FileNotFoundError(
-        f"Model checkpoint not found: {TEMPORAL_CHECKPOINT_PATH}"
+        f"Temporal model checkpoint not found: {TEMPORAL_CHECKPOINT_PATH}"
     )
 
 temporal_checkpoint = torch.load(
     TEMPORAL_CHECKPOINT_PATH,
     map_location=DEVICE,
-    weights_only=True
+    weights_only=True,
 )
-
-raw_state_dict = temporal_checkpoint.get("model_state_dict", temporal_checkpoint)
-temporal_state_dict = {}
-for k, v in raw_state_dict.items():
-    for i in range(1, 5):
-        if k.startswith(f"cu{i}."):
-            k = k.replace(f"cu{i}.", f"conv_up{i}.")
+temporal_state_dict = temporal_checkpoint.get(
+    "model_state_dict", temporal_checkpoint
+)
+compatible_state_dict = {}
+for key, value in temporal_state_dict.items():
+    for index in range(1, 5):
+        if key.startswith(f"cu{index}."):
+            key = key.replace(f"cu{index}.", f"conv_up{index}.", 1)
             break
-    temporal_state_dict[k] = v
-
-temporal_in_channels = temporal_state_dict["inc.block.0.weight"].shape[1]
+    compatible_state_dict[key] = value
 
 temporal_model = TemporalUNet(
-    in_channels=temporal_in_channels,
+    in_channels=9,
     out_channels=1,
-    init_features=32
+    init_features=32,
 ).to(DEVICE)
-
-temporal_model.load_state_dict(temporal_state_dict)
+temporal_model.load_state_dict(compatible_state_dict)
 temporal_model.eval()
+print("Stage 2 Temporal U-Net model loaded successfully.")
 
-print(f"Stage 2 Temporal U-Net model ({temporal_in_channels}-channel) loaded successfully.")
 
 # --------------------------------------------------
 # Image preprocessing
@@ -306,7 +309,7 @@ async def predict(
 
     with torch.no_grad():
 
-        logits = model(image_tensor)
+        logits = forest_model(image_tensor)
 
         probabilities = torch.sigmoid(logits)
 
@@ -362,7 +365,8 @@ async def predict_temporal(
     after_image: UploadFile = File(None),
     sample_path_a: str = Form(None),
     sample_path_b: str = Form(None),
-    threshold: float = Form(0.5)
+    threshold: float = Form(0.5),
+    bbox: str = Form(None),
 ):
     try:
         _validate_threshold(threshold)
@@ -406,34 +410,64 @@ async def predict_temporal(
             "error": "Images must have identical dimensions for accurate temporal comparison."
         }
 
-    # Preprocess both exactly as during training
+    if not 0.0 < threshold < 1.0:
+        return {"success": False, "error": "threshold must be between 0 and 1."}
+
+    try:
+        parsed_bbox = parse_bbox(bbox) if bbox is not None else None
+        total_area_ha = (
+            geodesic_area_hectares(parsed_bbox)
+            if parsed_bbox is not None
+            else None
+        )
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    # Normalize both dates to float32 [0, 1] before constructing model inputs.
     img_a_tensor = preprocess_image(img_a)
     img_b_tensor = preprocess_image(img_b)
+    img_a_tensor = img_a_tensor.to(dtype=torch.float32)
+    img_b_tensor = img_b_tensor.to(dtype=torch.float32)
 
-    # Concatenate according to model input channels
-    if temporal_in_channels == 9:
-        diff_tensor = torch.abs(img_a_tensor - img_b_tensor)
-        temporal_tensor = torch.cat([img_a_tensor, img_b_tensor, diff_tensor], dim=1).to(DEVICE)
-    else:
-        temporal_tensor = torch.cat([img_a_tensor, img_b_tensor], dim=1).to(DEVICE)
+    inference = predict_directional_deforestation(
+        forest_model,
+        temporal_model,
+        img_a_tensor,
+        img_b_tensor,
+        DEVICE,
+        threshold,
+    )
+    final_deforestation_mask = inference["final_mask"]
 
-    with torch.no_grad():
-        logits = temporal_model(temporal_tensor)
-        probabilities = torch.sigmoid(logits)
-        prediction = (probabilities > threshold).float()
-
-    mask = prediction[0, 0].cpu().numpy().astype(np.uint8)
-
-    changed_pixels = int(np.sum(mask == 1))
-    total_pixels = int(mask.size)
+    changed_pixels = int(np.sum(final_deforestation_mask))
+    total_pixels = int(final_deforestation_mask.size)
     deforestation_percentage = (changed_pixels / total_pixels) * 100
 
     return {
         "success": True,
         "before_image": image_to_base64(img_a),
         "after_image": image_to_base64(img_b),
-        "deforestation_mask": mask_to_base64(mask),
+        "deforestation_mask": rgba_mask_to_data_uri(final_deforestation_mask),
         "deforestation_percentage": round(deforestation_percentage, 2),
         "changed_pixels": changed_pixels,
-        "total_pixels": total_pixels
+        "total_pixels": total_pixels,
+        "total_area_ha": total_area_ha,
+        "area_loss_hectares": (
+            round((changed_pixels / total_pixels) * total_area_ha, 4)
+            if total_area_ha is not None
+            else None
+        ),
+        "area_note": (
+            None
+            if total_area_ha is not None
+            else "Pass bbox=west,south,east,north to calculate geodesic area loss."
+        ),
+        "bbox": list(parsed_bbox) if parsed_bbox is not None else None,
+        "logical_gate_pixels": inference["logical_gate_pixels"],
+        "temporal_prediction_pixels": inference["temporal_prediction_pixels"],
+        "temporal_probability_min": inference["temporal_probability_min"],
+        "temporal_probability_max": inference["temporal_probability_max"],
+        "temporal_probability_mean": inference["temporal_probability_mean"],
+        "temporal_threshold_used": inference["temporal_threshold_used"],
+        "used_logical_fallback": inference["used_logical_fallback"],
     }

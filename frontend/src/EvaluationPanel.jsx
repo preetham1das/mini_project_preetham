@@ -164,9 +164,9 @@ export default function EvaluationPanel({ analytics }) {
         <section className="eval-card">
           <div className="eval-card__head">
             <div>
-              <div className="eval-card__title">Stage 2 · Temporal Change Detection</div>
+              <div className="eval-card__title">Temporal U-Net Benchmark · Stage 2</div>
               <div className="eval-card__sub">
-                Temporal U-Net · 9-channel input · held-out test, 33 pairs · τ 0.5
+                Separate 9-channel model · held-out Forest-Change test, 33 pairs · not used for live inference
               </div>
             </div>
             <span className="badge badge--amber">
@@ -233,9 +233,9 @@ export default function EvaluationPanel({ analytics }) {
       <section className="eval-card">
         <div className="eval-card__head">
           <div>
-            <div className="eval-card__title">Why direct temporal modelling</div>
+            <div className="eval-card__title">Benchmark: direct temporal model vs. PCC</div>
             <div className="eval-card__sub">
-              Post-classification comparison (PCC) vs. the 9-channel Temporal U-Net
+              Current live inference uses PCC; these scores compare benchmark methods.
             </div>
           </div>
           <span className="badge badge--dim">Ablation</span>

@@ -14,6 +14,11 @@ if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
 try:
+    from src.temporal_inference import predict_temporal_forest_masks
+except ModuleNotFoundError:
+    from temporal_inference import predict_temporal_forest_masks
+
+try:
     from src.model import CHECKPOINT_PATH, UNet
     from src.metrics import THRESHOLD
 except ModuleNotFoundError:
@@ -44,16 +49,6 @@ def load_and_preprocess_image(image_path, target_size=TARGET_SIZE, is_label=Fals
         img_np = np.array(pil_img, dtype=np.float32) / 255.0
         img_tensor = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
         return img_tensor, img_np
-
-def predict_forest_mask(model, image_tensor, device, threshold=THRESHOLD):
-    model.eval()
-    with torch.no_grad():
-        image_tensor = image_tensor.to(device)
-        logits = model(image_tensor)
-        probs = torch.sigmoid(logits)
-        preds = (probs > threshold).float()
-        mask = preds[0, 0].cpu().numpy().astype(np.uint8)
-    return mask
 
 def calculate_metrics(pred_mask, gt_mask):
     pred = pred_mask.astype(bool)
@@ -133,11 +128,11 @@ def detect_deforestation(
     gt_change_mask = (label_np > 0).astype(np.uint8)
 
     # Predictions
-    t1_mask = predict_forest_mask(model, t1_tensor, device, threshold)
-    t2_mask = predict_forest_mask(model, t2_tensor, device, threshold)
+    t1_mask, t2_mask, forest_loss_mask = predict_temporal_forest_masks(
+        model, t1_tensor, t2_tensor, device, threshold
+    )
 
-    # Compute Temporal Maps
-    forest_loss_mask = ((t1_mask == 1) & (t2_mask == 0)).astype(np.uint8)
+    # Compute the remaining temporal classes
     forest_gain_mask = ((t1_mask == 0) & (t2_mask == 1)).astype(np.uint8)
     stable_forest_mask = ((t1_mask == 1) & (t2_mask == 1)).astype(np.uint8)
     stable_nonforest_mask = ((t1_mask == 0) & (t2_mask == 0)).astype(np.uint8)

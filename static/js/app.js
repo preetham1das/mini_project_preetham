@@ -20,8 +20,8 @@ document.addEventListener("DOMContentLoaded", () => {
             desc: "Extracting pixel-level forest canopy coverage from satellite imagery using Deep U-Net architecture."
         },
         stage2: {
-            title: "Stage 2: Temporal Deforestation Change Detection",
-            desc: "Detecting forest loss (deforestation) between T1 and T2 satellite image pairs using 6-Channel Temporal U-Net."
+            title: "Stage 2: Post-Classification Deforestation Detection",
+            desc: "Segments T1 and T2 independently; loss is forest at T1 and non-forest at T2."
         },
         swipe: {
             title: "Temporal Swipe Comparison Viewer",
@@ -368,7 +368,7 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
-    // Run Stage 2 Temporal Change Detection
+    // Run Stage 2 post-classification forest-loss detection
     const s2RunBtn = document.getElementById("stage2-run-btn");
     if (s2RunBtn) {
         s2RunBtn.addEventListener("click", () => {

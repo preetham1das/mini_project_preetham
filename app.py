@@ -49,14 +49,12 @@ if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
 from model import UNet, CHECKPOINT_PATH
-from temporal_model import TemporalUNet, TEMPORAL_CHECKPOINT_PATH
 from metrics import THRESHOLD
+<<<<<<< HEAD
+from temporal_inference import predict_temporal_forest_masks
+=======
 from experiments.kaggle_amazon_deforestation.model import LateFusionSegNet
-from experiments.kaggle_amazon_deforestation.dataset import (
-    resolve_sentinel1_bands,
-    resolve_sentinel2_bands,
-    align_sentinel_pair,
-)
+>>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
 
 app = Flask(__name__)
 CORS(app)
@@ -183,7 +181,6 @@ def get_sentinel_token():
 
 # Global variables for loaded models
 stage1_model = None
-stage2_model = None
 
 
 def estimate_pixel_area_hectares(bbox, pixel_count):
@@ -240,7 +237,7 @@ def parse_geographic_bbox(value):
 
 
 def load_models():
-    global stage1_model, stage2_model
+    global stage1_model
     
     # 1. Load Stage 1 UNet
     stage1_path = Path(CHECKPOINT_PATH)
@@ -252,26 +249,6 @@ def load_models():
         print(f"[OK] Loaded Stage 1 U-Net from {stage1_path}")
     else:
         print(f"[WARNING] Stage 1 checkpoint not found at {stage1_path}")
-
-    # 2. Load Stage 2 Temporal UNet (9 channels with key compatibility)
-    stage2_path = Path(TEMPORAL_CHECKPOINT_PATH)
-    if stage2_path.exists():
-        checkpoint = torch.load(stage2_path, map_location=DEVICE, weights_only=True)
-        state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-
-        # Remap legacy layer names (cu1 -> conv_up1, etc.)
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            nk = k.replace("cu1.", "conv_up1.").replace("cu2.", "conv_up2.").replace("cu3.", "conv_up3.").replace("cu4.", "conv_up4.")
-            new_state_dict[nk] = v
-
-        stage2_model = TemporalUNet(in_channels=9, out_channels=1, init_features=32).to(DEVICE)
-        stage2_model.load_state_dict(new_state_dict)
-        stage2_model.eval()
-        print(f"[OK] Loaded Stage 2 Temporal U-Net from {stage2_path}")
-    else:
-        print(f"[WARNING] Stage 2 checkpoint not found at {stage2_path}")
-
 
 def array_to_base64_png(np_img):
     """Converts numpy image array (RGB or RGBA) to base64 PNG data string."""
@@ -1459,7 +1436,7 @@ function evaluatePixel(sample) {
 @app.route("/api/sentinel/analyze", methods=["POST"])
 def analyze_sentinel_deforestation():
     """
-    Runs Stage-2 Temporal U-Net deforestation analysis on two Sentinel-2 images.
+    Runs post-classification deforestation analysis on two Sentinel-2 images.
 
     Accepts JSON body:
       {
@@ -1471,19 +1448,19 @@ def analyze_sentinel_deforestation():
         "threshold":    0.5    // optional, default 0.5
       }
 
-    Preprocessing matches the Stage-2 training pipeline exactly:
+    Preprocessing for both dates:
       - Convert to RGB
       - Resize to 256x256 with BILINEAR resampling
-      - Normalize [0,255] -> [0.0, 1.0]  (identical to temporal_dataset.py)
-      - Build 9-channel tensor: [T1_RGB, T2_RGB, |T1-T2|]
+      - Normalize [0,255] -> [0.0, 1.0]
+      - Predict forest masks independently, then classify T1 forest / T2 non-forest as loss
 
     Returns JSON with deforestation mask, overlay, and area metrics.
-    Includes an explicit domain-gap disclosure.
+    Includes an explicit model-domain disclosure.
     """
-    if stage2_model is None:
+    if stage1_model is None:
         return jsonify({
             "success": False,
-            "error": "Stage 2 Temporal U-Net is not loaded."
+            "error": "Stage 1 forest segmentation model is not loaded."
         }), 500
 
     # -- Parse JSON body -------------------------------------------------------
@@ -1536,30 +1513,18 @@ def analyze_sentinel_deforestation():
     if pil_before.size != pil_after.size:
         print(f"[Sentinel Analyze] Dimension variance: T1={pil_before.size}, T2={pil_after.size}. Resampling both to {TARGET_SIZE}.")
 
-    # -- Preprocessing: identical to temporal_dataset.py TemporalForestDataset -
-    # Step 1: Resize to 256x256 (BILINEAR, same as training)
+    # -- Preprocessing ----------------------------------------------------------
     pil_before_r = pil_before.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
     pil_after_r  = pil_after.resize(TARGET_SIZE,  Image.Resampling.BILINEAR)
 
-    # Step 2: Convert to float32 numpy, normalize [0,255] -> [0,1]
-    img_t1 = np.array(pil_before_r, dtype=np.float32) / 255.0   # (256,256,3)
-    img_t2 = np.array(pil_after_r,  dtype=np.float32) / 255.0   # (256,256,3)
+    img_t1 = np.array(pil_before_r, dtype=np.float32) / 255.0
+    img_t2 = np.array(pil_after_r, dtype=np.float32) / 255.0
+    t1_tensor = torch.from_numpy(img_t1).permute(2, 0, 1).unsqueeze(0)
+    t2_tensor = torch.from_numpy(img_t2).permute(2, 0, 1).unsqueeze(0)
 
-    # Step 3: Build 9-channel tensor [T1_RGB(3), T2_RGB(3), |T1-T2|(3)]
-    t1_tensor   = torch.tensor(img_t1, dtype=torch.float32).permute(2, 0, 1)  # (3,256,256)
-    t2_tensor   = torch.tensor(img_t2, dtype=torch.float32).permute(2, 0, 1)  # (3,256,256)
-    diff_tensor = torch.abs(t1_tensor - t2_tensor)                             # (3,256,256)
-
-    concat_tensor = torch.cat([t1_tensor, t2_tensor, diff_tensor], dim=0)      # (9,256,256)
-    input_tensor  = concat_tensor.unsqueeze(0).to(DEVICE)                      # (1,9,256,256)
-
-    # -- Inference -------------------------------------------------------------
-    with torch.no_grad():
-        logits = stage2_model(input_tensor)
-        probs  = torch.sigmoid(logits)
-        preds  = (probs > threshold).float()
-
-    pred_mask = preds[0, 0].cpu().numpy().astype(np.uint8)    # (256,256) binary
+    _, _, pred_mask = predict_temporal_forest_masks(
+        stage1_model, t1_tensor, t2_tensor, DEVICE, threshold
+    )
 
     # -- Metrics ---------------------------------------------------------------
     total_pixels  = int(pred_mask.size)
@@ -1626,10 +1591,10 @@ def analyze_sentinel_deforestation():
         "deforestation_overlay": overlay_b64,
         "difference_image":    diff_b64,
         "model_note": (
-            "Domain-gap disclosure: the Temporal U-Net was trained on the "
-            "Forest-Change dataset (480x480 tropical satellite imagery). "
-            "Live Sentinel-2 imagery may have different radiometric "
-            "characteristics. Results are indicative, not validated. "
+            "Post-classification comparison: the Stage 1 U-Net was trained "
+            "on the Amazon Forest Dataset, not Sentinel-2 imagery. Errors in "
+            "either per-date forest mask can affect the loss result. Results "
+            "are indicative, not validated. "
             "Do not use for regulatory or scientific decisions without "
             "independent ground-truth validation."
         )
@@ -1912,9 +1877,9 @@ def predict_stage1():
 
 @app.route("/api/predict/stage2", methods=["POST"])
 def predict_stage2():
-    """Runs Stage 2 Temporal Deforestation Detection with GIS spatial metrics."""
-    if stage2_model is None:
-        return jsonify({"error": "Stage 2 temporal model is not loaded"}), 500
+    """Runs post-classification forest-loss detection with GIS spatial metrics."""
+    if stage1_model is None:
+        return jsonify({"error": "Stage 1 forest segmentation model is not loaded"}), 500
 
     try:
         threshold = parse_probability_threshold(request.form.get("threshold"), 0.5)
@@ -1965,19 +1930,16 @@ def predict_stage2():
     img_a_np = np.array(pil_a_resized, dtype=np.float32) / 255.0
     img_b_np = np.array(pil_b_resized, dtype=np.float32) / 255.0
 
-    # 9-channel input tensor [T1_RGB (3), T2_RGB (3), |T1-T2|_RGB (3)]
+    # Segment each date independently and identify T1 forest absent at T2.
     t1_tensor = torch.tensor(img_a_np, dtype=torch.float32).permute(2, 0, 1)
     t2_tensor = torch.tensor(img_b_np, dtype=torch.float32).permute(2, 0, 1)
-    diff_tensor = torch.abs(t1_tensor - t2_tensor)
-
-    concat_tensor = torch.cat([t1_tensor, t2_tensor, diff_tensor], dim=0).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        logits = stage2_model(concat_tensor)
-        probs = torch.sigmoid(logits)
-        preds = (probs > threshold).float()
-
-    pred_defor_mask = preds[0, 0].cpu().numpy().astype(np.uint8)
+    _, _, pred_defor_mask = predict_temporal_forest_masks(
+        stage1_model,
+        t1_tensor.unsqueeze(0),
+        t2_tensor.unsqueeze(0),
+        DEVICE,
+        threshold,
+    )
 
     total_pixels = int(pred_defor_mask.size)
     defor_pixels = int(np.sum(pred_defor_mask == 1))
