@@ -414,7 +414,7 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install flask flask-cors Pillow opencv-python numpy pandas matplotlib requests timm einops
+pip install flask flask-cors Pillow opencv-python numpy pandas matplotlib requests timm einops rasterio
 ```
 
 ### 3. Install Frontend Dependencies

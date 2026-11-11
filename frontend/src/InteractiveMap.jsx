@@ -11,7 +11,7 @@
  *  - Base map switcher (Esri Satellite / OSM)
  *  - Coordinate display (mouse position)
  *  - Sentinel layer opacity slider
- *  - ML model DISCONNECTED from live Sentinel imagery (clearly labelled)
+ *  - Dual-model temporal inference over live Sentinel imagery
  */
 
 import React, {
@@ -919,14 +919,13 @@ export default function InteractiveMap({
         return;
       }
 
-      // Place deforestation overlay on map using the TO date bbox
-      if (data.deforestation_overlay && toData.bbox) {
-        const imgBounds = L.latLngBounds(
-          [toData.bbox[1], toData.bbox[0]],
-          [toData.bbox[3], toData.bbox[2]]
-        );
+      // The transparent prediction mask uses the exact AOI sent to the backend.
+      const deforestationMask = data.deforestation_mask || data.deforestation_overlay;
+      if (deforestationMask && toData.bbox) {
+        const imgBounds = L.latLngBounds([south, west], [north, east]);
         if (map) {
-          analysisLayerRef.current = L.imageOverlay(data.deforestation_overlay, imgBounds, {
+          if (analysisLayerRef.current) map.removeLayer(analysisLayerRef.current);
+          analysisLayerRef.current = L.imageOverlay(deforestationMask, imgBounds, {
             opacity: overlayOpacity, zIndex: 400,
           }).addTo(map);
         }
@@ -1733,7 +1732,7 @@ export default function InteractiveMap({
             <div className="analytics-panel__title">
               <CheckCircle2 size={14} color="var(--emerald-bright)" /> Deforestation Results
             </div>
-            <span className="badge badge--green">Post-classification</span>
+            <span className="badge badge--violet">9-Channel Temporal Model + Single-Frame Directional Gate Active</span>
           </div>
 
           <div className="analytics-panel__body">
@@ -1806,7 +1805,7 @@ export default function InteractiveMap({
               </div>
               <input
                 type="range"
-                min="0.1"
+                min="0"
                 max="1.0"
                 step="0.05"
                 value={overlayOpacity}
@@ -1865,8 +1864,8 @@ export default function InteractiveMap({
             <div className="note note--warn">
               <AlertTriangle size={11} />
               <span>
-                The Stage 1 Forest U-Net segments both dates independently. Seasonal differences, clouds, and errors
-                in either forest mask can affect the loss result.
+                Temporal predictions are restricted to T1 forest and T2 non-forest pixels. Seasonal differences,
+                clouds, and errors in either forest mask can still affect the loss result.
               </span>
             </div>
           </div>

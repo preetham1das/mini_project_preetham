@@ -11,8 +11,20 @@ from pyproj import Geod
 
 logger = logging.getLogger(__name__)
 _WGS84_GEOD = Geod(ellps="WGS84")
-LOW_PROBABILITY_CEILING = 0.20
-LOW_PROBABILITY_THRESHOLD = 0.10
+BENCHMARK_METADATA = {
+    "forest_cover_unet": {
+        "validation_iou": 0.8385551377629015,
+        "validation_dice": 0.9121892735653608,
+        "validation_split": "Amazon Forest Dataset validation",
+    },
+    "temporal_unet": {
+        "validation_iou": 0.5042657685060166,
+        "validation_dice": 0.6704477081956541,
+        "validation_dice_derived_from_iou": True,
+        "validation_epoch": 21,
+        "validation_split": "Forest-Change validation",
+    },
+}
 
 
 def parse_bbox(bbox: str) -> tuple[float, float, float, float]:
@@ -55,25 +67,48 @@ def predict_directional_deforestation(
         raise ValueError("T1 and T2 tensors must have identical shapes.")
     if image_t1.ndim != 4 or image_t1.shape[1] != 3:
         raise ValueError("T1 and T2 tensors must have shape (batch, 3, height, width).")
-    if not 0.0 < threshold < 1.0:
-        raise ValueError("threshold must be greater than 0 and less than 1.")
+    if image_t1.shape[0] != 1:
+        raise ValueError("T1 and T2 tensors must contain exactly one image pair.")
+    if image_t1.shape[2] <= 0 or image_t1.shape[3] <= 0:
+        raise ValueError("T1 and T2 tensors must have non-empty spatial dimensions.")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0 and 1.")
+
+    image_t1 = image_t1.to(dtype=torch.float32)
+    image_t2 = image_t2.to(dtype=torch.float32)
+    if not torch.isfinite(image_t1).all() or not torch.isfinite(image_t2).all():
+        raise ValueError("T1 and T2 tensors must contain only finite values.")
+    if image_t1.min() < 0 or image_t1.max() > 1 or image_t2.min() < 0 or image_t2.max() > 1:
+        raise ValueError("T1 and T2 tensors must be normalized to [0, 1].")
 
     forest_model.eval()
     temporal_model.eval()
     with torch.no_grad():
         forest_t1_probs = torch.sigmoid(forest_model(image_t1.to(device)))
         forest_t2_probs = torch.sigmoid(forest_model(image_t2.to(device)))
-        mask_t1 = forest_t1_probs[0, 0] > 0.5
-        mask_t2 = forest_t2_probs[0, 0] > 0.5
+        expected_shape = (1, 1, image_t1.shape[2], image_t1.shape[3])
+        if forest_t1_probs.shape != expected_shape or forest_t2_probs.shape != expected_shape:
+            raise RuntimeError("Forest model output must have shape (1, 1, height, width).")
+        if not torch.isfinite(forest_t1_probs).all() or not torch.isfinite(forest_t2_probs).all():
+            raise RuntimeError("Forest model produced non-finite probability values.")
+        mask_t1 = forest_t1_probs[0, 0] >= 0.5
+        mask_t2 = forest_t2_probs[0, 0] >= 0.5
         logical_loss_mask = mask_t1 & ~mask_t2
 
-        temporal_input = torch.cat(
-            [image_t1, image_t2, torch.abs(image_t1 - image_t2)], dim=1
-        ).to(device)
+        img_T1 = image_t1.detach().cpu().numpy().transpose(0, 2, 3, 1)
+        img_T2 = image_t2.detach().cpu().numpy().transpose(0, 2, 3, 1)
+        input_9ch = np.concatenate(
+            [img_T1, img_T2, np.abs(img_T1 - img_T2)], axis=-1
+        ).astype(np.float32, copy=False)
+        temporal_input = torch.from_numpy(
+            np.ascontiguousarray(input_9ch.transpose(0, 3, 1, 2))
+        ).to(device=device, dtype=torch.float32)
         temporal_probabilities = torch.sigmoid(temporal_model(temporal_input))
 
     if not torch.isfinite(temporal_probabilities).all():
         raise RuntimeError("Temporal model produced non-finite probability values.")
+    if temporal_probabilities.shape != expected_shape:
+        raise RuntimeError("Temporal model output must have shape (1, 1, height, width).")
 
     probability_min = float(temporal_probabilities.min().item())
     probability_max = float(temporal_probabilities.max().item())
@@ -85,19 +120,7 @@ def predict_directional_deforestation(
         probability_mean,
     )
 
-    effective_threshold = threshold
-    if probability_max < LOW_PROBABILITY_CEILING:
-        effective_threshold = min(threshold, LOW_PROBABILITY_THRESHOLD)
-        logger.warning(
-            "Temporal max probability %.6f is below %.2f; using threshold %.2f "
-            "instead of %.2f.",
-            probability_max,
-            LOW_PROBABILITY_CEILING,
-            effective_threshold,
-            threshold,
-        )
-
-    temporal_mask = temporal_probabilities[0, 0] > effective_threshold
+    temporal_mask = temporal_probabilities[0, 0] >= threshold
     final_mask = temporal_mask & logical_loss_mask
     used_logical_fallback = not bool(temporal_mask.any().item())
     if used_logical_fallback:
@@ -116,7 +139,7 @@ def predict_directional_deforestation(
         "temporal_probability_min": probability_min,
         "temporal_probability_max": probability_max,
         "temporal_probability_mean": probability_mean,
-        "temporal_threshold_used": effective_threshold,
+        "temporal_threshold_used": threshold,
         "used_logical_fallback": used_logical_fallback,
     }
 
@@ -124,7 +147,7 @@ def predict_directional_deforestation(
 def rgba_mask_to_data_uri(mask: np.ndarray) -> str:
     binary_mask = np.asarray(mask, dtype=bool)
     rgba = np.zeros((*binary_mask.shape, 4), dtype=np.uint8)
-    rgba[binary_mask] = (239, 68, 68, 200)
+    rgba[binary_mask] = (255, 0, 0, 180)
 
     buffer = io.BytesIO()
     Image.fromarray(rgba).save(buffer, format="PNG")

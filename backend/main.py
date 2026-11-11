@@ -1,12 +1,13 @@
 from pathlib import Path
 import io
 import base64
+import logging
 import math
 
 import numpy as np
 from PIL import Image
 import torch
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import sys
@@ -15,6 +16,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.model import UNet
 from src.temporal_model import TemporalUNet
 from backend.sentinel_service import (
+    BENCHMARK_METADATA,
     geodesic_area_hectares,
     parse_bbox,
     predict_directional_deforestation,
@@ -26,6 +28,7 @@ from backend.sentinel_service import (
 # --------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 DEVICE = torch.device("cpu")
 IMAGE_SIZE = 256
 THRESHOLD = 0.5
@@ -359,6 +362,8 @@ async def predict(
     }
 
 
+@app.post("/api/fetch-satellite-data")
+@app.post("/api/predict")
 @app.post("/predict-temporal")
 async def predict_temporal(
     before_image: UploadFile = File(None),
@@ -429,14 +434,21 @@ async def predict_temporal(
     img_a_tensor = img_a_tensor.to(dtype=torch.float32)
     img_b_tensor = img_b_tensor.to(dtype=torch.float32)
 
-    inference = predict_directional_deforestation(
-        forest_model,
-        temporal_model,
-        img_a_tensor,
-        img_b_tensor,
-        DEVICE,
-        threshold,
-    )
+    try:
+        inference = predict_directional_deforestation(
+            forest_model,
+            temporal_model,
+            img_a_tensor,
+            img_b_tensor,
+            DEVICE,
+            threshold,
+        )
+    except (RuntimeError, ValueError) as exc:
+        logger.exception("Temporal prediction failed.")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Temporal inference failed: {exc}",
+        ) from exc
     final_deforestation_mask = inference["final_mask"]
 
     changed_pixels = int(np.sum(final_deforestation_mask))
@@ -448,15 +460,23 @@ async def predict_temporal(
         "before_image": image_to_base64(img_a),
         "after_image": image_to_base64(img_b),
         "deforestation_mask": rgba_mask_to_data_uri(final_deforestation_mask),
-        "deforestation_percentage": round(deforestation_percentage, 2),
+        "deforestation_overlay": rgba_mask_to_data_uri(final_deforestation_mask),
         "changed_pixels": changed_pixels,
+        "deforestation_percentage": round(deforestation_percentage, 2),
+        "deforestation_pct": round(deforestation_percentage, 2),
         "total_pixels": total_pixels,
         "total_area_ha": total_area_ha,
+        "deforestation_hectares": (
+            round((changed_pixels / total_pixels) * total_area_ha, 4)
+            if total_area_ha is not None
+            else None
+        ),
         "area_loss_hectares": (
             round((changed_pixels / total_pixels) * total_area_ha, 4)
             if total_area_ha is not None
             else None
         ),
+        "area_estimate_method": "WGS84 geodesic bounding-box area" if total_area_ha is not None else None,
         "area_note": (
             None
             if total_area_ha is not None
@@ -470,4 +490,5 @@ async def predict_temporal(
         "temporal_probability_mean": inference["temporal_probability_mean"],
         "temporal_threshold_used": inference["temporal_threshold_used"],
         "used_logical_fallback": inference["used_logical_fallback"],
+        "benchmark_metadata": BENCHMARK_METADATA,
     }

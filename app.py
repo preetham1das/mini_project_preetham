@@ -2,6 +2,7 @@ import time
 import base64
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -50,17 +51,22 @@ if str(src_dir) not in sys.path:
 
 from model import UNet, CHECKPOINT_PATH
 from metrics import THRESHOLD
-<<<<<<< HEAD
-from temporal_inference import predict_temporal_forest_masks
-=======
+from temporal_model import TemporalUNet
+from backend.sentinel_service import (
+    BENCHMARK_METADATA,
+    geodesic_area_hectares,
+    predict_directional_deforestation,
+    rgba_mask_to_data_uri,
+)
 from experiments.kaggle_amazon_deforestation.model import LateFusionSegNet
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
 
 app = Flask(__name__)
 CORS(app)
+logger = logging.getLogger(__name__)
 
 DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
+TEMPORAL_CHECKPOINT_PATH = Path(__file__).resolve().parent / "models" / "best_temporal_model.pth"
 KAGGLE_AMAZON_CHECKPOINT = Path(__file__).resolve().parent / "checkpoints" / "kaggle_amazon" / "late_fusion_segnet_v2_corrected_best.pt"
 KAGGLE_AMAZON_NORMALIZATION = Path(__file__).resolve().parent / "checkpoints" / "kaggle_amazon" / "normalization.json"
 kaggle_amazon_model = None
@@ -181,6 +187,7 @@ def get_sentinel_token():
 
 # Global variables for loaded models
 stage1_model = None
+temporal_model = None
 
 
 def estimate_pixel_area_hectares(bbox, pixel_count):
@@ -237,7 +244,7 @@ def parse_geographic_bbox(value):
 
 
 def load_models():
-    global stage1_model
+    global stage1_model, temporal_model
     
     # 1. Load Stage 1 UNet
     stage1_path = Path(CHECKPOINT_PATH)
@@ -249,6 +256,31 @@ def load_models():
         print(f"[OK] Loaded Stage 1 U-Net from {stage1_path}")
     else:
         print(f"[WARNING] Stage 1 checkpoint not found at {stage1_path}")
+
+    if TEMPORAL_CHECKPOINT_PATH.is_file():
+        checkpoint = torch.load(
+            TEMPORAL_CHECKPOINT_PATH,
+            map_location=DEVICE,
+            weights_only=True,
+        )
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        compatible_state_dict = {}
+        for key, value in state_dict.items():
+            for index in range(1, 5):
+                if key.startswith(f"cu{index}."):
+                    key = key.replace(f"cu{index}.", f"conv_up{index}.", 1)
+                    break
+            compatible_state_dict[key] = value
+        temporal_model = TemporalUNet(
+            in_channels=9,
+            out_channels=1,
+            init_features=32,
+        ).to(DEVICE)
+        temporal_model.load_state_dict(compatible_state_dict)
+        temporal_model.eval()
+        print(f"[OK] Loaded 9-channel Temporal U-Net from {TEMPORAL_CHECKPOINT_PATH}")
+    else:
+        print(f"[WARNING] Temporal checkpoint not found at {TEMPORAL_CHECKPOINT_PATH}")
 
 def array_to_base64_png(np_img):
     """Converts numpy image array (RGB or RGBA) to base64 PNG data string."""
@@ -1433,10 +1465,11 @@ function evaluatePixel(sample) {
     })
 
 
+@app.route("/api/fetch-satellite-data", methods=["POST"])
 @app.route("/api/sentinel/analyze", methods=["POST"])
 def analyze_sentinel_deforestation():
     """
-    Runs post-classification deforestation analysis on two Sentinel-2 images.
+    Runs 9-channel temporal deforestation inference with a directional forest gate.
 
     Accepts JSON body:
       {
@@ -1452,15 +1485,17 @@ def analyze_sentinel_deforestation():
       - Convert to RGB
       - Resize to 256x256 with BILINEAR resampling
       - Normalize [0,255] -> [0.0, 1.0]
-      - Predict forest masks independently, then classify T1 forest / T2 non-forest as loss
+      - Predict per-date forest masks with the single-frame Forest U-Net
+      - Predict temporal change with the 9-channel Temporal U-Net
+      - Keep only temporal positives that are forest at T1 and non-forest at T2
 
     Returns JSON with deforestation mask, overlay, and area metrics.
     Includes an explicit model-domain disclosure.
     """
-    if stage1_model is None:
+    if stage1_model is None or temporal_model is None:
         return jsonify({
             "success": False,
-            "error": "Stage 1 forest segmentation model is not loaded."
+            "error": "Both the forest-cover and temporal models must be loaded."
         }), 500
 
     # -- Parse JSON body -------------------------------------------------------
@@ -1517,14 +1552,24 @@ def analyze_sentinel_deforestation():
     pil_before_r = pil_before.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
     pil_after_r  = pil_after.resize(TARGET_SIZE,  Image.Resampling.BILINEAR)
 
-    img_t1 = np.array(pil_before_r, dtype=np.float32) / 255.0
-    img_t2 = np.array(pil_after_r, dtype=np.float32) / 255.0
-    t1_tensor = torch.from_numpy(img_t1).permute(2, 0, 1).unsqueeze(0)
-    t2_tensor = torch.from_numpy(img_t2).permute(2, 0, 1).unsqueeze(0)
+    img_t1 = np.asarray(pil_before_r, dtype=np.float32) / np.float32(255.0)
+    img_t2 = np.asarray(pil_after_r, dtype=np.float32) / np.float32(255.0)
+    t1_tensor = torch.from_numpy(np.ascontiguousarray(img_t1.transpose(2, 0, 1))).unsqueeze(0)
+    t2_tensor = torch.from_numpy(np.ascontiguousarray(img_t2.transpose(2, 0, 1))).unsqueeze(0)
 
-    _, _, pred_mask = predict_temporal_forest_masks(
-        stage1_model, t1_tensor, t2_tensor, DEVICE, threshold
-    )
+    try:
+        inference = predict_directional_deforestation(
+            stage1_model,
+            temporal_model,
+            t1_tensor,
+            t2_tensor,
+            DEVICE,
+            threshold,
+        )
+    except (RuntimeError, ValueError) as exc:
+        logger.exception("Live Sentinel temporal inference failed.")
+        return jsonify({"success": False, "error": f"Temporal inference failed: {exc}"}), 500
+    pred_mask = inference["final_mask"]
 
     # -- Metrics ---------------------------------------------------------------
     total_pixels  = int(pred_mask.size)
@@ -1532,7 +1577,12 @@ def analyze_sentinel_deforestation():
     stable_pixels = total_pixels - defor_pixels
     defor_pct     = round((defor_pixels / total_pixels) * 100.0, 2)
     stable_pct    = round(100.0 - defor_pct, 2)
-    pixel_area_ha = estimate_pixel_area_hectares(bbox, total_pixels)
+    total_area_ha = (
+        geodesic_area_hectares(tuple(bbox))
+        if bbox is not None
+        else None
+    )
+    pixel_area_ha = total_area_ha / total_pixels if total_area_ha is not None else None
     defor_ha = round(defor_pixels * pixel_area_ha, 4) if pixel_area_ha is not None else None
     defor_sqkm = round(defor_ha / 100.0, 6) if defor_ha is not None else None
 
@@ -1554,10 +1604,7 @@ def analyze_sentinel_deforestation():
     # After image (resized)
     after_b64 = array_to_base64_png(img_t2)
 
-    # Deforestation mask (red channel)
-    mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
-    mask_rgb[pred_mask == 1] = [239, 68, 68]
-    mask_b64 = array_to_base64_png(mask_rgb)
+    mask_b64 = rgba_mask_to_data_uri(pred_mask)
 
     # Overlay: after image with red deforestation regions
     overlay_np = img_t2.copy()
@@ -1578,23 +1625,35 @@ def analyze_sentinel_deforestation():
         "threshold": threshold,
         "total_pixels":  total_pixels,
         "defor_pixels":  defor_pixels,
+        "changed_pixels": defor_pixels,
         "stable_pixels": stable_pixels,
         "deforestation_pct":  defor_pct,
+        "deforestation_percentage": defor_pct,
         "stable_pct":         stable_pct,
         "deforestation_hectares": defor_ha,
+        "area_loss_hectares": defor_ha,
         "deforestation_sqkm":     defor_sqkm,
-        "area_estimate_method": "spherical approximation from AOI bounding box" if pixel_area_ha is not None else None,
+        "total_area_ha": total_area_ha,
+        "area_estimate_method": "WGS84 geodesic area of AOI bounding box" if pixel_area_ha is not None else None,
+        "benchmark_metadata": BENCHMARK_METADATA,
         "gis": gis_bounds_obj,
         "before_image":        before_b64,
         "after_image":         after_b64,
         "deforestation_mask":  mask_b64,
         "deforestation_overlay": overlay_b64,
         "difference_image":    diff_b64,
+        "directional_gate_pixels": inference["logical_gate_pixels"],
+        "temporal_prediction_pixels": inference["temporal_prediction_pixels"],
+        "temporal_probability_min": inference["temporal_probability_min"],
+        "temporal_probability_max": inference["temporal_probability_max"],
+        "temporal_probability_mean": inference["temporal_probability_mean"],
+        "temporal_threshold_used": inference["temporal_threshold_used"],
+        "used_logical_fallback": inference["used_logical_fallback"],
         "model_note": (
-            "Post-classification comparison: the Stage 1 U-Net was trained "
-            "on the Amazon Forest Dataset, not Sentinel-2 imagery. Errors in "
-            "either per-date forest mask can affect the loss result. Results "
-            "are indicative, not validated. "
+            "The 9-channel Temporal U-Net is constrained by independent "
+            "Forest U-Net masks: only T1 forest and T2 non-forest pixels "
+            "can be classified as deforestation. Benchmark scores are static "
+            "model validation metrics, not ground truth for this Sentinel pair. "
             "Do not use for regulatory or scientific decisions without "
             "independent ground-truth validation."
         )
@@ -1876,15 +1935,28 @@ def predict_stage1():
 
 
 @app.route("/api/predict/stage2", methods=["POST"])
+@app.route("/api/predict", methods=["POST"])
 def predict_stage2():
-    """Runs post-classification forest-loss detection with GIS spatial metrics."""
-    if stage1_model is None:
-        return jsonify({"error": "Stage 1 forest segmentation model is not loaded"}), 500
+    """Runs 9-channel temporal change inference with a directional forest gate."""
+    if stage1_model is None or temporal_model is None:
+        return jsonify({"error": "Both the forest-cover and temporal models must be loaded"}), 500
 
     try:
         threshold = parse_probability_threshold(request.form.get("threshold"), 0.5)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    bbox = None
+    bbox_value = request.form.get("bbox")
+    if bbox_value:
+        try:
+            bbox_coordinates = (
+                json.loads(bbox_value)
+                if bbox_value.lstrip().startswith("[")
+                else bbox_value.split(",")
+            )
+            bbox = parse_geographic_bbox(bbox_coordinates)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return jsonify({"error": f"Invalid bbox: {exc}"}), 400
     split = request.form.get("split", "test")
     sample_id = request.form.get("sample_id")
 
@@ -1922,24 +1994,27 @@ def predict_stage2():
     else:
         return jsonify({"error": "No T1 and T2 images provided"}), 400
 
-    gis_bounds = None
-
     pil_a_resized = pil_a.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
     pil_b_resized = pil_b.resize(TARGET_SIZE, Image.Resampling.BILINEAR)
 
-    img_a_np = np.array(pil_a_resized, dtype=np.float32) / 255.0
-    img_b_np = np.array(pil_b_resized, dtype=np.float32) / 255.0
+    img_a_np = np.asarray(pil_a_resized, dtype=np.float32) / np.float32(255.0)
+    img_b_np = np.asarray(pil_b_resized, dtype=np.float32) / np.float32(255.0)
 
-    # Segment each date independently and identify T1 forest absent at T2.
-    t1_tensor = torch.tensor(img_a_np, dtype=torch.float32).permute(2, 0, 1)
-    t2_tensor = torch.tensor(img_b_np, dtype=torch.float32).permute(2, 0, 1)
-    _, _, pred_defor_mask = predict_temporal_forest_masks(
-        stage1_model,
-        t1_tensor.unsqueeze(0),
-        t2_tensor.unsqueeze(0),
-        DEVICE,
-        threshold,
-    )
+    t1_tensor = torch.from_numpy(np.ascontiguousarray(img_a_np.transpose(2, 0, 1))).unsqueeze(0)
+    t2_tensor = torch.from_numpy(np.ascontiguousarray(img_b_np.transpose(2, 0, 1))).unsqueeze(0)
+    try:
+        inference = predict_directional_deforestation(
+            stage1_model,
+            temporal_model,
+            t1_tensor,
+            t2_tensor,
+            DEVICE,
+            threshold,
+        )
+    except (RuntimeError, ValueError) as exc:
+        logger.exception("Stage 2 temporal inference failed.")
+        return jsonify({"error": f"Temporal inference failed: {exc}"}), 500
+    pred_defor_mask = inference["final_mask"]
 
     total_pixels = int(pred_defor_mask.size)
     defor_pixels = int(np.sum(pred_defor_mask == 1))
@@ -1947,15 +2022,34 @@ def predict_stage2():
     stable_pixels = total_pixels - defor_pixels
     stable_pct = round(100.0 - defor_pct, 2)
 
-    defor_hectares = None
-    defor_sqkm = None
+    total_area_ha = (
+        geodesic_area_hectares(tuple(bbox))
+        if bbox is not None
+        else None
+    )
+    pixel_area_ha = total_area_ha / total_pixels if total_area_ha is not None else None
+    defor_hectares = (
+        round(defor_pixels * pixel_area_ha, 4)
+        if pixel_area_ha is not None
+        else None
+    )
+    defor_sqkm = round(defor_hectares / 100.0, 6) if defor_hectares is not None else None
+    gis_bounds = None
+    if bbox is not None:
+        west, south, east, north = bbox
+        gis_bounds = {
+            "bounds": [[south, west], [north, east]],
+            "center": [(south + north) / 2, (west + east) / 2],
+            "west": west,
+            "east": east,
+            "south": south,
+            "north": north,
+        }
 
     t1_b64 = array_to_base64_png(img_a_np)
     t2_b64 = array_to_base64_png(img_b_np)
 
-    defor_mask_rgb = np.zeros((*TARGET_SIZE, 3), dtype=np.uint8)
-    defor_mask_rgb[pred_defor_mask == 1] = [239, 68, 68]
-    defor_mask_b64 = array_to_base64_png(defor_mask_rgb)
+    defor_mask_b64 = rgba_mask_to_data_uri(pred_defor_mask)
 
     overlay_rgb = img_b_np.copy()
     red_tint = np.array([0.937, 0.267, 0.267], dtype=np.float32)
@@ -1992,14 +2086,25 @@ def predict_stage2():
         }
 
     return jsonify({
+        "success": True,
         "pair_name": pair_name,
         "threshold": threshold,
         "total_pixels": total_pixels,
+        "changed_pixels": defor_pixels,
         "deforestation_pixels": defor_pixels,
         "deforestation_pct": defor_pct,
+        "deforestation_percentage": defor_pct,
         "deforestation_hectares": defor_hectares,
+        "area_loss_hectares": defor_hectares,
         "deforestation_sqkm": defor_sqkm,
-        "area_estimate_method": None,
+        "total_area_ha": total_area_ha,
+        "area_estimate_method": "WGS84 geodesic area of AOI bounding box" if pixel_area_ha is not None else None,
+        "area_note": (
+            None
+            if total_area_ha is not None
+            else "Pass bbox=[west,south,east,north] to calculate geodesic area loss."
+        ),
+        "bbox": bbox,
         "stable_pixels": stable_pixels,
         "stable_pct": stable_pct,
         "gis": gis_bounds,
@@ -2008,7 +2113,15 @@ def predict_stage2():
         "deforestation_mask": defor_mask_b64,
         "deforestation_overlay": overlay_b64,
         "gt_mask": gt_b64,
-        "metrics": metrics
+        "metrics": metrics,
+        "directional_gate_pixels": inference["logical_gate_pixels"],
+        "temporal_prediction_pixels": inference["temporal_prediction_pixels"],
+        "temporal_probability_min": inference["temporal_probability_min"],
+        "temporal_probability_max": inference["temporal_probability_max"],
+        "temporal_probability_mean": inference["temporal_probability_mean"],
+        "temporal_threshold_used": inference["temporal_threshold_used"],
+        "used_logical_fallback": inference["used_logical_fallback"],
+        "benchmark_metadata": BENCHMARK_METADATA,
     })
 
 
