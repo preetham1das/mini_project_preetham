@@ -1,0 +1,36 @@
+{
+  "available": true,
+  "experiment": "late_fusion_segnet_v2_corrected",
+  "source": "User-provided Colab experiment report, generated 2026-11-08T13:52:08.214449+00:00",
+  "model": "Dual-stream Sentinel-1/Sentinel-2 late-fusion SegNet",
+  "threshold": 0.5,
+  "best_validation": {
+    "epoch": 5,
+    "iou": 0.860067,
+    "dice_f1": 0.924770,
+    "precision": 0.924421,
+    "recall": 0.925119,
+    "accuracy": 0.930719
+  },
+  "held_out_test": {
+    "iou": 0.848883,
+    "dice_f1": 0.918266,
+    "precision": 0.921625,
+    "recall": 0.914932,
+    "accuracy": 0.931066,
+    "confusion_matrix": [[17250270, 1044521], [1142012, 12282620]],
+    "confusion_matrix_order": "[[TN, FP], [FN, TP]]"
+  },
+  "training": {
+    "gpu": "Tesla T4",
+    "batch_size": 2,
+    "mixed_precision": true,
+    "epochs_completed": 13
+  },
+  "label_mapping": {
+    "0": "NoData / ignored",
+    "1": "deforestation / positive",
+    "2": "non-deforestation / negative"
+  },
+  "audit_note": "These are recorded Colab research metrics, separate from predictions on uploaded rasters. The supplied report's train patch count (2,904 across 9 tiles) does not reconcile with the stated 2,816x2,816 tile dimensions and non-overlapping 256x256 patching; independently verify the saved patch index before treating these metrics as final research claims."
+}

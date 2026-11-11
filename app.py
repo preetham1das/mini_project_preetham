@@ -59,6 +59,12 @@ from backend.sentinel_service import (
     rgba_mask_to_data_uri,
 )
 from experiments.kaggle_amazon_deforestation.model import LateFusionSegNet
+from temporal_inference import predict_temporal_forest_masks
+from experiments.kaggle_amazon_deforestation.dataset import (
+    resolve_sentinel1_bands,
+    resolve_sentinel2_bands,
+    align_sentinel_pair,
+)
 
 app = Flask(__name__)
 CORS(app)
@@ -2150,41 +2156,25 @@ def predict_kaggle_amazon():
                 upload.save(str(temp_paths[-1]))
 
             with rasterio.open(temp_paths[0]) as s1_src, rasterio.open(temp_paths[1]) as s2_src:
-                # --- Relaxed validation: tolerate minor geotransform differences ---
-                if s1_src.count != 2:
-                    raise ValueError(f"Sentinel-1 raster must have exactly 2 bands; got {s1_src.count}.")
-                if s2_src.count != 4:
-                    raise ValueError(f"Sentinel-2 raster must have exactly 4 bands; got {s2_src.count}.")
-                if s1_src.width < 1 or s1_src.height < 1:
-                    raise ValueError("Input rasters are empty.")
+                if s1_src.width < 1 or s1_src.height < 1 or s2_src.width < 1 or s2_src.height < 1:
+                    raise ValueError("Input rasters cannot be empty.")
 
-                s1 = s1_src.read().astype(np.float32)
-                # Resample S2 to match S1 dimensions if they differ
-                if (s2_src.width, s2_src.height) != (s1_src.width, s1_src.height):
-                    import rasterio.warp as _warp
-                    s2_resampled = np.zeros((s2_src.count, s1_src.height, s1_src.width), dtype=np.float32)
-                    _warp.reproject(
-                        source=s2_src.read().astype(np.float32),
-                        destination=s2_resampled,
-                        src_transform=s2_src.transform,
-                        src_crs=s2_src.crs or s1_src.crs,
-                        dst_transform=s1_src.transform,
-                        dst_crs=s1_src.crs or s2_src.crs,
-                        resampling=_warp.Resampling.bilinear,
-                    )
-                    s2 = s2_resampled
-                    app.logger.info(
-                        "Resampled S2 from (%d,%d) to match S1 (%d,%d)",
-                        s2_src.width, s2_src.height, s1_src.width, s1_src.height
-                    )
-                else:
-                    s2 = s2_src.read().astype(np.float32)
-                valid = np.all(s1_src.read_masks() > 0, axis=0)
-                # s2_src.read_masks() may have different dims if resampled; use pixel validity instead
-                valid &= np.all(np.isfinite(s1), axis=0) & np.all(np.isfinite(s2), axis=0)
+                # Resolve and validate bands based on metadata and physics
+                s1_raw, s1_valid, s1_info = resolve_sentinel1_bands(s1_src)
+                s2_raw, s2_valid, s2_info = resolve_sentinel2_bands(s2_src)
+                app.logger.info("Kaggle Amazon S1: %s", s1_info)
+                app.logger.info("Kaggle Amazon S2: %s", s2_info)
+
+                # Validate geospatial coverage and align rasters
+                s1, s2, valid, was_resampled, align_note = align_sentinel_pair(
+                    s1_src, s2_src, s1_raw, s2_raw, s1_valid, s2_valid
+                )
+                app.logger.info("Kaggle Amazon Alignment: %s", align_note)
+
                 if not valid.any():
-                    raise ValueError("The rasters contain no mutually valid pixels.")
+                    raise ValueError("The rasters contain no mutually valid pixels in the overlapping area.")
 
+                # Train-only robust normalization (1st and 99th percentiles)
                 s1 = np.clip((s1 - low1) / np.maximum(high1 - low1, 1e-6), 0.0, 1.0)
                 s2 = np.clip((s2 - low2) / np.maximum(high2 - low2, 1e-6), 0.0, 1.0)
                 s1[:, ~valid] = 0.0
@@ -2218,8 +2208,7 @@ def predict_kaggle_amazon():
                         if len(windows) == batch_size:
                             run_window_batch()
                 run_window_batch()
-                # 0=predicted stable/background, 1=predicted deforestation,
-                # 255=NoData. Preserve the invalid-pixel distinction in output.
+                # 0=predicted non-deforestation, 1=predicted deforestation, 255=NoData
                 prediction[~valid] = 255
 
                 valid_pixels = int(valid.sum())
@@ -2234,10 +2223,11 @@ def predict_kaggle_amazon():
                 prediction_dir = Path(__file__).resolve().parent / "outputs" / "kaggle_amazon" / "predictions"
                 prediction_dir.mkdir(parents=True, exist_ok=True)
                 prediction_path = prediction_dir / f"{prediction_id}_deforestation_mask.tif"
-                result_profile = s2_src.profile.copy()
+                result_profile = s1_src.profile.copy()
                 result_profile.update(
                     driver="GTiff", count=1, dtype="uint8", nodata=255,
                     compress="deflate", photometric="MINISBLACK",
+                    width=width, height=height, crs=s1_src.crs, transform=s1_src.transform
                 )
                 with rasterio.open(prediction_path, "w", **result_profile) as result_dst:
                     result_dst.write(prediction, 1)
@@ -2246,9 +2236,9 @@ def predict_kaggle_amazon():
                         threshold=str(threshold),
                         class_0="predicted non-deforestation",
                         class_1="predicted deforestation",
-                        nodata_255="invalid input pixel",
+                        nodata_255="invalid or NoData pixel",
                     )
-                    result_dst.update_tags(**s2_src.tags())
+                    result_dst.update_tags(**s1_src.tags())
 
                 west, south, east, north = transform_bounds(
                     s1_src.crs, "EPSG:4326", *s1_src.bounds, densify_pts=21
@@ -2257,12 +2247,15 @@ def predict_kaggle_amazon():
                 # Build a bounded preview response to avoid sending full rasters as JSON.
                 scale = min(1.0, 1024.0 / max(height, width))
                 out_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-                display = np.moveaxis(s2[:3], 0, -1)
+
+                # RGB natural color preview: Sentinel-2 Band 3 (Red), Band 2 (Green), Band 1 (Blue)
+                display = np.moveaxis(s2[[2, 1, 0]], 0, -1)
                 rgb = np.zeros_like(display, dtype=np.uint8)
                 for channel in range(3):
                     values = display[..., channel][valid]
-                    lo, hi = np.percentile(values, (2, 98))
-                    rgb[..., channel] = (np.clip((display[..., channel] - lo) / max(float(hi - lo), 1e-6), 0, 1) * 255).astype(np.uint8)
+                    if values.size > 0:
+                        lo, hi = np.percentile(values, (2, 98))
+                        rgb[..., channel] = (np.clip((display[..., channel] - lo) / max(float(hi - lo), 1e-6), 0, 1) * 255).astype(np.uint8)
                 image_pil = Image.fromarray(rgb).resize(out_size, Image.Resampling.BILINEAR)
                 display_mask = np.where(prediction == 1, 255, 0).astype(np.uint8)
                 mask_pil = Image.fromarray(display_mask).resize(out_size, Image.Resampling.NEAREST)
@@ -2284,6 +2277,10 @@ def predict_kaggle_amazon():
                     "deforestation_pct": round(percent, 4),
                     "deforestation_hectares": round(hectares, 4) if hectares is not None else None,
                     "area_estimate_method": "GeoTIFF affine pixel area and projected CRS units" if hectares is not None else None,
+                    "s1_info": s1_info,
+                    "s2_info": s2_info,
+                    "alignment_note": align_note,
+                    "was_resampled": was_resampled,
                     "gis": {"bounds": [[south, west], [north, east]]},
                     "download_url": f"/api/predict/kaggle-amazon/{prediction_id}/download",
                     "preview_image": array_to_base64_png(np.asarray(image_pil)),
