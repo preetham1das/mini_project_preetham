@@ -21,12 +21,30 @@ import {
   Cpu as CpuIcon,
   Search,
   ArrowUpRight,
+  Sun,
+  Moon,
+  Info,
 } from 'lucide-react';
 import InteractiveMap from './InteractiveMap.jsx';
 import EvaluationPanel from './EvaluationPanel.jsx';
+import {
+  getDetectionMethodPresentation,
+  getDetectionWarnings,
+  getForestChangeSignalPresentation,
+} from './stage2Presentation.js';
 
 export default function App() {
   const [view, setView] = useState(() => window.location.hash.replace(/^#\/?/, '') || 'dashboard');
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('forestwatch-theme') || 'light'; }
+    catch { return 'light'; }
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem('forestwatch-theme', theme); }
+    catch { /* Theme remains active for this session when storage is unavailable. */ }
+  }, [theme]);
 
   const [loading, setLoading] = useState(false);
   const [backendStatus, setBackendStatus] = useState('connecting');
@@ -57,6 +75,7 @@ export default function App() {
   // Separate Kaggle Amazon multimodal experiment (Sentinel-1 + Sentinel-2).
   const [kaggleS1File, setKaggleS1File] = useState(null);
   const [kaggleS2File, setKaggleS2File] = useState(null);
+  const [kaggleS1RetrievedMeta, setKaggleS1RetrievedMeta] = useState(null);
   const [kaggleThreshold, setKaggleThreshold] = useState(0.5);
   const [kaggleResults, setKaggleResults] = useState(null);
 
@@ -149,10 +168,12 @@ export default function App() {
       stable_pct: data.stable_pct ?? (100 - deforestationPct),
       t1_image: data.before_image ?? data.t1_image,
       t2_image: data.after_image ?? data.t2_image,
+      acquisition_before: data.acquisition_before,
+      acquisition_after: data.acquisition_after,
       live_source: true,
     });
     setGisMode('stage2');
-    setAiOverlayData({ image: data.deforestation_mask || data.deforestation_overlay, gis: data.gis, mode: 'stage2', metrics: data });
+    setAiOverlayData({ image: data.forest_change_overlay || data.forest_change_mask || data.deforestation_overlay || data.deforestation_mask, gis: data.gis, mode: 'stage2', metrics: data });
     if (shouldRecord) {
       recordAnalysis({
         type: 'Change detection',
@@ -199,6 +220,7 @@ export default function App() {
         setGisMode('stage1');
         setAiOverlayData({ image: data.overlay_image, gis: data.gis, mode: 'stage1', metrics: data });
         recordAnalysis({ type: 'Forest analysis', region: data.sample_name || s1File?.name || 'Uploaded image', date: new Date().toISOString().slice(0, 10), forestHa: data.forest_hectares, forestPct: data.forest_pct, forestPixels: data.forest_pixels, totalPixels: data.total_pixels, areaMethod: data.area_estimate_method });
+        navigate('analytics');
       })
       .catch((err) => {
         clearTimeout(timeoutId);
@@ -256,7 +278,7 @@ export default function App() {
         }
         setS2Results(data);
         setGisMode('stage2');
-        setAiOverlayData({ image: data.deforestation_mask || data.deforestation_overlay, gis: data.gis, mode: 'stage2', metrics: data });
+        setAiOverlayData({ image: data.forest_change_overlay || data.forest_change_mask || data.deforestation_overlay || data.deforestation_mask, gis: data.gis, mode: 'stage2', metrics: data });
         recordAnalysis({ type: 'Change detection', region: data.pair_name || 'Uploaded image pair', date: new Date().toISOString().slice(0, 10), lossHa: data.area_loss_hectares ?? data.deforestation_hectares, lossPct: data.deforestation_pct ?? data.deforestation_percentage, lossPixels: data.changed_pixels ?? data.deforestation_pixels, areaMethod: data.area_estimate_method });
       })
       .catch((err) => {
@@ -306,6 +328,25 @@ export default function App() {
     }
   };
 
+  const handleRetrieveKaggleSentinel1 = async (startDate, endDate) => {
+    if (!kaggleS2File) throw new Error('Upload the Sentinel-2 GeoTIFF first; its footprint defines the AOI and output grid.');
+    const formData = new FormData();
+    formData.append('sentinel2', kaggleS2File);
+    formData.append('start_date', startDate);
+    formData.append('end_date', endDate);
+    const response = await fetch('/api/kaggle-amazon/sentinel1', { method: 'POST', body: formData });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `Sentinel-1 retrieval failed (${response.status})`);
+    }
+    const blob = await response.blob();
+    const metadata = JSON.parse(response.headers.get('X-Sentinel1-Metadata') || '{}');
+    const outputFile = new File([blob], 'sentinel1_VV_VH_GAMMA0_ELLIPSOID.tif', { type: 'image/tiff' });
+    setKaggleS1File(outputFile);
+    setKaggleS1RetrievedMeta(metadata);
+    return { metadata, file: outputFile };
+  };
+
   /* Re-run Stage 2 inference on currently loaded live Sentinel-2 images */
   const handleRunLiveStage2 = async (threshold = s2Threshold, shouldRecord = true) => {
     const beforeImg = s2Results?.before_image || s2Results?.t1_image;
@@ -328,7 +369,7 @@ export default function App() {
     const timeoutId = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, 35000);
+    }, 180000);
     setLoading(true);
     try {
       const response = await fetch('/api/sentinel/analyze', {
@@ -340,6 +381,9 @@ export default function App() {
           image_after: afterImg,
           date_before: dateBefore,
           date_after: dateAfter,
+          acquisition_before: s2Results?.acquisition_before,
+          acquisition_after: s2Results?.acquisition_after,
+          detection_method: s2Results?.detection_method || 'temporal',
           bbox,
           threshold,
         }),
@@ -353,7 +397,7 @@ export default function App() {
       }
     } catch (error) {
       if (controller.signal.aborted) {
-        if (timedOut) alert('Live analysis timed out after 35 seconds. Please try again.');
+        if (timedOut) alert('Live analysis timed out after 3 minutes. Please try again.');
       } else {
         alert('Failed to connect to backend: ' + error.message);
       }
@@ -408,9 +452,9 @@ export default function App() {
           image: swipeData.t2_image,
         },
         {
-          label: 'Predicted forest loss',
-          description: 'Red pixels show forest loss predicted between T1 and T2.',
-          image: swipeData.deforestation_overlay,
+          label: 'Forest change',
+          description: 'Red pixels show predicted canopy loss; unchanged pixels remain transparent.',
+          image: swipeData.forest_change_overlay || swipeData.forest_change_mask || swipeData.deforestation_overlay,
         },
       ]
     : [];
@@ -455,15 +499,28 @@ export default function App() {
       <div className="fw-main">
         <header className="fw-topbar">
           <div><span className="fw-breadcrumb">ForestWatch /</span> <strong>{page.label}</strong></div>
-          <div className="fw-topbar__status"><span className={`fw-status-dot ${backendStatus}`} />{backendStatus === 'online' ? 'Services operational' : backendStatus === 'offline' ? 'API unavailable' : 'Checking services'}</div>
+          <div className="fw-topbar__actions">
+            <div className="fw-topbar__status"><span className={`fw-status-dot ${backendStatus}`} />{backendStatus === 'online' ? 'Services operational' : backendStatus === 'offline' ? 'API unavailable' : 'Checking services'}</div>
+            <button
+              className="fw-theme-toggle"
+              type="button"
+              onClick={() => setTheme((current) => current === 'light' ? 'dark' : 'light')}
+              aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
+              title={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
+            >
+              {theme === 'light' ? <Moon size={15} /> : <Sun size={15} />}
+              <span>{theme === 'light' ? 'Dark mode' : 'Light mode'}</span>
+            </button>
+          </div>
         </header>
 
         <main className={`app-main fw-content ${isMapPage ? 'fw-content--map' : ''}`}>
         {isMapPage ? (
           <div className="fw-map-page">
             <div className="fw-page-heading fw-page-heading--map">
-              <div><span className="fw-eyebrow">{view === 'acquisition' ? 'IMAGERY WORKSPACE' : 'GEOSPATIAL WORKSPACE'}</span><h1>{view === 'acquisition' ? 'Satellite Acquisition' : 'Interactive GIS Map'}</h1><p>{view === 'acquisition' ? 'Define an area, search Sentinel-2 scenes, inspect previews and select a date pair for analysis.' : 'Explore satellite basemaps, define regions and review forest change overlays.'}</p></div>
-              {view === 'acquisition' && <button className="btn btn--primary" onClick={() => navigate('change')}><GitCompare size={14} /> Open Change Detection</button>}
+              <div>
+                {view === 'acquisition' ? <><span className="fw-eyebrow">IMAGERY WORKSPACE</span><h1>Satellite Acquisition</h1><p>Search Sentinel-2 imagery and compare two dates.</p></> : <h1>Interactive GIS Map</h1>}
+              </div>
             </div>
             <InteractiveMap
               workspace={view}
@@ -477,7 +534,7 @@ export default function App() {
             />
           </div>
         ) : view === 'forest' ? (
-          <PageFrame className="fw-page--forest" title="Forest Analysis" description="Run Forest U-Net canopy segmentation on a sample tile or uploaded image.">
+          <PageFrame className="fw-page--forest" title="Forest Analysis" description="Estimate forest canopy from a single satellite image.">
             <Stage1View
                   samples={samples}
                   s1Sample={s1Sample}
@@ -486,19 +543,12 @@ export default function App() {
                   setS1File={setS1File}
                   s1Threshold={s1Threshold}
                   setS1Threshold={setS1Threshold}
-                  s1Results={s1Results}
                   loading={loading}
                   onRun={handleRunStage1}
                 />
-            <OverlaySettings
-              overlay={aiOverlayData}
-              opacity={gisOpacity}
-              onOpacityChange={setGisOpacity}
-              onViewMap={() => navigate('map')}
-            />
           </PageFrame>
         ) : view === 'change' ? (
-          <PageFrame className="fw-page--change" title="Change Detection" description="Compare aligned T1 and T2 forest masks; loss is forest at T1 and non-forest at T2.">
+          <PageFrame className="fw-page--change" title="Change Detection" description="Compare two dates to identify directional forest-cover change.">
             <Stage2View
                   samples={samples}
                   sentinelStatus={sentinelStatus}
@@ -519,20 +569,16 @@ export default function App() {
                     navigate(s2Results?.live_source ? 'map' : 'acquisition');
                   }}
                 />
-            <OverlaySettings
-              overlay={aiOverlayData}
-              opacity={gisOpacity}
-              onOpacityChange={setGisOpacity}
-              onViewMap={() => navigate('map')}
-            />
           </PageFrame>
         ) : view === 'kaggle-amazon' ? (
           <PageFrame className="fw-page--kaggle" title="Kaggle Amazon Experiment" description="Separate Sentinel-1 SAR + Sentinel-2 optical SegNet. These inputs are sensor modalities, not a temporal before/after pair.">
             <KaggleAmazonView
               sentinel1File={kaggleS1File} setSentinel1File={setKaggleS1File}
+              sentinel1RetrievedMeta={kaggleS1RetrievedMeta} setSentinel1RetrievedMeta={setKaggleS1RetrievedMeta}
               sentinel2File={kaggleS2File} setSentinel2File={setKaggleS2File}
               threshold={kaggleThreshold} setThreshold={setKaggleThreshold}
               results={kaggleResults} loading={loading} onRun={handleRunKaggleAmazon}
+              onRetrieveSentinel1={handleRetrieveKaggleSentinel1}
               onViewMap={() => navigate('map')}
             />
           </PageFrame>
@@ -555,8 +601,17 @@ export default function App() {
             </HistoryView>
           </PageFrame>
         ) : view === 'analytics' ? (
-          <PageFrame title="Analytics & Reports" description="Explore recorded analysis results and export the data available in this browser.">
-            <AnalyticsView history={analysisHistory} analytics={analytics} />
+          <PageFrame title="Analytics & Reports" description="View the latest model outputs and review saved analyses.">
+            <AnalyticsView
+              history={analysisHistory}
+              analytics={analytics}
+              s1Results={s1Results}
+              s2Results={s2Results}
+              overlay={aiOverlayData}
+              overlayOpacity={gisOpacity}
+              onOverlayOpacityChange={setGisOpacity}
+              onViewMap={() => navigate('map')}
+            />
           </PageFrame>
         ) : view === 'benchmarks' ? (
           <PageFrame title="Model Benchmarks" description="Evaluation results from the recorded benchmark datasets. Live scene results are shown separately from these scores.">
@@ -671,7 +726,7 @@ function TrendChart({ records, metric = 'lossHa', unit = 'ha' }) {
   return <div className="fw-chart" role="img" aria-label={unit === '%' ? 'Forest cover percentage by analysis' : 'Forest loss hectares by analysis'}><div className="fw-chart__bars">{records.map((record, index) => <div className="fw-chart__col" key={record.id || index}><span>{Number(record[metric]).toLocaleString()} {unit}</span><i style={{ height: `${Math.max(6, Number(record[metric]) / max * 100)}%` }} /><small>{record.date || 'Analysis'}</small></div>)}</div></div>;
 }
 
-function AnalyticsView({ history, analytics }) {
+function AnalyticsView({ history, analytics, s1Results, s2Results, overlay, overlayOpacity, onOverlayOpacityChange, onViewMap }) {
   const lossRecords = history.filter((item) => item.lossPct != null && Number.isFinite(Number(item.lossPct)));
   const exportCsv = () => {
     const rows = [['Analysis date', 'Type', 'Region', 'Forest loss (ha estimate)', 'Forest loss (%)', 'Forest loss (pixels)', 'Forest cover (ha estimate)', 'Forest cover (%)', 'Forest cover (pixels)', 'Total pixels', 'Area estimate method'], ...history.map((item) => [item.date || '', item.type || '', item.region || '', item.areaMethod ? item.lossHa ?? '' : '', item.lossPct ?? '', item.lossPixels ?? '', item.areaMethod ? item.forestHa ?? '' : '', item.forestPct ?? '', item.forestPixels ?? '', item.totalPixels ?? '', item.areaMethod || ''])];
@@ -681,7 +736,20 @@ function AnalyticsView({ history, analytics }) {
   };
   const benchmarkSources = analytics?.stage1 && analytics?.stage2 ? '2 models' : analytics?.stage1 ? 'Forest U-Net' : analytics?.stage2 ? 'Temporal U-Net' : 'Unavailable';
   const forestRecords = history.filter((item) => Number.isFinite(Number(item.forestPct)));
-  return <div className="fw-reports"><section className="fw-card"><div className="fw-section-head"><div><h2>Analysis report</h2><p>Export pixel metrics and any AOI-based area estimates recorded in this browser.</p></div><button className="btn btn--ghost" onClick={exportCsv} disabled={!history.length}>Download CSV</button></div><div className="fw-report-kpis"><div><span>Saved analyses</span><strong>{history.length}</strong></div><div><span>Change analyses</span><strong>{history.filter((item) => item.type === 'Change detection').length}</strong></div><div><span>Loss percentage records</span><strong>{lossRecords.length}</strong></div><div><span>Benchmark sources</span><strong>{benchmarkSources}</strong></div></div></section><section className="fw-card"><div className="fw-section-head"><div><h2>Forest loss by analysis</h2><p>Percentage of analyzed pixels classified as loss</p></div></div><TrendChart metric="lossPct" unit="%" records={lossRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Canopy cover by analysis</h2><p>Coverage reported by Forest U-Net runs</p></div></div><TrendChart metric="forestPct" unit="%" records={forestRecords.slice(0, 12).reverse()} /></section><section className="fw-card"><div className="fw-section-head"><div><h2>Analysis records</h2><p>Pixel counts and any AOI-based area estimates</p></div></div><HistoryTable history={history} /></section></div>;
+  return (
+    <div className="fw-reports">
+      {s1Results && <LatestForestResults results={s1Results} />}
+      {s2Results && <LatestChangeResults results={s2Results} />}
+      {overlay && <OverlaySettings overlay={overlay} opacity={overlayOpacity} onOpacityChange={onOverlayOpacityChange} onViewMap={onViewMap} />}
+      <section className="fw-card">
+        <div className="fw-section-head"><div><h2>Analysis report</h2><p>Export pixel metrics and any AOI-based area estimates recorded in this browser.</p></div><button className="btn btn--ghost" onClick={exportCsv} disabled={!history.length}>Download CSV</button></div>
+        <div className="fw-report-kpis"><div><span>Saved analyses</span><strong>{history.length}</strong></div><div><span>Change analyses</span><strong>{history.filter((item) => item.type === 'Change detection' || item.type === 'Amazon multimodal inference').length}</strong></div><div><span>Loss percentage records</span><strong>{lossRecords.length}</strong></div><div><span>Benchmark sources</span><strong>{benchmarkSources}</strong></div></div>
+      </section>
+      <section className="fw-card"><div className="fw-section-head"><div><h2>Forest loss by analysis</h2><p>Percentage of analyzed pixels classified as loss</p></div></div><TrendChart metric="lossPct" unit="%" records={lossRecords.slice(0, 12).reverse()} /></section>
+      <section className="fw-card"><div className="fw-section-head"><div><h2>Canopy cover by analysis</h2><p>Coverage reported by Forest U-Net runs</p></div></div><TrendChart metric="forestPct" unit="%" records={forestRecords.slice(0, 12).reverse()} /></section>
+      <section className="fw-card"><div className="fw-section-head"><div><h2>Analysis records</h2><p>Pixel counts and any AOI-based area estimates</p></div></div><HistoryTable history={history} /></section>
+    </div>
+  );
 }
 
 function HistoryView({ history, children }) {
@@ -697,10 +765,21 @@ function HistoryTable({ history }) {
    Manual workbench views
    ══════════════════════════════════════════════════════════════ */
 
-function KaggleAmazonView({ sentinel1File, setSentinel1File, sentinel2File, setSentinel2File,
-  threshold, setThreshold, results, loading, onRun, onViewMap }) {
+function KaggleAmazonView({ sentinel1File, setSentinel1File, sentinel1RetrievedMeta, setSentinel1RetrievedMeta,
+  sentinel2File, setSentinel2File, threshold, setThreshold, results, loading,
+  onRun, onRetrieveSentinel1, onViewMap }) {
   const [researchMetrics, setResearchMetrics] = useState(null);
   const [researchMetricsError, setResearchMetricsError] = useState('');
+  const [dateRange, setDateRange] = useState(() => {
+    const end = new Date();
+    const start = new Date(end); start.setDate(start.getDate() - 30);
+    return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+  });
+  const [retrieving, setRetrieving] = useState(false);
+  const [retrieveError, setRetrieveError] = useState('');
+  const [sentinel1DownloadUrl, setSentinel1DownloadUrl] = useState('');
+
+  useEffect(() => () => { if (sentinel1DownloadUrl) URL.revokeObjectURL(sentinel1DownloadUrl); }, [sentinel1DownloadUrl]);
 
   useEffect(() => {
     fetch('/api/kaggle-amazon/research-metrics')
@@ -711,6 +790,19 @@ function KaggleAmazonView({ sentinel1File, setSentinel1File, sentinel2File, setS
       .then(setResearchMetrics)
       .catch((error) => setResearchMetricsError(error.message));
   }, []);
+
+  const retrieveSentinel1 = async () => {
+    setRetrieving(true); setRetrieveError('');
+    try {
+      const { metadata, file } = await onRetrieveSentinel1(dateRange.start, dateRange.end);
+      setSentinel1DownloadUrl((old) => { if (old) URL.revokeObjectURL(old); return URL.createObjectURL(file); });
+      if (!metadata?.calibration_compatible_with_kaggle_v2) setRetrieveError('Retrieved successfully. The V2 training files do not record the Sentinel-1 backscatter coefficient or units, and their saved ranges do not match linear power. This file is available to download, but inference is disabled until calibration is verified.');
+    } catch (error) {
+      setRetrieveError(error.message || 'Sentinel-1 retrieval failed.');
+    } finally {
+      setRetrieving(false);
+    }
+  };
 
   return (
     <>
@@ -761,13 +853,13 @@ function KaggleAmazonView({ sentinel1File, setSentinel1File, sentinel2File, setS
         </div>
         <div className="control-grid">
           <label className={`upload-zone ${sentinel1File ? 'has-file' : ''}`}>
-            <input type="file" accept=".tif,.tiff,image/tiff" onChange={(event) => setSentinel1File(event.target.files?.[0] || null)} />
+            <input type="file" accept=".tif,.tiff,image/tiff" onChange={(event) => { setSentinel1File(event.target.files?.[0] || null); setSentinel1RetrievedMeta(null); setRetrieveError(''); }} />
             <Upload size={17} />
             <span className="upload-zone__label">{sentinel1File?.name || 'Upload Sentinel-1 GeoTIFF'}</span>
             <span className="upload-zone__hint">2 bands · same grid as Sentinel-2</span>
           </label>
           <label className={`upload-zone ${sentinel2File ? 'has-file' : ''}`}>
-            <input type="file" accept=".tif,.tiff,image/tiff" onChange={(event) => setSentinel2File(event.target.files?.[0] || null)} />
+            <input type="file" accept=".tif,.tiff,image/tiff" onChange={(event) => { const nextFile = event.target.files?.[0] || null; setSentinel2File(nextFile); if (sentinel1RetrievedMeta) { setSentinel1File(null); setSentinel1RetrievedMeta(null); setSentinel1DownloadUrl(''); } }} />
             <Upload size={17} />
             <span className="upload-zone__label">{sentinel2File?.name || 'Upload Sentinel-2 GeoTIFF'}</span>
             <span className="upload-zone__hint">4 bands · same grid as Sentinel-1</span>
@@ -776,10 +868,31 @@ function KaggleAmazonView({ sentinel1File, setSentinel1File, sentinel2File, setS
             <div className="slider-row"><span>Deforestation threshold</span><span className="slider-value">{threshold.toFixed(2)}</span></div>
             <input type="range" min="0.1" max="0.9" step="0.05" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} aria-label="Kaggle model threshold" />
           </div>
-          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading || !sentinel1File || !sentinel2File}>
+          <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading || !sentinel1File || !sentinel2File || sentinel1RetrievedMeta?.calibration_compatible_with_kaggle_v2 === false}>
             {loading ? <span className="btn__spinner" /> : <Play size={14} />}
             Run Kaggle model
           </button>
+        </div>
+        <div className="kaggle-retrieve">
+          <div className="kaggle-retrieve__copy">
+            <strong><Radar size={14} /> Retrieve Sentinel-1 VV + VH</strong>
+            <span>Uses the uploaded Sentinel-2 GeoTIFF footprint and grid as the AOI/reference.</span>
+          </div>
+          <div className="kaggle-retrieve__fields">
+            <label>From<input type="date" value={dateRange.start} max={dateRange.end} onChange={(event) => setDateRange((current) => ({ ...current, start: event.target.value }))} /></label>
+            <label>To<input type="date" value={dateRange.end} min={dateRange.start} onChange={(event) => setDateRange((current) => ({ ...current, end: event.target.value }))} /></label>
+            <button type="button" className="btn btn--ghost" onClick={retrieveSentinel1} disabled={retrieving || !sentinel2File || !dateRange.start || !dateRange.end}>
+              {retrieving ? <span className="btn__spinner" /> : <RefreshCw size={14} />}
+              {retrieving ? 'Retrieving…' : 'Find and download VV/VH'}
+            </button>
+          </div>
+          {sentinel1RetrievedMeta && <div className="kaggle-retrieve__meta">{sentinel1RetrievedMeta.width} × {sentinel1RetrievedMeta.height} · {sentinel1RetrievedMeta.crs} · {sentinel1RetrievedMeta.catalog_item_count} matching catalogue item(s) · aligned to Sentinel-2</div>}
+          {sentinel1RetrievedMeta?.acquisition_dates?.length > 0 && <div className="kaggle-retrieve__meta">Acquisition dates: {sentinel1RetrievedMeta.acquisition_dates.map((date) => new Date(date).toLocaleDateString()).join(', ')}</div>}
+          {sentinel1RetrievedMeta && sentinel1DownloadUrl && <a className="btn btn--ghost kaggle-retrieve__download" href={sentinel1DownloadUrl} download="sentinel1_VV_VH_GAMMA0_ELLIPSOID.tif">Download numeric VV/VH GeoTIFF</a>}
+          {retrieveError && <div className={sentinel1RetrievedMeta ? 'kaggle-calibration-warning' : 'kaggle-retrieve__error'}>{retrieveError}</div>}
+        </div>
+        <div className="kaggle-calibration-warning">
+          The V2 checkpoint was trained on raw Kaggle raster values with saved train-only ranges. That source does not identify its Sentinel-1 coefficient or units. Sentinel Hub returns calibrated linear-power data, so retrieved files are kept out of model inference until the training calibration can be confirmed.
         </div>
       </section>
       {results && (
@@ -815,7 +928,6 @@ function Stage1View({
   setS1File,
   s1Threshold,
   setS1Threshold,
-  s1Results,
   loading,
   onRun,
 }) {
@@ -855,7 +967,7 @@ function Stage1View({
             </div>
             <button type="button" className="btn btn--primary" onClick={onRun} disabled={loading || (!s1Sample && !s1File)}>
               {loading ? <span className="btn__spinner" /> : <Play size={14} />}
-              Run segmentation
+              Run forest analysis
             </button>
           </div>
 
@@ -894,44 +1006,6 @@ function Stage1View({
         </div>
       </section>
 
-      {s1Results && (
-        <>
-          <div className="stat-grid fw-forest-results" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
-            <div className="stat stat--green">
-              <span className="stat__label">
-                <Trees size={11} /> Forest canopy
-              </span>
-              <div className="stat__value">
-                {s1Results.forest_pct}
-                <span className="stat__unit">%</span>
-              </div>
-              <div className="stat__sub">{s1Results.forest_pixels.toLocaleString()} pixels classified as canopy</div>
-            </div>
-            <div className="stat stat--neutral">
-              <span className="stat__label">Non-forest</span>
-              <div className="stat__value">
-                {s1Results.non_forest_pct}
-                <span className="stat__unit">%</span>
-              </div>
-              <div className="stat__sub">{s1Results.non_forest_pixels.toLocaleString()} pixels</div>
-            </div>
-            <div className="stat stat--cyan">
-              <span className="stat__label">Image pixels</span>
-              <div className="stat__value">
-                {s1Results.total_pixels.toLocaleString()}
-                <span className="stat__unit">px</span>
-              </div>
-              <div className="stat__sub">Physical area unavailable without georeferencing</div>
-            </div>
-          </div>
-
-          <div className="visual-grid fw-forest-visuals">
-            <VisualCard title="Original RGB" src={s1Results.original_image} alt="Original satellite image" />
-            <VisualCard title="Binary mask" src={s1Results.mask_image} alt="Predicted forest mask" />
-            <VisualCard title="Canopy overlay" src={s1Results.overlay_image} alt="Forest overlay" />
-          </div>
-        </>
-      )}
     </>
   );
 }
@@ -957,6 +1031,7 @@ function Stage2View({
   const [stage2Mode, setStage2Mode] = useState(
     s2Results?.live_source ? 'live' : (s2FileT1 || s2FileT2 ? 'upload' : s2Sample ? 'sample' : 'live')
   );
+  const resultMethod = getDetectionMethodPresentation(s2Results);
 
   useEffect(() => () => clearTimeout(liveThresholdTimerRef.current), []);
 
@@ -967,11 +1042,11 @@ function Stage2View({
           <div>
             <div className="panel__title">Bi-Temporal Deforestation Detection</div>
             <div className="block__hint">
-              Runs the 9-channel Temporal U-Net and constrains detections to forest at T1 and non-forest at T2.
+              {s2Results ? resultMethod.description : 'Run an analysis to see which model produced its result.'}
             </div>
           </div>
           <span className="badge badge--violet">
-            <Layers size={11} /> 9-Channel Temporal Model + Single-Frame Directional Gate Active
+            <Layers size={11} /> {s2Results ? resultMethod.label : resultMethod.shortLabel}
           </span>
         </div>
 
@@ -1030,7 +1105,7 @@ function Stage2View({
                 <div className="note note--ok">
                   <Satellite size={13} />
                   <span>
-                    <strong>Active Live Pair:</strong> {s2Results.pair_name || 'Sentinel-2 Scene'} · Dual-model inference active
+                    <strong>Active Live Pair:</strong> {s2Results.pair_name || 'Sentinel-2 Scene'} · {resultMethod.shortLabel}
                   </span>
                 </div>
 
@@ -1083,7 +1158,7 @@ function Stage2View({
                 <div className="note note--info">
                   <Satellite size={13} />
                   <span>
-                    Select an Area of Interest (AOI) rectangle on the GIS Map and choose two Sentinel-2 historical acquisition dates across 2018–2026. The Temporal U-Net prediction is constrained by per-date Forest U-Net masks to keep only T1 forest that is non-forest at T2.
+                    Choose an AOI and two dates on the GIS Map. Loss is T1 forest that is not forest at T2.
                   </span>
                 </div>
 
@@ -1216,75 +1291,127 @@ function Stage2View({
           </div>
         )}
       </section>
-
-      {s2Results && (
-        <>
-          {s2Results.live_source && (
-            <div className="note note--info">
-              <Satellite size={13} />
-              <span>
-                {s2Results.pair_name} · live Sentinel-2 imagery analysed by the temporal model and directional forest gate.
-                Live scenes have no ground-truth mask; benchmark metrics do not measure this result.
-              </span>
-            </div>
-          )}
-
-          <div className="stat-grid fw-change-results" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
-            <div className="stat stat--red">
-              <span className="stat__label">Forest loss</span>
-              <div className="stat__value">
-                {s2Results.deforestation_hectares != null ? s2Results.deforestation_hectares : Number(s2Results.deforestation_pixels ?? s2Results.defor_pixels ?? 0).toLocaleString()}
-                <span className="stat__unit">{s2Results.deforestation_hectares != null ? 'ha*' : 'px'}</span>
-              </div>
-              <div className="stat__sub">{s2Results.deforestation_pct ?? 0}% of analyzed pixels classified as loss{s2Results.area_estimate_method ? ' · AOI estimate' : ''}</div>
-            </div>
-            <div className="stat stat--neutral">
-              <span className="stat__label">Stable land</span>
-              <div className="stat__value">
-                {s2Results.stable_pct ?? 0}
-                <span className="stat__unit">%</span>
-              </div>
-              <div className="stat__sub">{(s2Results.stable_pixels ?? 0).toLocaleString()} pixels</div>
-            </div>
-            {s2Results.metrics && (
-              <div className="stat stat--green">
-                <span className="stat__label">
-                  <Activity size={11} /> Sample IoU / Dice
-                </span>
-                <div className="stat__value">
-                  {s2Results.metrics.sample_iou} / {s2Results.metrics.sample_dice}
-                </div>
-                <div className="stat__sub">Ground truth {Number(s2Results.metrics.gt_defor_pixels).toLocaleString()} pixels</div>
-              </div>
-            )}
-          </div>
-
-          {s2Results.benchmark_metadata && (
-            <div className="note note--info">
-              <Cpu size={13} />
-              <span>
-                Static validation benchmarks — Forest U-Net IoU/Dice: {s2Results.benchmark_metadata.forest_cover_unet.validation_iou.toFixed(3)} / {s2Results.benchmark_metadata.forest_cover_unet.validation_dice.toFixed(3)}; Temporal U-Net IoU/Dice: {s2Results.benchmark_metadata.temporal_unet.validation_iou.toFixed(3)} / {s2Results.benchmark_metadata.temporal_unet.validation_dice.toFixed(3)}. These are model benchmarks, not scene-level scores.
-              </span>
-            </div>
-          )}
-
-          <div className="visual-grid fw-change-visuals" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
-            <VisualCard title="T1 · Before" src={s2Results.t1_image || s2Results.before_image} alt="Before image" />
-            <VisualCard title="T2 · After" src={s2Results.t2_image || s2Results.after_image} alt="After image" />
-            <VisualCard title="Change mask" src={s2Results.deforestation_mask} alt="Deforestation mask" />
-            <VisualCard title="Loss overlay" src={s2Results.deforestation_overlay} alt="Deforestation overlay" />
-          </div>
-
-          {s2Results.model_note && (
-            <div className="note note--warn">
-              <Cpu size={13} />
-              <span>{s2Results.model_note}</span>
-            </div>
-          )}
-        </>
-      )}
+      {s2Results && <LatestChangeResults results={s2Results} />}
     </>
   );
+}
+
+function LatestChangeResults({ results }) {
+  if (!results) return null;
+  const methodPresentation = getDetectionMethodPresentation(results);
+  const signalPresentation = getForestChangeSignalPresentation(results.signal);
+  const signalIsLoss = results.signal === 'DEFORESTATION';
+  const warnings = getDetectionWarnings(results);
+  const areaUnit = results.area_unit === 'ha' || results.deforestation_hectares != null ? 'ha' : 'px';
+  const activeArea = results.deforestation_hectares ?? results.deforested_area ?? results.deforested_pixels ?? results.deforestation_pixels ?? results.defor_pixels ?? 0;
+  const activePixels = results.deforested_pixels ?? results.deforestation_pixels ?? results.defor_pixels ?? 0;
+  return (
+    <section className="fw-latest-results">
+      <div className="fw-section-head">
+        <div><h2>Latest change detection</h2><p>{results.pair_name || 'Most recent temporal image pair'}</p></div>
+        {signalPresentation && <span className={`fw-results-badge fw-results-badge--${signalPresentation.tone}`}>{signalPresentation.label}</span>}
+        {results.live_source && <span className="fw-results-badge">Live imagery · no ground-truth evaluation</span>}
+        <span className="fw-results-badge">{methodPresentation.label} · {results.model_status || 'complete'}</span>
+      </div>
+      <div className="stat-grid fw-change-results">
+        {signalPresentation && <div className={`stat stat--${signalIsLoss ? 'red' : 'neutral'}`}>
+          <span className="stat__label">{results.status || signalPresentation.label}</span>
+          <div className="stat__value">
+            {formatChangeArea(activeArea, areaUnit)}
+            <span className="stat__unit">{areaUnit}</span>
+          </div>
+          <div className="stat__sub">{Number(activePixels).toLocaleString()} deforestation pixels{s2AreaEstimate(results) ? ' · AOI estimate' : ''}</div>
+        </div>}
+        {results.metrics && signalIsLoss && <div className="stat stat--green">
+          <span className="stat__label"><Activity size={11} /> Sample IoU / Dice</span>
+          <div className="stat__value">{results.metrics.sample_iou} / {results.metrics.sample_dice}</div>
+          <div className="stat__sub">Ground truth {Number(results.metrics.gt_defor_pixels).toLocaleString()} pixels</div>
+        </div>}
+        {results.detection_method === 'compare' && signalIsLoss && <>
+          <div className="stat stat--cyan">
+            <span className="stat__label">Temporal U-Net</span>
+            <div className="stat__value">{results.temporal_deforestation_pct ?? 0}<span className="stat__unit">%</span></div>
+            <div className="stat__sub">{Number(results.temporal_deforestation_hectares ?? 0).toLocaleString()} ha · dataset-labelled loss prediction</div>
+          </div>
+          <div className="stat stat--green">
+            <span className="stat__label">Stage 1 baseline</span>
+            <div className="stat__value">{results.baseline_deforestation_pct ?? 0}<span className="stat__unit">%</span></div>
+            <div className="stat__sub">{Number(results.baseline_deforestation_hectares ?? 0).toLocaleString()} ha · T1 forest / T2 non-forest</div>
+          </div>
+        </>}
+      </div>
+      <div className="visual-grid fw-change-visuals">
+        <VisualCard title="T1 · Before" src={results.t1_image || results.before_image} alt="Before image" />
+        <VisualCard title="T2 · After" src={results.t2_image || results.after_image} alt="After image" />
+        {results.before_forest_mask && <VisualCard title="T1 forest mask · Stage 1" src={results.before_forest_mask} alt="Forest mask before" />}
+        {results.after_forest_mask && <VisualCard title="T2 forest mask · Stage 1" src={results.after_forest_mask} alt="Forest mask after" />}
+        <VisualCard title="Forest change mask" src={results.forest_change_mask || results.deforestation_mask} alt="Deforestation mask" />
+        <VisualCard title="Forest change overlay" src={results.forest_change_overlay || results.deforestation_overlay} alt="Deforestation overlay" />
+        {signalIsLoss && results.temporal_deforestation_mask && <VisualCard title="Temporal U-Net prediction" src={results.temporal_deforestation_mask} alt="Temporal U-Net deforestation mask" />}
+        {signalIsLoss && results.baseline_deforestation_mask && <VisualCard title="Stage 1 baseline" src={results.baseline_deforestation_mask} alt="Post-classification baseline mask" />}
+      </div>
+      {results.prediction_output?.invalid_pixel_encoding && <div className="note note--info">
+        <Info size={13} /><span>Gray pixels in the selected prediction mask are invalid or cloud-masked; they are excluded from area totals.</span>
+      </div>}
+      {results.temporal_validation_iou != null && <div className="note note--info"><Info size={13} /><span>Checkpoint validation IoU: {Number(results.temporal_validation_iou).toFixed(3)} on Forest-Change validation data. This is a research metric, not a score for the live scene.</span></div>}
+      {warnings.map((warning, index) => <div className="note note--warn" key={`${results.detection_method || 'unknown'}-${index}`}><Cpu size={13} /><span>{warning}</span></div>)}
+    </section>
+  );
+}
+
+function LatestForestResults({ results }) {
+  return (
+    <section className="fw-latest-results fw-latest-results--forest">
+      <div className="fw-section-head">
+        <div><h2>Latest forest analysis</h2><p>{results.sample_name || 'Single-image canopy segmentation'}</p></div>
+        <span className="fw-results-badge">Forest U-Net · single image</span>
+      </div>
+      <div className="stat-grid fw-change-results">
+        <div className="stat stat--green">
+          <span className="stat__label"><Trees size={11} /> Forest canopy</span>
+          <div className="stat__value">{results.forest_pct ?? '—'}<span className="stat__unit">%</span></div>
+          <div className="stat__sub">{Number(results.forest_pixels ?? 0).toLocaleString()} pixels classified as canopy</div>
+        </div>
+        <div className="stat stat--neutral">
+          <span className="stat__label">Non-forest</span>
+          <div className="stat__value">{results.non_forest_pct ?? '—'}<span className="stat__unit">%</span></div>
+          <div className="stat__sub">{Number(results.non_forest_pixels ?? 0).toLocaleString()} pixels</div>
+        </div>
+        <div className="stat stat--cyan">
+          <span className="stat__label">{results.forest_hectares != null ? 'Estimated canopy area' : 'Image pixels'}</span>
+          <div className="stat__value">
+            {results.forest_hectares != null ? results.forest_hectares : Number(results.total_pixels ?? 0).toLocaleString()}
+            <span className="stat__unit">{results.forest_hectares != null ? 'ha' : 'px'}</span>
+          </div>
+          <div className="stat__sub">{results.area_estimate_method || (results.forest_hectares == null ? 'Area unavailable without georeferencing' : 'Area estimate')}</div>
+        </div>
+      </div>
+      <div className="visual-grid fw-forest-visuals">
+        <VisualCard title="Original image" src={results.original_image} alt="Original satellite image" />
+        <VisualCard title="Binary canopy mask" src={results.mask_image} alt="Predicted forest mask" />
+        <VisualCard title="Canopy overlay" src={results.overlay_image} alt="Forest canopy overlay" />
+      </div>
+      {results.model_note && <div className="note note--warn"><Cpu size={13} /><span>{results.model_note}</span></div>}
+    </section>
+  );
+}
+
+function s2AreaEstimate(results) {
+  return Boolean(results.area_estimate_method);
+}
+
+function formatChangeArea(area, unit) {
+  const numericArea = Number(area);
+  if (unit === 'ha') {
+    return numericArea.toLocaleString(undefined, {
+      minimumFractionDigits: 3,
+      maximumFractionDigits: 3,
+    });
+  }
+  return numericArea.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 4,
+  });
 }
 
 function TimelineView({
@@ -1300,6 +1427,9 @@ function TimelineView({
   loading,
   onLoad,
 }) {
+  const signalPresentation = getForestChangeSignalPresentation(swipeData?.signal);
+  const activeArea = swipeData?.deforestation_hectares ?? swipeData?.deforested_area ?? swipeData?.deforested_pixels ?? swipeData?.deforestation_pixels ?? 0;
+  const areaUnit = swipeData?.area_unit === 'ha' || swipeData?.deforestation_hectares != null ? 'ha' : 'px';
   return (
     <>
       <section className="panel fw-history-selector">
@@ -1307,7 +1437,7 @@ function TimelineView({
           <div>
             <div className="panel__title">Temporal Pair Comparison</div>
             <div className="block__hint">
-              Scrub through the earlier image, the later image and the predicted forest-loss overlay.
+              Scrub through the earlier image, the later image and the directional forest-change overlay.
             </div>
           </div>
         </div>
@@ -1350,10 +1480,12 @@ function TimelineView({
             </div>
             <div className="row" style={{ gap: 12 }}>
               <span className="badge badge--dim">{swipeData.pair_name}</span>
-              <span className="badge badge--red">
-                {swipeData.deforestation_pct}% loss ·{' '}
-                {Number(swipeData.deforestation_pixels ?? 0).toLocaleString()} px
-              </span>
+              {signalPresentation && <span className={`fw-results-badge fw-results-badge--${signalPresentation.tone}`}>
+                {signalPresentation.label}
+              </span>}
+              {signalPresentation && <span className={`badge ${swipeData.signal === 'DEFORESTATION' ? 'badge--red' : 'badge--dim'}`}>
+                {formatChangeArea(activeArea, areaUnit)} {areaUnit}
+              </span>}
             </div>
           </div>
 

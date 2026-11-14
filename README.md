@@ -50,28 +50,20 @@ Automating deforestation detection from satellite imagery must account for **sev
 
 This project provides a two-stage post-classification inference workflow and separately benchmarks a direct temporal model:
 1. **Stage 1 (Static Canopy Delineation):** A 3-channel convolutional U-Net trained on the Amazon Forest Dataset to segment baseline forest cover.
-<<<<<<< HEAD
-2. **Stage 2 (Bi-Temporal Change Detection):** Reuses the Stage 1 U-Net independently on $T_1$ and $T_2$; a pixel is deforestation only when it is forest at $T_1$ and non-forest at $T_2$. The separately trained Temporal U-Net remains available for benchmark training and evaluation, but is not used by the live inference endpoints.
-3. **Live Earth Observation:** A direct integration with the European Copernicus Data Space Ecosystem to query live Sentinel-2 L2A surface reflectance imagery, quantify AOI-specific cloud obscuration using the official Scene Classification Layer (SCL), and execute live deforestation inference with physical area reporting in hectares.
-=======
-2. **Stage 2 (Bi-Temporal Change Detection):** A 9-channel Temporal U-Net trained on the Forest-Change dataset that ingests pre-change imagery ($T_1$), post-change imagery ($T_2$), and an explicit absolute difference tensor ($|T_1 - T_2|$) to detect forest loss directly.
-3. **Live Earth Observation:** A direct integration with the European Copernicus Data Space Ecosystem to query Sentinel-2 imagery, quantify AOI-specific cloud obscuration using the Scene Classification Layer (SCL), and run live deforestation inference. Live area is an AOI-bounds approximation; benchmark samples and ordinary uploads report pixel counts without physical area.
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
-4. **SwinIR Super-Resolution:** An architecturally isolated Swin Transformer module providing 4× spatial magnification for visual inspection without affecting model inference.
+2. **Stage 2 (Bi-Temporal Change Detection):** Constrains Temporal U-Net predictions to pixels that Stage 1 classifies as forest at $T_1$ and non-forest at $T_2$. The system reports deforestation only; zero qualifying pixels return `No Deforestation Detected`.
+3. **Live Earth Observation:** Integrates Copernicus Data Space to search Sentinel-2 scenes, compute AOI-specific cloud statistics from SCL, and run the post-classification workflow. Stage 1 uses B08/B04 NDVI when NIR is available, or an RGB Excess Green filter otherwise. The live hectares figure is an estimate based on the selected AOI and image grid, not a ground-truth measurement.
+4. **Temporal Change Model:** The 9-channel Temporal U-Net consumes $T_1$, $T_2$, and $|T_1-T_2|$ and contributes to live inference; its detections are constrained by the refined Stage 1 forest-loss mask.
+5. **SwinIR Super-Resolution:** An architecturally isolated Swin Transformer module providing 4× spatial magnification for visual inspection without affecting model inference.
 
 ---
 
 ## ✨ Key Features
 
-<<<<<<< HEAD
-- **Post-Classification Forest-Loss Rule:** Runs the Stage 1 forest segmenter on each date and marks only pixels that change from forest to non-forest. Since it depends on two independent predictions, segmentation errors can propagate into the loss mask.
-- **Temporal Benchmark Training:** The separate temporal model combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$), Focal Loss ($\gamma = 2.0, \alpha = 0.75$), and Soft Dice Loss to train on rare change events; it is not used by current inference endpoints.
-=======
-- **Direct Temporal Modeling:** Overcomes the failure modes of post-classification subtraction by processing bi-temporal image pairs through an end-to-end 9-channel architecture.
+- **Deforestation-Only Change Rule:** Computes T1-forest AND T2-non-forest and intersects it with the Temporal U-Net prediction. Green gain signals are not computed or displayed; only red loss pixels are overlaid, with all other pixels transparent.
+- **Temporal U-Net:** Uses a 9-channel tensor made from two RGB dates plus their absolute difference; its output is gated by the refined Stage 1 forest-loss mask.
 - **Robust U-Net Spatial Shapes:** Both U-Nets pad only the bottom/right edges to a multiple of 16 and crop logits to the original dimensions, so odd-sized inputs work without changing learned checkpoint weights.
 - **Explicit Change Prior:** Ingests the absolute difference tensor $|T_1 - T_2|$ alongside raw RGB channels, giving early convolutional layers a direct inductive bias for spectral change detection.
 - **Severe Class Imbalance Mitigation:** Combines Positive-Weighted Binary Cross-Entropy ($w_{\text{pos}} = 19.94$) and Focal Loss ($\gamma = 2.0, \alpha = 0.75$) with per-image Soft Dice Loss to reduce domination by samples with different foreground prevalence.
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
 - **Live Copernicus Data Space Integration:** Authenticated OAuth2 integration querying the Sentinel-2 L2A STAC catalog and retrieving dynamically rendered true-color RGB tiles via the Process API.
 - **AOI-Specific Cloud Statistics:** Extracts the 20-meter Scene Classification Layer (SCL) to compute cloud obscuration percentages specifically within the user's drawn bounding box, distinguishing local cloud cover from tile-wide catalog estimates.
 - **Client-Side Cloud Mask Overlay:** Generates a cyan-tinted map overlay showing obscured pixels to alert analysts before running inference.
@@ -152,19 +144,12 @@ sequenceDiagram
 
     User->>Map: Click "Analyze Deforestation"
     Map->>Server: POST /api/sentinel/analyze (T1, T2, bbox, threshold)
-<<<<<<< HEAD
     Server->>Model: Predict forest mask for T1
     Model-->>Server: Return T1 forest mask
     Server->>Model: Predict forest mask for T2
     Model-->>Server: Return T2 forest mask
     Server->>Server: Mark T1 forest AND T2 non-forest pixels
-    Server->>Server: Calculate Hectares (10m GSD) & Generate Red Overlay
-=======
-    Server->>Server: Construct 9-channel tensor [T1, T2, |T1-T2|]
-    Server->>Model: Execute Stage 2 Model Inference
-    Model-->>Server: Return Deforestation Mask & Logits
-    Server->>Server: Estimate AOI area and generate red overlay
->>>>>>> 1043ccc344920b66b902fb9a3931b05948544061
+    Server->>Server: Estimate affected area from available spatial metadata & generate red overlay
     Server-->>Map: Return Mask, Affected Area, and Stats
     Map-->>User: Render Semi-Transparent Red Mask on Satellite Base
 ```
@@ -182,14 +167,15 @@ sequenceDiagram
 - **Checkpoint:** `models/best_unet_model.pth` (saved at Epoch 5).
 
 ### Stage 2: Bi-Temporal Deforestation Detection
-- **Task:** Estimate forest loss between two temporal acquisitions ($T_1 \to T_2$).
-- **Live inference:** Applies the Stage 1 U-Net separately to each image and computes `forest_T1 AND NOT forest_T2`.
-- **Model:** `UNet` (`src/model.py`), with the same checkpoint and threshold as Stage 1.
-- **Benchmark model:** `TemporalUNet` (`src/temporal_model.py`) is trained and evaluated separately; it is not loaded by the current Flask or FastAPI inference endpoints.
+- **Task:** Estimate forest loss and gain between two temporal acquisitions ($T_1 \to T_2$).
+- **Live inference:** Applies the Stage 1 U-Net separately to each date. With B08 it requires `probability > 0.65` and NDVI `> 0.45`; RGB-only inputs require `probability > 0.75` and Excess Green `2G-R-B > 0`. The final deforestation mask is `(forest_T1 == 1) AND (forest_T2 == 0) AND (temporal_probability >= threshold)`. Zero pixels report `No Deforestation Detected` and `0.0 ha`.
+- **Area units:** A supplied AOI bounding box enables hectare estimates; otherwise the API reports pixel areas and pixel counts without implying a physical scale.
+- **Model:** `UNet` (`src/model.py`), with the same checkpoint and a live-domain vegetation constraint.
+- **Temporal gate:** `TemporalUNet` (`src/temporal_model.py`) is intersected with the Stage 1 deforestation mask before the final overlay and loss metrics are reported.
 - **Known limitation:** Post-classification comparison compounds per-date segmentation errors. The recorded benchmark test IoU for this approach was only **0.0026** (0.26%), so results are indicative and require independent validation.
 
 ### 9-Channel Temporal Input Architecture
-This architecture describes the separately trained benchmark model only; the live Flask and FastAPI endpoints use the Stage 1 U-Net post-classification rule above.
+The live Flask and FastAPI endpoints use this Temporal U-Net prediction only after intersecting it with the refined Stage 1 forest-loss transition.
 
 Given pre-change RGB image $\mathbf{I}_{T_1} \in \mathbb{R}^{3 \times H \times W}$ and post-change RGB image $\mathbf{I}_{T_2} \in \mathbb{R}^{3 \times H \times W}$:
 1. Compute the pixel-wise absolute spectral difference:
@@ -294,6 +280,7 @@ Evaluated on the Forest-Change dataset independent test split (**33 pairs, 2,162
 ### Operational Sentinel-2 Demo Inference
 When running inference on live Sentinel-2 imagery via `/api/sentinel/analyze`, the system outputs:
 - Predicted deforestation pixel count and percentage.
+- Stage 1 forest-loss and forest-gain areas, net area change, and an overall change signal; the overlay shows only the active signal in red (loss) or green (gain).
 - Approximate hectares and square kilometers from the live AOI bounding box; sample and upload workflows report pixels only.
 - **Important Distinction:** Live Sentinel-2 queries **do not have ground-truth masks**. Therefore, IoU, Dice, Precision, and Recall are not reported for live queries. Benchmark metrics apply strictly to the held-out test datasets.
 
@@ -305,7 +292,7 @@ When running inference on live Sentinel-2 imagery via `/api/sentinel/analyze`, t
 |---|:---:|---|
 | **Stage 1 U-Net Forest Segmentation** | ✅ Implemented | 3-channel U-Net; 7.76M parameters; evaluated on Amazon Forest Dataset. |
 | **Stage 2 Post-Classification Inference** | ✅ Implemented | Runs Stage 1 U-Net on both dates; loss is T1 forest AND T2 non-forest. |
-| **Temporal U-Net Benchmark** | ✅ Implemented | Separate 9-channel model; trained and evaluated on Forest-Change, not loaded by inference endpoints. |
+| **Temporal U-Net** | ✅ Implemented | 9-channel model trained and evaluated on Forest-Change; live detections are constrained by the Stage 1 forest-loss mask. |
 | **Extreme Class Imbalance Training** | ✅ Implemented | Benchmark model uses Weighted BCE ($w_{\text{pos}} = 19.94$) + Focal Loss ($\gamma = 2.0$) + Soft Dice Loss. |
 | **Copernicus OAuth2 & STAC Search** | ✅ Implemented | Live token generation; queries `sentinel-2-l2a` catalog with bbox filtering. |
 | **Sentinel Hub Process API Previews** | ✅ Implemented | Custom evalscript rendering calibrated true-color RGB PNG tiles. |
@@ -452,7 +439,7 @@ SENTINEL_TOKEN_URL="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/pr
 
 ### Stage 2: Live Sentinel-2 or Local Imagery
 
-In the Stage 2 workbench, choose **Choose AOI and dates on GIS Map** to open the existing Interactive GIS Map. Draw an AOI, search Sentinel-2 acquisitions over a date range, set an earlier acquisition as **FROM / T1** and a later one as **TO / T2**, then run **Analyze Deforestation**. The map retrieves both images for the same AOI and sends them to `/api/sentinel/analyze`, which runs the Stage 1 U-Net independently on both dates and marks T1-forest/T2-non-forest pixels. AOI cloud statistics are shown when available; scenes with substantial cloud cover should be avoided. Missing credentials, acquisitions, or network access are reported as unavailable rather than replaced with sample imagery.
+In the Stage 2 workbench, choose **Choose AOI and dates on GIS Map** to open the existing Interactive GIS Map. Draw an AOI, search Sentinel-2 acquisitions over a date range, set an earlier acquisition as **FROM / T1** and a later one as **TO / T2**, then run **Analyze Deforestation**. The map retrieves B04/B03/B02 and B08 where available for both dates, applies the NDVI-refined Stage 1 masks, and intersects the T1-forest/T2-non-forest transition with the Temporal U-Net output. The map displays deforestation only; zero pixels report `No Deforestation Detected` and `0.0 ha`. AOI cloud statistics are shown when available; scenes with substantial cloud cover should be avoided. Missing credentials, acquisitions, or network access are reported as unavailable rather than replaced with sample imagery.
 
 Pre-loaded temporal pairs and manual T1/T2 uploads remain alternatives in Stage 2. Uploaded images must be co-registered to the same geographic footprint and have identical dimensions; the application can validate dimensions, but cannot infer geospatial alignment from ordinary image files. Both images are resized to 256 × 256 and normalized to [0, 1] before separate forest segmentation. The Stage 1 model was trained on the Amazon Forest Dataset, not Sentinel-2 imagery; independent mask errors can propagate into deforestation predictions. Treat results as indicative and validate them independently.
 
@@ -492,13 +479,13 @@ The Flask backend provides 13 operational REST endpoints:
 | `/api/sentinel/search` | `GET` | `bbox`, `from`, `to`, `max_cloud` | Queries the Copernicus STAC catalog; returns a sorted array of historical acquisitions. |
 | `/api/sentinel/preview` | `GET` | `acquisition_id`, `bbox`, `width`, `height` | Queries the Process API; returns a true-color RGB base64-encoded PNG preview. |
 | `/api/sentinel/cloud-stats` | `GET` | `acquisition_id`, `bbox`, `resolution` | Retrieves the 20 m SCL band; returns AOI cloud %, clear %, and a breakdown by SCL class. |
-| `/api/sentinel/analyze` | `POST` | JSON: `image_before`, `image_after`, `bbox`, `threshold` | Executes Stage 2 inference; returns mask/overlay, pixel metrics, and approximate AOI-based area when a valid bbox is supplied. |
+| `/api/sentinel/analyze` | `POST` | JSON: selected acquisitions or `image_before`, `image_after`, `bbox`, `threshold` | Executes Stage 2 inference; returns deforestation-only area/pixel metrics and a transparent red loss overlay. Zero detections return status `No Deforestation Detected` and `0.0 ha`. |
 | `/api/sentinel/superresolve` | `POST` | JSON: `image` (base64) | Executes SwinIR 4× super-resolution; returns a 4× enlarged base64-encoded PNG. |
 | `/api/sentinel/superresolve/status` | `GET` | None | Checks whether the `models/swinir_x4.pth` checkpoint is available on disk. |
 | `/api/gis/regions` | `GET` | None | Returns regions with verified spatial metadata; currently empty because bundled samples have no georeferenced region metadata. |
 | `/api/samples` | `GET` | None | Returns lists of available local dataset samples for Stage 1 and Stage 2 testing. |
 | `/api/predict/stage1` | `POST` | Form: `sample_path` or `file`, `threshold` | Executes Stage 1 U-Net segmentation; returns forest canopy mask and pixel area statistics. |
-| `/api/predict/stage2` | `POST` | Form: `sample_id` or `files`, `threshold` | Segments both dates with the Stage 1 U-Net and returns the T1-forest/T2-non-forest loss mask and pixel metrics. |
+| `/api/predict/stage2` | `POST` | Form: `sample_id` or `files`, `threshold` | Combines the refined Stage 1 loss transition with the Temporal U-Net prediction and returns deforestation-only metrics and a red overlay. |
 | `/api/metrics` | `GET` | None | Returns raw JSON validation and test evaluation metrics for the UI dashboard. |
 
 ---

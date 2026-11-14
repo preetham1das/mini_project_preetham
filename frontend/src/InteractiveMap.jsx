@@ -45,6 +45,10 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
 } from 'lucide-react';
+import {
+  getDetectionMethodPresentation,
+  getDetectionWarnings,
+} from './stage2Presentation.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -279,6 +283,7 @@ export default function InteractiveMap({
   const [analysing,       setAnalysing]       = useState(false);
   const [analysisError,   setAnalysisError]   = useState('');
   const [analysisResult,  setAnalysisResult]  = useState(null);
+  const [analysisMethod, setAnalysisMethod] = useState('temporal');
   const [analysisOverlayVisible, setAnalysisOverlayVisible] = useState(true);
   const [overlayOpacity, setOverlayOpacity] = useState(0.55);
   const analysisLayerRef = useRef(null); // L.imageOverlay for analysis overlay
@@ -608,7 +613,7 @@ export default function InteractiveMap({
 
   // ── Sentinel Search ──────────────────────────────────────────────────────────
 
-  const runSearch = useCallback(async () => {
+  const runSearch = useCallback(async (collectionOverride = collection) => {
     if (!aoiBounds) {
       setSearchError('Draw an Area of Interest on the map first.');
       return;
@@ -648,7 +653,7 @@ export default function InteractiveMap({
       lon:        centerLon.toFixed(6),
       start_date: startDate,
       end_date:   endDate,
-      collection,
+      collection: collectionOverride,
       bbox:       `${west.toFixed(6)},${south.toFixed(6)},${east.toFixed(6)},${north.toFixed(6)}`,
       limit:      1000,
     });
@@ -660,7 +665,7 @@ export default function InteractiveMap({
       if (!data.success) {
         setSearchError(data.error || 'Search failed.');
       } else if (!data.acquisitions?.length) {
-        setSearchError('No Sentinel-2 acquisitions found for this area and date range.');
+        setSearchError('');
       } else {
         // Sort oldest → newest for timeline
         const sorted = [...data.acquisitions].sort((a, b) =>
@@ -853,6 +858,12 @@ export default function InteractiveMap({
       setAnalysisError('The FROM / T1 acquisition must be earlier than the TO / T2 acquisition.');
       return;
     }
+    const selectedCollections = [fromData.acq.collection || collection, toData.acq.collection || collection]
+      .map((value) => String(value).toLowerCase());
+    if (selectedCollections.some((value) => value === 'sentinel-2-l1c' || value === 'l1c')) {
+      setAnalysisError('Live analysis currently requires Sentinel-2 L2A scenes. L1C scenes can be previewed, but cannot be analyzed with the current cloud-masked workflow.');
+      return;
+    }
     if (
       !Array.isArray(fromData.bbox) ||
       !Array.isArray(toData.bbox) ||
@@ -888,7 +899,8 @@ export default function InteractiveMap({
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000);
+    // Two selected-scene Process API requests can take longer than the preview calls.
+    const timeoutId = setTimeout(() => controller.abort(), 180000);
 
     try {
       const res = await fetch('/api/sentinel/analyze', {
@@ -896,12 +908,27 @@ export default function InteractiveMap({
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
+          acquisition_before: {
+            id: fromData.acq.id,
+            datetime: fromData.acq.datetime,
+            collection: fromData.acq.collection || collection,
+          },
+          acquisition_after: {
+            id: toData.acq.id,
+            datetime: toData.acq.datetime,
+            collection: toData.acq.collection || collection,
+          },
+          // Keep the selected preview pair as a compatibility fallback for
+          // older Flask workers that still route image-payload requests.
+          // Current workers prefer the acquisition records and fetch source
+          // Sentinel-2 data directly from Copernicus.
           image_before: fromData.image,
-          image_after:  toData.image,
-          date_before:  fromData.acq.datetime ? fromData.acq.datetime.slice(0, 10) : 'Unknown',
-          date_after:   toData.acq.datetime   ? toData.acq.datetime.slice(0, 10)   : 'Unknown',
-          bbox:         [west, south, east, north],
-          threshold:    stage2Threshold,
+          image_after: toData.image,
+          date_before: fromData.acq.datetime,
+          date_after: toData.acq.datetime,
+          bbox: [west, south, east, north],
+          threshold: stage2Threshold,
+          detection_method: analysisMethod,
         }),
       });
       clearTimeout(timeoutId);
@@ -920,7 +947,7 @@ export default function InteractiveMap({
       }
 
       // The transparent prediction mask uses the exact AOI sent to the backend.
-      const deforestationMask = data.deforestation_mask || data.deforestation_overlay;
+      const deforestationMask = data.forest_change_overlay || data.forest_change_mask || data.deforestation_overlay || data.deforestation_mask;
       if (deforestationMask && toData.bbox) {
         const imgBounds = L.latLngBounds([south, west], [north, east]);
         if (map) {
@@ -936,7 +963,7 @@ export default function InteractiveMap({
     } catch (err) {
       clearTimeout(timeoutId);
       if (err.name === 'AbortError') {
-        setAnalysisError('Analysis request timed out after 35 seconds. Please try again.');
+        setAnalysisError('Analysis request timed out after 3 minutes. Please try again.');
       } else {
         setAnalysisError('Network error: ' + err.message);
       }
@@ -944,7 +971,7 @@ export default function InteractiveMap({
       clearTimeout(timeoutId);
       setAnalysing(false);
     }
-  }, [fromData, toData, aoiBounds, overlayOpacity, stage2Threshold, onStage2Result]);
+  }, [fromData, toData, aoiBounds, overlayOpacity, stage2Threshold, analysisMethod, collection, onStage2Result]);
 
   // Toggle analysis overlay visibility
   const toggleAnalysisOverlay = useCallback(() => {
@@ -1137,6 +1164,9 @@ export default function InteractiveMap({
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
+  // Let users continue from drawing an AOI without leaving the GIS map.
+  const showAcquisitionWorkflow = workspace === 'acquisition' || (workspace === 'map' && Boolean(aoiBounds));
+
   return (
     <div className={`map-stage ${drawerOpen ? '' : 'is-drawer-collapsed'}`}>
 
@@ -1166,26 +1196,6 @@ export default function InteractiveMap({
 
         <span className="divider-v" />
 
-        {!isDrawing ? (
-          <>
-            <button type="button" className="btn btn--sm btn--ghost" onClick={startDrawing}>
-              <Square size={12} /> Draw AOI
-            </button>
-            <button
-              type="button"
-              className="btn btn--sm btn--ghost"
-              onClick={loadAmazonPreset}
-              title="Amazon deforestation hotspot (-3.465°, -62.215°)"
-            >
-              <MapPin size={12} /> Amazon
-            </button>
-          </>
-        ) : (
-          <button type="button" className="btn btn--sm btn--danger" onClick={cancelDrawing}>
-            <X size={12} /> Cancel
-          </button>
-        )}
-
         {aoiBounds && !isDrawing && (
           <>
             <button type="button" className="icon-btn" onClick={fitToAoi} title="Fit map to AOI">
@@ -1214,7 +1224,7 @@ export default function InteractiveMap({
       <aside className={`drawer ${drawerOpen ? '' : 'is-collapsed'}`} aria-hidden={!drawerOpen}>
         <div className="drawer__head">
           <div className="drawer__title">
-            <Satellite size={14} color="var(--cyan-bright)" /> {workspace === 'acquisition' ? 'Area & imagery' : 'Map controls'}
+            <Satellite size={14} color="var(--cyan-bright)" /> {showAcquisitionWorkflow ? 'Acquisition workflow' : 'Map controls'}
           </div>
           <button
             type="button"
@@ -1228,7 +1238,6 @@ export default function InteractiveMap({
 
         <div className="drawer__body">
 
-          {/* ── Area of Interest ─────────────────────────────── */}
           <div className="block">
             <div className="block__head">
               <div className="block__title">
@@ -1236,23 +1245,26 @@ export default function InteractiveMap({
               </div>
               {aoiBounds && <span className="badge badge--amber">AOI set</span>}
             </div>
-
-            {isDrawing ? (
-              <div className="note note--warn">
-                <Info size={12} />
-                <span>Click and drag on the map to draw your AOI rectangle.</span>
-              </div>
-            ) : (
+            {!isDrawing ? (
               <div className="row" style={{ gap: 6 }}>
                 <button type="button" className="btn btn--sm btn--ghost" style={{ flex: 1 }} onClick={startDrawing}>
-                  <Square size={12} /> Draw
+                  <Square size={12} /> Draw AOI
                 </button>
-                <button type="button" className="btn btn--sm btn--ghost" style={{ flex: 1 }} onClick={loadAmazonPreset}>
+                <button
+                  type="button"
+                  className="btn btn--sm btn--ghost"
+                  style={{ flex: 1 }}
+                  onClick={loadAmazonPreset}
+                  title="Amazon deforestation hotspot (-3.465°, -62.215°)"
+                >
                   <MapPin size={12} /> Amazon
                 </button>
               </div>
+            ) : (
+              <button type="button" className="btn btn--sm btn--danger" style={{ width: '100%' }} onClick={cancelDrawing}>
+                <X size={12} /> Cancel drawing
+              </button>
             )}
-
             {aoiBounds && !isDrawing && (() => {
               const [w, s, e, n] = bboxFromLatLngBounds(aoiBounds);
               return (
@@ -1261,15 +1273,9 @@ export default function InteractiveMap({
                 </div>
               );
             })()}
-
-            {!aoiBounds && !isDrawing && (
-              <div className="block__hint" style={{ marginTop: 7 }}>
-                Draw a rectangle or load the Amazon preset to begin.
-              </div>
-            )}
           </div>
 
-          {workspace === 'acquisition' && <>
+          {showAcquisitionWorkflow && <>
           {/* ── Sentinel-2 search ────────────────────────────── */}
           <div className="block">
             <div className="block__head">
@@ -1315,7 +1321,7 @@ export default function InteractiveMap({
               type="button"
               className="btn btn--primary btn--block btn--sm"
               style={{ marginTop: 9 }}
-              onClick={runSearch}
+              onClick={() => runSearch()}
               disabled={searching || !aoiBounds}
             >
               {searching ? (
@@ -1329,12 +1335,6 @@ export default function InteractiveMap({
               )}
             </button>
 
-            {!aoiBounds && (
-              <div className="block__hint" style={{ marginTop: 7, textAlign: 'center' }}>
-                Draw an AOI first to search imagery.
-              </div>
-            )}
-
             {searchError && (
               <div className="note note--error" style={{ marginTop: 8 }}>
                 <AlertTriangle size={11} />
@@ -1345,13 +1345,13 @@ export default function InteractiveMap({
             {acquisitions.length > 0 && (
               <div className="block__hint" style={{ marginTop: 8 }}>
                 <strong style={{ color: 'var(--emerald-bright)' }}>{acquisitions.length}</strong> acquisition
-                {acquisitions.length !== 1 ? 's' : ''} found — select FROM / TO on the timeline below.
+                {acquisitions.length !== 1 ? 's' : ''} found.
               </div>
             )}
           </div>
 
           {/* ── Before / After workflow ──────────────────────── */}
-          <div className="block">
+          {acquisitions.length > 0 && <div className="block">
             <div className="block__head">
               <div className="block__title">
                 <GitCompare size={14} color="var(--emerald-bright)" /> Before / After
@@ -1364,7 +1364,7 @@ export default function InteractiveMap({
             </div>
 
             <p className="block__hint" style={{ marginBottom: 9 }}>
-              Pick a <strong>FROM</strong> and a <strong>TO</strong> acquisition for independent forest segmentation and post-classification comparison.
+              Select one T1 and one T2 scene from the timeline.
             </p>
 
             <div className="tile-pair">
@@ -1425,7 +1425,7 @@ export default function InteractiveMap({
                     </div>
                   </>
                 ) : (
-                  <div className="block__hint">Click “Set FROM” in the timeline</div>
+                  <div className="block__hint">No date selected</div>
                 )}
               </div>
 
@@ -1486,7 +1486,7 @@ export default function InteractiveMap({
                     </div>
                   </>
                 ) : (
-                  <div className="block__hint">Click “Set TO” in the timeline</div>
+                  <div className="block__hint">No date selected</div>
                 )}
               </div>
             </div>
@@ -1638,43 +1638,39 @@ export default function InteractiveMap({
                 )}
 
                 <div className="block__hint" style={{ marginTop: 7, fontSize: 10 }}>
-                  Super-resolution increases display pixel density; it does not create true 2.5 m measurements.
+                  4× upscaling improves display detail, not source resolution.
                 </div>
               </>
             )}
 
             {/* Primary CTA */}
-            <button
+            {fromData && toData && <div className="field" style={{ marginTop: 10 }}>
+              <label htmlFor="live-detection-method">Detection method</label>
+              <select
+                id="live-detection-method"
+                className="select"
+                value={analysisMethod}
+                onChange={(event) => setAnalysisMethod(event.target.value)}
+              >
+                <option value="temporal">Temporal U-Net · recommended</option>
+                <option value="compare">Compare with Stage 1 baseline</option>
+                <option value="baseline">Stage 1 post-classification baseline</option>
+              </select>
+              <div className="block__hint" style={{ marginTop: 5 }}>
+                The comparison mode runs both methods on the same clear pixels.
+              </div>
+            </div>}
+            {fromData && toData && <button
               type="button"
               className={`btn btn--primary btn--block btn--cta ${canAnalyze ? '' : 'btn--ghost'}`}
               style={{ marginTop: 11 }}
               disabled={!canAnalyze || analysing}
               onClick={runAnalysis}
             >
-              {analysing ? (
-                <>
-                  <span className="btn__spinner" /> Analysing Forest Change…
-                </>
-              ) : (
-                <>
-                  <Activity size={16} /> Run Deforestation Analysis
-                </>
-              )}
-            </button>
+              {analysing ? <><span className="btn__spinner" /> Analysing Forest Change…</> : <><Activity size={16} /> Run Deforestation Analysis</>}
+            </button>}
 
             {/* Validation hints */}
-            {!aoiBounds && (
-              <div className="block__hint" style={{ marginTop: 6, textAlign: 'center' }}>
-                Draw an AOI on the map to begin.
-              </div>
-            )}
-            {aoiBounds && (!fromData || !toData) && (
-              <div className="block__hint" style={{ marginTop: 6, textAlign: 'center' }}>
-                {!fromData && !toData && 'Select both FROM and TO dates from the timeline.'}
-                {fromData && !toData && 'Now select a TO date from the timeline.'}
-                {!fromData && toData && 'Now select a FROM date from the timeline.'}
-              </div>
-            )}
             {((fromData?.acq?.id && toData?.acq?.id && fromData.acq.id === toData.acq.id) ||
               (fromIdx !== null && toIdx !== null && fromIdx === toIdx)) && (
               <div className="note note--warn" style={{ marginTop: 7 }}>
@@ -1696,22 +1692,20 @@ export default function InteractiveMap({
                 <span>{analysisError}</span>
               </div>
             )}
-          </div>
+          </div>}
 
           </>}
 
-          {/* Legend */}
-          <div className="block">
-            <div className="block__head" style={{ marginBottom: 8 }}>
-              <div className="block__title">
-                <Layers size={13} color="var(--text-dim)" /> Layer legend
-              </div>
-            </div>
+          {/* Keep the legend available without taking space from the workflow. */}
+          <details className="block map-layer-legend">
+            <summary className="block__title">
+              <Layers size={13} color="var(--text-dim)" /> Layer legend
+            </summary>
             <div className="legend" style={{ background: 'transparent', border: 'none', padding: 0, gap: 9 }}>
               {[
                 { color: '#F59E0B', label: 'AOI boundary' },
                 { color: '#3B82F6', label: 'Sentinel-2 RGB' },
-                { color: '#EF4444', label: 'Forest loss' },
+                { color: '#EF4444', label: 'Deforestation / Loss' },
                 { color: '#10B981', label: 'Canopy' },
               ].map(({ color, label }) => (
                 <div key={label} className="legend__row">
@@ -1720,7 +1714,7 @@ export default function InteractiveMap({
                 </div>
               ))}
             </div>
-          </div>
+          </details>
 
         </div>
       </aside>
@@ -1732,7 +1726,7 @@ export default function InteractiveMap({
             <div className="analytics-panel__title">
               <CheckCircle2 size={14} color="var(--emerald-bright)" /> Deforestation Results
             </div>
-            <span className="badge badge--violet">9-Channel Temporal Model + Single-Frame Directional Gate Active</span>
+            <span className="badge badge--green">{getDetectionMethodPresentation(analysisResult).label}</span>
           </div>
 
           <div className="analytics-panel__body">
@@ -1742,47 +1736,22 @@ export default function InteractiveMap({
                 Change between <strong>{analysisResult.date_before}</strong> and{' '}
                 <strong>{analysisResult.date_after}</strong> across the selected AOI.
               </span>
+              <span className={`fw-results-badge ${analysisResult.signal === 'DEFORESTATION' ? 'fw-results-badge--loss' : ''}`}>
+                {analysisResult.status || (analysisResult.signal === 'DEFORESTATION' ? 'Deforestation Detected' : 'No Deforestation Detected')}
+              </span>
             </div>
 
             <div className="stat-grid">
-              <div className="stat stat--red">
-                <span className="stat__label">
-                  <Activity size={10} /> Loss
-                </span>
+              <div className={`stat ${analysisResult.signal === 'DEFORESTATION' ? 'stat--red' : 'stat--neutral'}`}>
+                <span className="stat__label">Deforestation · forest loss</span>
                 <div className="stat__value">
-                  {analysisResult.deforestation_pct}
-                  <span className="stat__unit">%</span>
+                  {Number(analysisResult.deforestation_hectares ?? analysisResult.deforested_area ?? analysisResult.deforested_pixels ?? analysisResult.defor_pixels ?? 0).toLocaleString(undefined, {
+                    minimumFractionDigits: analysisResult.area_unit === 'ha' || analysisResult.deforestation_hectares != null ? 3 : 0,
+                    maximumFractionDigits: analysisResult.area_unit === 'ha' || analysisResult.deforestation_hectares != null ? 3 : 4,
+                  })}
+                  <span className="stat__unit">{analysisResult.area_unit === 'ha' || analysisResult.deforestation_hectares != null ? 'ha' : 'px'}</span>
                 </div>
-                <div className="stat__sub">canopy loss detected</div>
-              </div>
-
-              <div className="stat stat--red">
-                <span className="stat__label">Area</span>
-                <div className="stat__value">
-                  {analysisResult.deforestation_hectares ?? Number(analysisResult.defor_pixels ?? 0).toLocaleString()}
-                  <span className="stat__unit">{analysisResult.deforestation_hectares != null ? 'ha*' : 'px'}</span>
-                </div>
-                <div className="stat__sub">{analysisResult.area_estimate_method || 'Area unavailable'}</div>
-              </div>
-
-              <div className="stat stat--neutral">
-                <span className="stat__label">Square km</span>
-                <div className="stat__value">
-                  {analysisResult.deforestation_sqkm ?? '—'}
-                  {analysisResult.deforestation_sqkm != null && <span className="stat__unit">km²</span>}
-                </div>
-                <div className="stat__sub">AOI-based approximation</div>
-              </div>
-
-              <div className="stat stat--green">
-                <span className="stat__label">
-                  <Trees size={10} /> Stable
-                </span>
-                <div className="stat__value">
-                  {analysisResult.stable_pct}
-                  <span className="stat__unit">%</span>
-                </div>
-                <div className="stat__sub">preserved canopy</div>
+                <div className="stat__sub">{Number(analysisResult.deforested_pixels ?? 0).toLocaleString()} pixels · {analysisResult.area_estimate_method || 'Pixel count'}</div>
               </div>
             </div>
 
@@ -1817,12 +1786,16 @@ export default function InteractiveMap({
             <div className="legend">
               <div className="legend__row">
                 <span className="legend__swatch" style={{ background: '#EF4444' }} />
-                <span>Forest loss</span>
+                <span>Deforestation / loss</span>
               </div>
               <div className="legend__row">
-                <span className="legend__swatch" style={{ background: '#10B981' }} />
-                <span>Stable forest</span>
+                <span className="legend__swatch" style={{ background: 'transparent', border: '1px solid var(--border-strong)' }} />
+                <span>Unchanged · transparent</span>
               </div>
+              {analysisResult.prediction_output?.invalid_pixel_encoding && <div className="legend__row">
+                <span className="legend__swatch" style={{ background: '#808080' }} />
+                <span>Invalid / masked pixel</span>
+              </div>}
             </div>
 
             {/* Comparison previews */}
@@ -1832,8 +1805,8 @@ export default function InteractiveMap({
                 {[
                   { label: `Before · ${analysisResult.date_before}`, image: analysisResult.before_image },
                   { label: `After · ${analysisResult.date_after}`, image: analysisResult.after_image },
-                  { label: 'Change mask', image: analysisResult.deforestation_mask },
-                  { label: 'Overlay', image: analysisResult.deforestation_overlay },
+                  { label: 'Change mask', image: analysisResult.forest_change_mask || analysisResult.deforestation_mask },
+                  { label: 'Overlay', image: analysisResult.forest_change_overlay || analysisResult.deforestation_overlay },
                 ].map(({ label, image }) => (
                   <button
                     key={label}
@@ -1861,19 +1834,15 @@ export default function InteractiveMap({
               </div>
             </div>
 
-            <div className="note note--warn">
-              <AlertTriangle size={11} />
-              <span>
-                Temporal predictions are restricted to T1 forest and T2 non-forest pixels. Seasonal differences,
-                clouds, and errors in either forest mask can still affect the loss result.
-              </span>
-            </div>
+            {getDetectionWarnings(analysisResult).map((warning, index) => <div className="note note--warn" key={`${analysisResult.detection_method || 'unknown'}-${index}`}>
+              <AlertTriangle size={11} /><span>{warning}</span>
+            </div>)}
           </div>
         </aside>
       )}
 
       {/* ─── Timeline dock ──────────────────────────────────────── */}
-      {workspace === 'acquisition' && acquisitions.length > 0 && (
+      {showAcquisitionWorkflow && acquisitions.length > 0 && (
         <div className="timeline-dock">
           <div className="timeline-dock__head">
             <div className="row">
@@ -2013,7 +1982,7 @@ export default function InteractiveMap({
         </div>
       )}
 
-      {hasSearched && !searching && acquisitions.length === 0 && (
+      {hasSearched && !searching && !searchError && acquisitions.length === 0 && (
         <div
           className="empty-state glass"
           style={{
@@ -2028,9 +1997,24 @@ export default function InteractiveMap({
           <Calendar size={19} />
           <strong style={{ color: 'var(--text)', fontSize: 13 }}>No Sentinel-2 acquisitions found</strong>
           <span>
-            Nothing was captured between {startDate} and {endDate} for this AOI. Sentinel-2 coverage starts mid-2015 —
-            try widening the range or redrawing the AOI.
+            The catalog returned no {collection === 'all' ? 'L1C or L2A' : collection.endsWith('l1c') ? 'L1C' : 'L2A'} scenes intersecting this AOI from {startDate} through {endDate}. Try a wider date range or a larger AOI.
           </span>
+          {collection !== 'all' && (
+            <button
+              type="button"
+              className="btn btn--cyan"
+              disabled={searching}
+              onClick={() => {
+                setCollection('all');
+                runSearch('all');
+              }}
+            >
+              <Satellite size={13} /> Retry with L1C + L2A
+            </button>
+          )}
+          {collection === 'all' && (
+            <small>L1C scenes can be previewed; the current live analysis workflow requires L2A.</small>
+          )}
         </div>
       )}
 

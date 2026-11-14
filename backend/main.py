@@ -9,6 +9,7 @@ from PIL import Image
 import torch
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import rasterio
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -18,9 +19,11 @@ from src.temporal_model import TemporalUNet
 from backend.sentinel_service import (
     BENCHMARK_METADATA,
     geodesic_area_hectares,
+    forest_change_metrics,
     parse_bbox,
     predict_directional_deforestation,
     rgba_mask_to_data_uri,
+    sentinel_bands_to_reflectance,
 )
 
 # --------------------------------------------------
@@ -155,6 +158,47 @@ def preprocess_image(image: Image.Image):
     image_tensor = image_tensor.unsqueeze(0)
 
     return image_tensor
+
+
+def _resize_spectral_band(band, categorical=False):
+    resampling = Image.Resampling.NEAREST if categorical else Image.Resampling.BILINEAR
+    band_image = Image.fromarray(np.asarray(band, dtype=np.float32), mode="F")
+    resized = band_image.resize((IMAGE_SIZE, IMAGE_SIZE), resampling)
+    return np.asarray(resized, dtype=np.float32)
+
+
+def _decode_uploaded_image(contents):
+    """Decode RGB uploads and retain Sentinel B08/SCL bands from multiband TIFFs."""
+    spectral = None
+    try:
+        with rasterio.MemoryFile(contents) as memory_file:
+            with memory_file.open() as dataset:
+                if dataset.count >= 4:
+                    indexes = list(range(1, min(dataset.count, 5) + 1))
+                    bands = dataset.read(indexes=indexes)
+                    rgb, spectral = sentinel_bands_to_reflectance(bands)
+                    valid = np.all(
+                        dataset.read_masks(indexes=[1, 2, 3, 4]) > 0,
+                        axis=0,
+                    )
+                    spectral["valid"] = valid
+                    image_array = np.round(
+                        np.clip(rgb, 0.0, 1.0) * 255.0
+                    ).astype(np.uint8)
+                    image = Image.fromarray(image_array, mode="RGB")
+                    spectral = {
+                        name: _resize_spectral_band(
+                            band, categorical=name in {"scl", "valid"}
+                        )
+                        for name, band in spectral.items()
+                    }
+                    spectral["valid"] = spectral["valid"] > 0.5
+                    return image, spectral
+    except rasterio.errors.RasterioIOError:
+        pass
+
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    return image, spectral
 
 
 # --------------------------------------------------
@@ -395,14 +439,16 @@ async def predict_temporal(
                 raise ValueError("Sample paths must identify a matching bundled T1/T2 pair.")
             img_a = Image.open(pair[0]).convert("RGB")
             img_b = Image.open(pair[1]).convert("RGB")
+            spectral_t1 = None
+            spectral_t2 = None
         except Exception:
             return {"success": False, "error": "Invalid sample paths."}
     elif before_image and after_image:
         try:
             t1_contents = await before_image.read()
-            img_a = Image.open(io.BytesIO(t1_contents)).convert("RGB")
+            img_a, spectral_t1 = _decode_uploaded_image(t1_contents)
             t2_contents = await after_image.read()
-            img_b = Image.open(io.BytesIO(t2_contents)).convert("RGB")
+            img_b, spectral_t2 = _decode_uploaded_image(t2_contents)
         except Exception:
             return {"success": False, "error": "Invalid image file(s)."}
     else:
@@ -442,6 +488,8 @@ async def predict_temporal(
             img_b_tensor,
             DEVICE,
             threshold,
+            spectral_t1=spectral_t1,
+            spectral_t2=spectral_t2,
         )
     except (RuntimeError, ValueError) as exc:
         logger.exception("Temporal prediction failed.")
@@ -450,32 +498,56 @@ async def predict_temporal(
             detail=f"Temporal inference failed: {exc}",
         ) from exc
     final_deforestation_mask = inference["final_mask"]
+    change_metrics = forest_change_metrics(
+        inference["mask_t1"],
+        inference["mask_t2"],
+        total_area_hectares=total_area_ha,
+        valid_mask=(
+            np.asarray(spectral_t1["valid"], dtype=bool)
+            & np.asarray(spectral_t2["valid"], dtype=bool)
+            if spectral_t1 is not None
+            and spectral_t2 is not None
+            and "valid" in spectral_t1
+            and "valid" in spectral_t2
+            else None
+        ),
+        deforestation_mask=final_deforestation_mask,
+    )
+    forest_change_overlay = rgba_mask_to_data_uri(final_deforestation_mask)
 
     changed_pixels = int(np.sum(final_deforestation_mask))
     total_pixels = int(final_deforestation_mask.size)
     deforestation_percentage = (changed_pixels / total_pixels) * 100
+    if changed_pixels == 0:
+        area_loss_hectares = 0.0
+    elif total_area_ha is not None:
+        area_loss_hectares = round(
+            total_area_ha * (changed_pixels / total_pixels), 3
+        )
+    else:
+        area_loss_hectares = round(changed_pixels * 0.01, 3)
 
     return {
         "success": True,
         "before_image": image_to_base64(img_a),
         "after_image": image_to_base64(img_b),
         "deforestation_mask": rgba_mask_to_data_uri(final_deforestation_mask),
-        "deforestation_overlay": rgba_mask_to_data_uri(final_deforestation_mask),
+        "forest_change_mask": forest_change_overlay,
+        "forest_change_overlay": forest_change_overlay,
+        "deforestation_overlay": forest_change_overlay,
+        **{
+            key: value
+            for key, value in change_metrics.items()
+            if not key.endswith("_mask")
+        },
         "changed_pixels": changed_pixels,
         "deforestation_percentage": round(deforestation_percentage, 2),
         "deforestation_pct": round(deforestation_percentage, 2),
         "total_pixels": total_pixels,
         "total_area_ha": total_area_ha,
-        "deforestation_hectares": (
-            round((changed_pixels / total_pixels) * total_area_ha, 4)
-            if total_area_ha is not None
-            else None
-        ),
-        "area_loss_hectares": (
-            round((changed_pixels / total_pixels) * total_area_ha, 4)
-            if total_area_ha is not None
-            else None
-        ),
+        "deforestation_hectares": area_loss_hectares,
+        "area_loss_hectares": area_loss_hectares,
+        "status": change_metrics["status"],
         "area_estimate_method": "WGS84 geodesic bounding-box area" if total_area_ha is not None else None,
         "area_note": (
             None
@@ -489,6 +561,5 @@ async def predict_temporal(
         "temporal_probability_max": inference["temporal_probability_max"],
         "temporal_probability_mean": inference["temporal_probability_mean"],
         "temporal_threshold_used": inference["temporal_threshold_used"],
-        "used_logical_fallback": inference["used_logical_fallback"],
         "benchmark_metadata": BENCHMARK_METADATA,
     }
