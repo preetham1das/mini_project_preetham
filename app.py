@@ -3174,13 +3174,6 @@ def predict_kaggle_amazon():
         return jsonify({"error": "Upload both Sentinel-1 and Sentinel-2 GeoTIFF files."}), 400
     try:
         threshold = parse_probability_threshold(request.form.get("threshold"), 0.5)
-        model = get_kaggle_amazon_model()
-        normalization = json.loads(KAGGLE_AMAZON_NORMALIZATION.read_text(encoding="utf-8"))
-        low1 = np.asarray(normalization["s1"]["low"], dtype=np.float32)[:, None, None]
-        high1 = np.asarray(normalization["s1"]["high"], dtype=np.float32)[:, None, None]
-        low2 = np.asarray(normalization["s2"]["low"], dtype=np.float32)[:, None, None]
-        high2 = np.asarray(normalization["s2"]["high"], dtype=np.float32)[:, None, None]
-
         temp_paths = []
         try:
             for upload in (s1_upload, s2_upload):
@@ -3213,6 +3206,13 @@ def predict_kaggle_amazon():
 
                 if not valid.any():
                     raise ValueError("The rasters contain no mutually valid pixels in the overlapping area.")
+
+                model = get_kaggle_amazon_model()
+                normalization = json.loads(KAGGLE_AMAZON_NORMALIZATION.read_text(encoding="utf-8"))
+                low1 = np.asarray(normalization["s1"]["low"], dtype=np.float32)[:, None, None]
+                high1 = np.asarray(normalization["s1"]["high"], dtype=np.float32)[:, None, None]
+                low2 = np.asarray(normalization["s2"]["low"], dtype=np.float32)[:, None, None]
+                high2 = np.asarray(normalization["s2"]["high"], dtype=np.float32)[:, None, None]
 
                 # Train-only robust normalization (1st and 99th percentiles)
                 s1 = np.clip((s1 - low1) / np.maximum(high1 - low1, 1e-6), 0.0, 1.0)
