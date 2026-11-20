@@ -827,7 +827,189 @@
 .kaggle-audit-note { padding: 9px 11px; border-left: 2px solid var(--cyan-bright); background: rgba(6,182,212,.05); border-radius: 0 7px 7px 0; }
 .kaggle-result-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
 
-/* ── Timeline dock (bottom) ──────────────────────────────────── */
+/* ── Cumulative deforestation timeline ───────────────────────── */
+
+.map-workspace {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.map-workspace > .map-stage {
+  flex: 1;
+  min-height: 240px;
+}
+
+.timeline-control-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.timeline-control-bar__title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.timeline-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.timeline-preset {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 3px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 750;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+
+.timeline-preset:hover {
+  border-color: var(--cyan);
+  background: var(--tint-cyan);
+}
+
+.timeline-preset span {
+  color: var(--text-faint);
+  font-size: 8px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+.temporal-scrubber {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-strong);
+  color: var(--text);
+  box-shadow: var(--shadow-md);
+}
+
+.temporal-scrubber__head,
+.temporal-scrubber__intro,
+.temporal-scrubber__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.temporal-scrubber__head {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.temporal-scrubber__intro {
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.temporal-scrubber__title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+}
+
+.temporal-scrubber__caption {
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+
+.temporal-scrubber__metric {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-left: auto;
+  color: var(--red-bright);
+  font-size: 10px;
+}
+
+.temporal-scrubber__metric strong {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.temporal-scrubber__actions { flex-shrink: 0; }
+
+.temporal-scrubber__slider {
+  display: grid;
+  grid-template-columns: auto minmax(100px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+
+.temporal-scrubber__slider input {
+  width: 100%;
+  accent-color: var(--red);
+  cursor: pointer;
+}
+
+.temporal-scrubber__slider input:disabled { cursor: not-allowed; }
+
+.temporal-scrubber__checkpoints {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.temporal-scrubber__checkpoint {
+  min-width: 40px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 9px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.temporal-scrubber__checkpoint:hover,
+.temporal-scrubber__checkpoint.is-active {
+  border-color: rgba(239, 68, 68, 0.48);
+  background: var(--tint-red);
+  color: var(--red-bright);
+}
+
+@media (max-width: 640px) {
+  .temporal-scrubber__head { align-items: flex-start; }
+  .temporal-scrubber__actions { width: 100%; }
+  .temporal-scrubber__actions .btn { flex: 1; }
+  .temporal-scrubber__slider { grid-template-columns: 1fr 1fr; }
+  .temporal-scrubber__slider input { grid-column: 1 / -1; grid-row: 2; }
+}
+
+/* ── Sentinel acquisition timeline dock (map overlay) ────────── */
 
 .timeline-dock {
   position: absolute;
@@ -1980,7 +2162,7 @@
     right: 10px;
     bottom: 10px;
     width: auto;
-    max-height: 52%;
+    max-height: calc(100% - 70px);
   }
   .map-stage .drawer { top: auto; }
   .timeline-dock { left: 10px; right: 10px; bottom: 10px; }
@@ -1999,4 +2181,8 @@
   .tile-pair { grid-template-columns: 1fr; }
   .control-grid { grid-template-columns: 1fr; }
   .field-grid { grid-template-columns: 1fr; }
+  .fw-content--map { overflow-x: hidden; overflow-y: auto; }
+  .fw-content--map .fw-map-page { flex: 0 0 auto; }
+  .fw-content--map .map-workspace { flex: 0 0 auto; min-height: 430px; }
+  .fw-content--map .map-workspace > .map-stage { flex: 0 0 320px; min-height: 320px; }
 }

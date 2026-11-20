@@ -1,14 +1,18 @@
+import asyncio
 from pathlib import Path
+from datetime import date
 import io
 import base64
 import logging
 import math
 
 import numpy as np
+import cv2
 from PIL import Image
 import torch
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
 import rasterio
 
 import sys
@@ -25,6 +29,7 @@ from backend.sentinel_service import (
     rgba_mask_to_data_uri,
     sentinel_bands_to_reflectance,
 )
+from backend.sentinel_fetcher import fetch_s2_patch
 
 # --------------------------------------------------
 # Configuration
@@ -34,10 +39,30 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
 DEVICE = torch.device("cpu")
 IMAGE_SIZE = 256
+MAX_AOI_SPAN_DEGREES = 0.15
 THRESHOLD = 0.5
 
 CHECKPOINT_PATH = PROJECT_ROOT / "models" / "best_unet_model.pth"
 TEMPORAL_CHECKPOINT_PATH = PROJECT_ROOT / "models" / "best_temporal_model.pth"
+
+
+class AOIAnalysisRequest(BaseModel):
+    bbox: list[float]
+    t1_date: date
+    t2_date: date
+
+    @field_validator("bbox")
+    @classmethod
+    def validate_bbox(cls, bbox: list[float]) -> list[float]:
+        if len(bbox) != 4 or not all(np.isfinite(value) for value in bbox):
+            raise ValueError("bbox must contain four finite coordinates.")
+        min_lon, min_lat, max_lon, max_lat = bbox
+        if not (
+            -180 <= min_lon < max_lon <= 180
+            and -90 <= min_lat < max_lat <= 90
+        ):
+            raise ValueError("bbox must be a non-empty EPSG:4326 bounding box.")
+        return bbox
 
 
 def _resolve_sample_path(sample_path, allowed_root):
@@ -242,6 +267,123 @@ def root():
 
     return {
         "message": "Forest Segmentation API is running"
+    }
+
+
+@app.post("/api/analyze-aoi")
+async def analyze_aoi(request: AOIAnalysisRequest):
+    bbox = request.bbox
+    min_lon, min_lat, max_lon, max_lat = bbox
+    if max(max_lon - min_lon, max_lat - min_lat) > MAX_AOI_SPAN_DEGREES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "AOI width and height must each be no more than "
+                f"{MAX_AOI_SPAN_DEGREES} degrees (about 15 km)."
+            ),
+        )
+
+    try:
+        t1, t2 = await asyncio.gather(
+            asyncio.to_thread(
+                fetch_s2_patch,
+                bbox,
+                request.t1_date.isoformat(),
+                size=(IMAGE_SIZE, IMAGE_SIZE),
+            ),
+            asyncio.to_thread(
+                fetch_s2_patch,
+                bbox,
+                request.t2_date.isoformat(),
+                size=(IMAGE_SIZE, IMAGE_SIZE),
+            ),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    def predict_probability(patch):
+        rgb = np.stack(
+            [patch["red"], patch["green"], patch["blue"]],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        expected_shape = (3, IMAGE_SIZE, IMAGE_SIZE)
+        if rgb.shape != expected_shape:
+            raise ValueError(f"Sentinel RGB patch must have shape {expected_shape}.")
+
+        image_tensor = torch.from_numpy(
+            np.ascontiguousarray(rgb)
+        ).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            probabilities = torch.sigmoid(forest_model(image_tensor))
+        expected_output_shape = (1, 1, IMAGE_SIZE, IMAGE_SIZE)
+        if tuple(probabilities.shape) != expected_output_shape:
+            raise RuntimeError(
+                f"Stage-1 model output must have shape {expected_output_shape}."
+            )
+        return probabilities[0, 0].cpu().numpy().astype(np.float32, copy=False)
+
+    try:
+        prob_t1 = predict_probability(t1)
+        prob_t2 = predict_probability(t2)
+    except (RuntimeError, ValueError) as exc:
+        logger.exception("AOI Stage-1 inference failed.")
+        raise HTTPException(
+            status_code=500,
+            detail=f"AOI inference failed: {exc}",
+        ) from exc
+
+    red_t1 = np.asarray(t1["red"], dtype=np.float32)
+    red_t2 = np.asarray(t2["red"], dtype=np.float32)
+    nir_t1 = np.asarray(t1["nir"], dtype=np.float32)
+    nir_t2 = np.asarray(t2["nir"], dtype=np.float32)
+    ndvi_t1 = (nir_t1 - red_t1) / (nir_t1 + red_t1 + 1e-6)
+    ndvi_t2 = (nir_t2 - red_t2) / (nir_t2 + red_t2 + 1e-6)
+    both_valid = (np.asarray(t1["valid_mask"]) > 0) & (
+        np.asarray(t2["valid_mask"]) > 0
+    )
+    forest_t1 = (prob_t1 > 0.50) & (ndvi_t1 > 0.45)
+    non_forest_t2 = (prob_t2 < 0.45) & (ndvi_t2 < 0.35)
+    ndvi_drop = (ndvi_t1 - ndvi_t2) > 0.20
+    raw_mask = (
+        both_valid & forest_t1 & non_forest_t2 & ndvi_drop
+    ).astype(np.uint8)
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    opened_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        opened_mask,
+        connectivity=8,
+    )
+    clean_mask = np.zeros_like(opened_mask)
+    for label in range(1, component_count):
+        if stats[label, cv2.CC_STAT_AREA] >= 20:
+            clean_mask[labels == label] = 1
+
+    rgba = np.zeros((*clean_mask.shape, 4), dtype=np.uint8)
+    rgba[clean_mask == 1] = (239, 68, 68, 195)
+    png_buffer = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(png_buffer, format="PNG")
+    overlay_png = (
+        "data:image/png;base64,"
+        + base64.b64encode(png_buffer.getvalue()).decode("ascii")
+    )
+
+    deforested_pixels = int(np.count_nonzero(clean_mask))
+    total_pixels = clean_mask.size
+    area_hectares = (
+        geodesic_area_hectares(
+            (bbox[0], bbox[1], bbox[2], bbox[3])
+        )
+        * deforested_pixels
+        / total_pixels
+    )
+    return {
+        "overlay_png": overlay_png,
+        "bbox": bbox,
+        "deforested_pixels": deforested_pixels,
+        "area_hectares": area_hectares,
+        "t1_scene_date": t1["scene_date"],
+        "t2_scene_date": t2["scene_date"],
     }
 
 

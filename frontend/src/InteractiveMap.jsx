@@ -17,11 +17,20 @@
 import React, {
   useState,
   useEffect,
+  useLayoutEffect,
   useRef,
   useCallback,
   useMemo,
 } from 'react';
 import L from 'leaflet';
+import {
+  ImageOverlay,
+  MapContainer,
+  Rectangle,
+  TileLayer,
+  useMap,
+  useMapEvents,
+} from 'react-leaflet';
 import {
   Satellite,
   Layers,
@@ -30,6 +39,8 @@ import {
   Cloud,
   Eye,
   EyeOff,
+  Play,
+  Pause,
   Square,
   X,
   Loader,
@@ -55,6 +66,70 @@ import {
 function formatDate(isoStr) {
   if (!isoStr) return '—';
   return isoStr.slice(0, 10);
+}
+
+function getTodayDateString() {
+  const today = new Date();
+  const month = String(today.getMonth() + 1).padStart(2, '0');
+  const day = String(today.getDate()).padStart(2, '0');
+  return `${today.getFullYear()}-${month}-${day}`;
+}
+
+function shiftDateByYears(dateString, years) {
+  const [year, month, day] = dateString.split('-').map(Number);
+  const targetYear = year + years;
+  const targetDay = Math.min(day, new Date(targetYear, month, 0).getDate());
+  return `${targetYear}-${String(month).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}`;
+}
+
+function buildTimelineCheckpoints(fromDate, toDate) {
+  if (!fromDate || !toDate || fromDate >= toDate) return [];
+
+  const firstYear = Number(fromDate.slice(0, 4));
+  const lastYear = Number(toDate.slice(0, 4));
+  const yearCount = lastYear - firstYear + 1;
+  const checkpointCount = Math.min(5, yearCount);
+  const years = Array.from({ length: checkpointCount }, (_, index) => (
+    checkpointCount === 1
+      ? lastYear
+      : Math.round(firstYear + ((lastYear - firstYear) * index) / (checkpointCount - 1))
+  ));
+  const checkpoints = years
+    .map((year) => ({
+      year,
+      date: year === lastYear ? toDate : `${year}-12-31`,
+    }))
+    .filter((checkpoint) => checkpoint.date > fromDate);
+
+  if (!checkpoints.some((checkpoint) => checkpoint.date === toDate)) {
+    checkpoints.push({ year: lastYear, date: toDate });
+  }
+
+  return checkpoints;
+}
+
+async function postAoiAnalysis(bbox, t1Date, t2Date, signal) {
+  const response = await fetch('/api/analyze-aoi', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      bbox,
+      t1_date: t1Date,
+      t2_date: t2Date,
+    }),
+    signal,
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    const detail = Array.isArray(result?.detail)
+      ? result.detail.map((issue) => issue.msg).filter(Boolean).join('; ')
+      : result?.detail || result?.error;
+    throw new Error(detail || `AOI analysis failed (${response.status}).`);
+  }
+  if (!result || typeof result.overlay_png !== 'string') {
+    throw new Error('AOI analysis response did not include an overlay image.');
+  }
+  return result;
 }
 
 function fmtCloud(v) {
@@ -198,6 +273,28 @@ function generateCloudMaskDataUrl(imgSrc, cloudPct) {
 const BASE_CENTER = [20.0, 0.0];
 const BASE_ZOOM = 2;
 
+function MapRefBridge({ mapRef, onMapReady }) {
+  const map = useMap();
+  useLayoutEffect(() => {
+    mapRef.current = map;
+    onMapReady();
+    return () => {
+      if (mapRef.current === map) mapRef.current = null;
+    };
+  }, [map, mapRef, onMapReady]);
+  return null;
+}
+
+function MapEventBridge({ handlers }) {
+  const map = useMap();
+  useMapEvents({
+    click: (event) => handlers.onClick(event, map),
+    mousemove: (event) => handlers.onMouseMove(event, map),
+    mouseout: handlers.onMouseOut,
+  });
+  return null;
+}
+
 // ── component ─────────────────────────────────────────────────────────────────
 
 export default function InteractiveMap({
@@ -212,11 +309,7 @@ export default function InteractiveMap({
   workspace = 'map',
 }) {
   // Map refs
-  const mapDivRef   = useRef(null);
   const mapRef      = useRef(null);
-  const esriLayerRef = useRef(null);
-  const osmLayerRef  = useRef(null);
-  const aoiLayerRef  = useRef(null);        // L.Rectangle for AOI
   const sentinelLayerRef = useRef(null);    // L.imageOverlay for active sentinel image
   const beforeLayerRef   = useRef(null);    // L.imageOverlay for "before" comparison
   const aiLayerRef       = useRef(null);    // L.imageOverlay for AI result
@@ -230,9 +323,31 @@ export default function InteractiveMap({
   // UI state
   const [baseMap, setBaseMap] = useState('esri'); // 'esri' | 'osm'
   const [coords, setCoords] = useState({ lat: null, lon: null });
+  const [mapReady, setMapReady] = useState(false);
   const [aoiBounds, setAoiBounds] = useState(null);   // L.LatLngBounds | null
+  const [selectedBounds, setSelectedBounds] = useState(null);
+  const [t1Date, setT1Date] = useState('2021-07-01');
+  const [t2Date, setT2Date] = useState('2026-07-01');
+  const todayDate = getTodayDateString();
+  const isTemporalRangeValid = Boolean(t1Date && t2Date && t1Date < t2Date);
+  const temporalRangeError = !t1Date || !t2Date
+    ? 'Choose both dates to analyze this area.'
+    : !isTemporalRangeValid
+      ? 'From Date (Baseline) must be earlier than To Date (Target).'
+      : '';
+  const timelineCheckpoints = useMemo(
+    () => buildTimelineCheckpoints(t1Date, t2Date),
+    [t1Date, t2Date]
+  );
+  const timelinePresets = useMemo(() => [
+    { label: '1Y', fromDate: shiftDateByYears(todayDate, -1), toDate: todayDate },
+    { label: '3Y', fromDate: shiftDateByYears(todayDate, -3), toDate: todayDate },
+    { label: '5Y', fromDate: shiftDateByYears(todayDate, -5), toDate: todayDate },
+    { label: 'Max', fromDate: '2018-01-01', toDate: todayDate },
+  ], [todayDate]);
   const [isDrawing, setIsDrawing] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(true);  // floating control drawer
+  const onMapReady = useCallback(() => setMapReady(true), []);
 
   // Sentinel search
   const [startDate, setStartDate] = useState('2023-01-01');
@@ -286,6 +401,16 @@ export default function InteractiveMap({
   const [analysisMethod, setAnalysisMethod] = useState('temporal');
   const [analysisOverlayVisible, setAnalysisOverlayVisible] = useState(true);
   const [overlayOpacity, setOverlayOpacity] = useState(0.55);
+  const [aoiAnalysisResult, setAoiAnalysisResult] = useState(null);
+  const [aoiAnalysisLoading, setAoiAnalysisLoading] = useState(false);
+  const [aoiAnalysisError, setAoiAnalysisError] = useState('');
+  const aoiAnalysisRequestRef = useRef(null);
+  const [timelineResults, setTimelineResults] = useState([]);
+  const [timelineIndex, setTimelineIndex] = useState(0);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState('');
+  const [timelinePlaying, setTimelinePlaying] = useState(false);
+  const timelineRequestRef = useRef(null);
   const analysisLayerRef = useRef(null); // L.imageOverlay for analysis overlay
   // Layer view mode on the Leaflet map: 'before' | 'after' | 'blend'
   const [mapViewMode, setMapViewMode] = useState('after');
@@ -315,39 +440,8 @@ export default function InteractiveMap({
   }, [acquisitions, hasSearched, onAcquisitions]);
 
   useEffect(() => {
-    if (!mapDivRef.current || mapRef.current) return;
-
-    const esri = L.tileLayer(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      { maxZoom: 18, attribution: '© Esri' }
-    );
-    const osm = L.tileLayer(
-      'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-      { maxZoom: 19, attribution: '© OpenStreetMap' }
-    );
-
-    esriLayerRef.current = esri;
-    osmLayerRef.current  = osm;
-
-    const map = L.map(mapDivRef.current, {
-      center: BASE_CENTER,
-      zoom: BASE_ZOOM,
-      layers: [esri],
-      zoomControl: true,
-      // KEY FIX: worldCopyJump prevents Leaflet from accumulating longitude
-      // offsets that exceed ±180 when the user pans across the antimeridian.
-      // Without this, e.latlng.lng can return values like 435° or -435°.
-      worldCopyJump: true,
-    });
-
-    // Coordinate display uses .wrap() so the readout always shows [-180, 180].
-    map.on('mousemove', (e) => {
-      const lng = wrapLng(e.latlng.lng);
-      setCoords({ lat: e.latlng.lat.toFixed(5), lon: lng.toFixed(5) });
-    });
-    map.on('mouseout', () => setCoords({ lat: null, lon: null }));
-
-    mapRef.current = map;
+    const map = mapRef.current;
+    if (!map) return;
 
     // Use ResizeObserver to call invalidateSize() whenever the container
     // dimensions actually change (replaces the unreliable fixed 200ms timeout).
@@ -355,35 +449,19 @@ export default function InteractiveMap({
     let ro = null;
     if (typeof ResizeObserver !== 'undefined') {
       ro = new ResizeObserver(() => {
-        mapRef.current?.invalidateSize({ pan: false });
+        map.invalidateSize({ pan: false });
       });
-      ro.observe(mapDivRef.current);
+      ro.observe(map.getContainer());
     } else {
       // Fallback for old browsers
-      setTimeout(() => mapRef.current?.invalidateSize(), 300);
+      setTimeout(() => map.invalidateSize(), 300);
     }
 
     return () => {
       if (ro) ro.disconnect();
-      map.remove();
-      mapRef.current = null;
     };
-  }, []);
+  }, [mapReady]);
 
-
-  // ── Base map switch ──────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    if (baseMap === 'esri') {
-      if (osmLayerRef.current)  map.removeLayer(osmLayerRef.current);
-      if (esriLayerRef.current) esriLayerRef.current.addTo(map);
-    } else {
-      if (esriLayerRef.current) map.removeLayer(esriLayerRef.current);
-      if (osmLayerRef.current)  osmLayerRef.current.addTo(map);
-    }
-  }, [baseMap]);
 
   // ── Opacity ──────────────────────────────────────────────────────────────────
 
@@ -454,14 +532,41 @@ export default function InteractiveMap({
 
   // ── AOI Drawing ──────────────────────────────────────────────────────────────
 
+  const clearAoiAnalysis = useCallback(() => {
+    aoiAnalysisRequestRef.current?.abort();
+    aoiAnalysisRequestRef.current = null;
+    timelineRequestRef.current?.abort();
+    timelineRequestRef.current = null;
+    setAoiAnalysisResult(null);
+    setAoiAnalysisError('');
+    setAoiAnalysisLoading(false);
+    setTimelineResults([]);
+    setTimelineIndex(0);
+    setTimelineLoading(false);
+    setTimelineError('');
+    setTimelinePlaying(false);
+  }, []);
+
+  const updateTimelineDate = useCallback((setter, value) => {
+    clearAoiAnalysis();
+    setter(value);
+  }, [clearAoiAnalysis]);
+
+  const applyTimelinePreset = useCallback((preset) => {
+    clearAoiAnalysis();
+    setT1Date(preset.fromDate);
+    setT2Date(preset.toDate);
+  }, [clearAoiAnalysis]);
+
   const startDrawing = useCallback(() => {
     const map = mapRef.current;
     if (!map) return;
+    clearAoiAnalysis();
     setIsDrawing(true);
     drawingRef.current = true;
     map.dragging.disable();
     map.getContainer().style.cursor = 'crosshair';
-  }, []);
+  }, [clearAoiAnalysis]);
 
   const cancelDrawing = useCallback(() => {
     const map = mapRef.current;
@@ -474,11 +579,90 @@ export default function InteractiveMap({
     drawStartRef.current = null;
   }, []);
 
+  const handleMapClick = useCallback((event, map) => {
+    if (!drawingRef.current) return;
+    const clickedLatLng = event.latlng.wrap();
+    if (!drawStartRef.current) {
+      clearAoiAnalysis();
+      drawStartRef.current = clickedLatLng;
+      return;
+    }
+
+    const finalBounds = L.latLngBounds(drawStartRef.current, clickedLatLng);
+    const [west, south, east, north] = bboxFromLatLngBounds(finalBounds);
+    const bboxErr = validateBbox(west, south, east, north);
+    if (bboxErr || (north - south) < 0.001 || (east - west) < 0.001) {
+      cancelDrawing();
+      return;
+    }
+
+    if (drawRectRef.current) {
+      map.removeLayer(drawRectRef.current);
+      drawRectRef.current = null;
+    }
+
+    const bounds = [[south, west], [north, east]];
+    setSelectedBounds(bounds);
+    setAoiBounds(L.latLngBounds(bounds));
+    setAcquisitions([]);
+    setFromIdx(null);
+    setToIdx(null);
+    setFromData(null);
+    setToData(null);
+    setAnalysisResult(null);
+    setAnalysisError('');
+    setSearchError('');
+
+    drawingRef.current = false;
+    drawStartRef.current = null;
+    setIsDrawing(false);
+    map.dragging.enable();
+    map.getContainer().style.cursor = '';
+  }, [cancelDrawing, clearAoiAnalysis]);
+
+  const handleMapMouseMove = useCallback((event, map) => {
+    const lng = wrapLng(event.latlng.lng);
+    setCoords({ lat: event.latlng.lat.toFixed(5), lon: lng.toFixed(5) });
+    if (!drawingRef.current || !drawStartRef.current) return;
+    const wrappedLatLng = event.latlng.wrap();
+    if (!drawRectRef.current) {
+      drawRectRef.current = L.rectangle(
+        [drawStartRef.current, wrappedLatLng],
+        {
+          color: '#f59e0b',
+          weight: 2,
+          fillColor: '#fbbf24',
+          fillOpacity: 0.15,
+          dashArray: '5 4',
+        }
+      ).addTo(map);
+    } else {
+      drawRectRef.current.setBounds(
+        L.latLngBounds(drawStartRef.current, wrappedLatLng)
+      );
+    }
+  }, []);
+
+  const handleMapMouseOut = useCallback(() => {
+    setCoords({ lat: null, lon: null });
+  }, []);
+
+  const mapEventHandlers = useMemo(() => ({
+    onClick: handleMapClick,
+    onMouseMove: handleMapMouseMove,
+    onMouseOut: handleMapMouseOut,
+  }), [
+    handleMapClick,
+    handleMapMouseMove,
+    handleMapMouseOut,
+  ]);
+
   const clearAoi = useCallback(() => {
     const map = mapRef.current;
     if (!map) return;
-    if (aoiLayerRef.current) { map.removeLayer(aoiLayerRef.current); aoiLayerRef.current = null; }
+    clearAoiAnalysis();
     setAoiBounds(null);
+    setSelectedBounds(null);
     setAcquisitions([]);
     setFromIdx(null);
     setToIdx(null);
@@ -491,96 +675,7 @@ export default function InteractiveMap({
     if (sentinelLayerRef.current) { map.removeLayer(sentinelLayerRef.current); sentinelLayerRef.current = null; }
     if (beforeLayerRef.current)   { map.removeLayer(beforeLayerRef.current);   beforeLayerRef.current = null; }
     if (analysisLayerRef.current) { map.removeLayer(analysisLayerRef.current); analysisLayerRef.current = null; }
-  }, []);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const onMouseDown = (e) => {
-      if (!drawingRef.current) return;
-      // .wrap() normalizes lng to [-180, 180] — prevents out-of-range coordinates
-      // from Leaflet's continuous-world system reaching our AOI bounds.
-      const wrappedLatLng = e.latlng.wrap();
-      drawStartRef.current = wrappedLatLng;
-      if (drawRectRef.current) { map.removeLayer(drawRectRef.current); drawRectRef.current = null; }
-      drawRectRef.current = L.rectangle([wrappedLatLng, wrappedLatLng], {
-        color: '#f59e0b', weight: 2, fillColor: '#fbbf24', fillOpacity: 0.15, dashArray: '5 4',
-      }).addTo(map);
-    };
-
-    const onMouseMove = (e) => {
-      if (!drawingRef.current || !drawStartRef.current || !drawRectRef.current) return;
-      const wrappedLatLng = e.latlng.wrap();
-      drawRectRef.current.setBounds(L.latLngBounds(drawStartRef.current, wrappedLatLng));
-    };
-
-    const onMouseUp = (e) => {
-      if (!drawingRef.current || !drawStartRef.current) return;
-
-      const wrappedEnd = e.latlng.wrap();
-      const finalBounds = L.latLngBounds(drawStartRef.current, wrappedEnd);
-
-      // Compute wrapped bbox for the size-check (consistent with what bboxFromLatLngBounds returns)
-      const [west, south, east, north] = bboxFromLatLngBounds(finalBounds);
-
-      // Log for debugging — these are the exact values that will be sent to the backend.
-      console.debug('[AOI] Drawn bounds:', { west, south, east, north });
-
-      // Validate before accepting the AOI
-      const bboxErr = validateBbox(west, south, east, north);
-      if (bboxErr) {
-        console.error('[AOI] Invalid bbox after drawing:', bboxErr, { west, south, east, north });
-        cancelDrawing();
-        return;
-      }
-
-      // Too small? Ignore.
-      if ((north - south) < 0.001 || (east - west) < 0.001) {
-        cancelDrawing();
-        return;
-      }
-
-      // Remove temp rect
-      if (drawRectRef.current) { map.removeLayer(drawRectRef.current); drawRectRef.current = null; }
-
-      // Remove old AOI
-      if (aoiLayerRef.current) { map.removeLayer(aoiLayerRef.current); aoiLayerRef.current = null; }
-
-      // Draw permanent AOI using the wrapped finalBounds
-      aoiLayerRef.current = L.rectangle(finalBounds, {
-        color: '#f59e0b', weight: 2.5, fillColor: '#fbbf24', fillOpacity: 0.08,
-        dashArray: '6 4',
-      }).addTo(map);
-
-      setAoiBounds(finalBounds);
-      setAcquisitions([]);
-      setFromIdx(null);
-      setToIdx(null);
-      setFromData(null);
-      setToData(null);
-      setAnalysisResult(null);
-      setAnalysisError('');
-      setSearchError('');
-
-      drawingRef.current = false;
-      drawStartRef.current = null;
-      setIsDrawing(false);
-      map.dragging.enable();
-      map.getContainer().style.cursor = '';
-    };
-
-    map.on('mousedown', onMouseDown);
-    map.on('mousemove', onMouseMove);
-    map.on('mouseup', onMouseUp);
-
-    return () => {
-      map.off('mousedown', onMouseDown);
-      map.off('mousemove', onMouseMove);
-      map.off('mouseup', onMouseUp);
-    };
-  }, [cancelDrawing]);
-
+  }, [clearAoiAnalysis]);
 
   const loadAmazonPreset = useCallback(() => {
     const map = mapRef.current;
@@ -591,14 +686,10 @@ export default function InteractiveMap({
     const east = -62.165;
     const bounds = L.latLngBounds([[south, west], [north, east]]);
 
+    clearAoiAnalysis();
     if (drawRectRef.current) { map.removeLayer(drawRectRef.current); drawRectRef.current = null; }
-    if (aoiLayerRef.current) { map.removeLayer(aoiLayerRef.current); aoiLayerRef.current = null; }
 
-    aoiLayerRef.current = L.rectangle(bounds, {
-      color: '#f59e0b', weight: 2.5, fillColor: '#fbbf24', fillOpacity: 0.08,
-      dashArray: '6 4',
-    }).addTo(map);
-
+    setSelectedBounds([[south, west], [north, east]]);
     setAoiBounds(bounds);
     setAcquisitions([]);
     setFromIdx(null);
@@ -609,7 +700,7 @@ export default function InteractiveMap({
     setAnalysisError('');
     setSearchError('');
     map.fitBounds(bounds, { padding: [20, 20] });
-  }, []);
+  }, [clearAoiAnalysis]);
 
   // ── Sentinel Search ──────────────────────────────────────────────────────────
 
@@ -1153,6 +1244,134 @@ export default function InteractiveMap({
     }
   }, [aoiBounds]);
 
+  const handleAnalyzeSelectedArea = useCallback(async () => {
+    if (
+      !selectedBounds ||
+      !isTemporalRangeValid ||
+      aoiAnalysisLoading ||
+      timelineLoading
+    ) return;
+    const [[minLat, minLon], [maxLat, maxLon]] = selectedBounds;
+    const bbox = [minLon, minLat, maxLon, maxLat];
+    aoiAnalysisRequestRef.current?.abort();
+    timelineRequestRef.current?.abort();
+    timelineRequestRef.current = null;
+    setTimelineResults([]);
+    setTimelineIndex(0);
+    setTimelineLoading(false);
+    setTimelineError('');
+    setTimelinePlaying(false);
+    const controller = new AbortController();
+    aoiAnalysisRequestRef.current = controller;
+    setAoiAnalysisLoading(true);
+    setAoiAnalysisError('');
+    setAoiAnalysisResult(null);
+
+    try {
+      const result = await postAoiAnalysis(bbox, t1Date, t2Date, controller.signal);
+      setAoiAnalysisResult(result);
+    } catch (error) {
+      if (!(error instanceof Error && error.name === 'AbortError')) {
+        setAoiAnalysisError(
+          error instanceof Error ? error.message : 'AOI analysis failed.'
+        );
+      }
+    } finally {
+      if (aoiAnalysisRequestRef.current === controller) {
+        aoiAnalysisRequestRef.current = null;
+        setAoiAnalysisLoading(false);
+      }
+    }
+  }, [
+    selectedBounds,
+    t1Date,
+    t2Date,
+    isTemporalRangeValid,
+    aoiAnalysisLoading,
+    timelineLoading,
+  ]);
+
+  const handleRunTimelineSeries = useCallback(async () => {
+    if (
+      !selectedBounds ||
+      !isTemporalRangeValid ||
+      aoiAnalysisLoading ||
+      timelineLoading
+    ) return;
+
+    const [[minLat, minLon], [maxLat, maxLon]] = selectedBounds;
+    const bbox = [minLon, minLat, maxLon, maxLat];
+    timelineRequestRef.current?.abort();
+    const controller = new AbortController();
+    timelineRequestRef.current = controller;
+    setTimelineResults([]);
+    setTimelineIndex(0);
+    setTimelineError('');
+    setTimelinePlaying(false);
+    setTimelineLoading(true);
+    setAoiAnalysisResult(null);
+    setAoiAnalysisError('');
+
+    try {
+      const completedSteps = [];
+      for (const checkpoint of timelineCheckpoints) {
+        const result = await postAoiAnalysis(
+          bbox,
+          t1Date,
+          checkpoint.date,
+          controller.signal
+        );
+        completedSteps.push({
+          ...result,
+          year: checkpoint.year,
+          date: checkpoint.date,
+        });
+        setTimelineResults([...completedSteps]);
+        setTimelineIndex(completedSteps.length - 1);
+      }
+    } catch (error) {
+      if (!(error instanceof Error && error.name === 'AbortError')) {
+        setTimelineError(
+          error instanceof Error ? error.message : 'Timeline analysis failed.'
+        );
+      }
+    } finally {
+      if (timelineRequestRef.current === controller) {
+        timelineRequestRef.current = null;
+        setTimelineLoading(false);
+      }
+    }
+  }, [
+    selectedBounds,
+    isTemporalRangeValid,
+    aoiAnalysisLoading,
+    timelineLoading,
+    timelineCheckpoints,
+    t1Date,
+  ]);
+
+  const toggleTimelinePlayback = useCallback(() => {
+    if (timelinePlaying) {
+      setTimelinePlaying(false);
+      return;
+    }
+    if (timelineResults.length < 2 || timelineLoading) return;
+    if (timelineIndex >= timelineResults.length - 1) setTimelineIndex(0);
+    setTimelinePlaying(true);
+  }, [timelinePlaying, timelineResults.length, timelineIndex, timelineLoading]);
+
+  useEffect(() => {
+    if (!timelinePlaying || timelineResults.length < 2) return undefined;
+    const timer = window.setTimeout(() => {
+      if (timelineIndex >= timelineResults.length - 1) {
+        setTimelinePlaying(false);
+      } else {
+        setTimelineIndex((index) => index + 1);
+      }
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [timelinePlaying, timelineIndex, timelineResults.length]);
+
   // ── Derived render values ─────────────────────────────────────────────────────
 
   const canAnalyze = fromData !== null && toData !== null &&
@@ -1161,6 +1380,8 @@ export default function InteractiveMap({
     !analysing && !loadingPreview;
 
   const activeCloudStats = (mapViewMode === 'before' ? fromCloudStats : toCloudStats) || toCloudStats || fromCloudStats;
+  const activeTimelineResult = timelineResults[timelineIndex] || null;
+  const displayedAoiAnalysisResult = activeTimelineResult || aoiAnalysisResult;
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -1168,10 +1389,51 @@ export default function InteractiveMap({
   const showAcquisitionWorkflow = workspace === 'acquisition' || (workspace === 'map' && Boolean(aoiBounds));
 
   return (
+    <div className="map-workspace">
     <div className={`map-stage ${drawerOpen ? '' : 'is-drawer-collapsed'}`}>
 
-      {/* Leaflet canvas */}
-      <div ref={mapDivRef} className="map-canvas" />
+      <MapContainer
+        center={BASE_CENTER}
+        zoom={BASE_ZOOM}
+        zoomControl
+        worldCopyJump
+        className="map-canvas"
+      >
+        <MapEventBridge handlers={mapEventHandlers} />
+        <MapRefBridge mapRef={mapRef} onMapReady={onMapReady} />
+        {baseMap === 'esri' ? (
+          <TileLayer
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            attribution="Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics"
+            maxZoom={18}
+          />
+        ) : (
+          <TileLayer
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            attribution="© OpenStreetMap"
+            maxZoom={19}
+          />
+        )}
+        {selectedBounds && (
+          <Rectangle
+            bounds={selectedBounds}
+            pathOptions={{
+              color: '#f59e0b',
+              weight: 2.5,
+              fillColor: '#fbbf24',
+              fillOpacity: 0.08,
+              dashArray: '6 4',
+            }}
+          />
+        )}
+        {displayedAoiAnalysisResult?.overlay_png && selectedBounds && (
+          <ImageOverlay
+            url={displayedAoiAnalysisResult.overlay_png}
+            bounds={selectedBounds}
+            opacity={0.8}
+          />
+        )}
+      </MapContainer>
 
       {/* ─── Floating map toolbar ───────────────────────────────── */}
       <div className="map-toolbar">
@@ -1261,9 +1523,14 @@ export default function InteractiveMap({
                 </button>
               </div>
             ) : (
-              <button type="button" className="btn btn--sm btn--danger" style={{ width: '100%' }} onClick={cancelDrawing}>
-                <X size={12} /> Cancel drawing
-              </button>
+              <>
+                <button type="button" className="btn btn--sm btn--danger" style={{ width: '100%' }} onClick={cancelDrawing}>
+                  <X size={12} /> Cancel drawing
+                </button>
+                <div className="block__hint" style={{ marginTop: 6 }}>
+                  Click two opposite corners on the map.
+                </div>
+              </>
             )}
             {aoiBounds && !isDrawing && (() => {
               const [w, s, e, n] = bboxFromLatLngBounds(aoiBounds);
@@ -1273,7 +1540,126 @@ export default function InteractiveMap({
                 </div>
               );
             })()}
+
+            <section className="timeline-control-bar" aria-label="Timeline controls">
+              <div className="timeline-control-bar__title">
+                <Calendar size={13} color="var(--cyan-bright)" />
+                <span>Timeline range</span>
+              </div>
+              <div className="field-grid">
+                <div className="field">
+                  <label htmlFor="aoi-t1-date">From Date (Baseline)</label>
+                  <input
+                    id="aoi-t1-date"
+                    type="date"
+                    className="input"
+                    min="2017-01-01"
+                    max={todayDate}
+                    value={t1Date}
+                    onChange={(event) => updateTimelineDate(setT1Date, event.target.value)}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="aoi-t2-date">To Date (Target)</label>
+                  <input
+                    id="aoi-t2-date"
+                    type="date"
+                    className="input"
+                    min="2017-01-01"
+                    max={todayDate}
+                    value={t2Date}
+                    onChange={(event) => updateTimelineDate(setT2Date, event.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="timeline-presets" role="group" aria-label="Quick timeline ranges">
+                {timelinePresets.map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    className="timeline-preset"
+                    onClick={() => applyTimelinePreset(preset)}
+                    aria-label={`Set ${preset.label} timeline range`}
+                  >
+                    {preset.label}
+                    <span>{preset.fromDate.slice(0, 4)} → {preset.toDate.slice(0, 4)}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+            {temporalRangeError && (
+              <div className="note note--warn" role="alert" style={{ marginTop: 8 }}>
+                <AlertTriangle size={11} />
+                <span>{temporalRangeError}</span>
+              </div>
+            )}
+            <div className="row" style={{ gap: 6, marginTop: 9 }}>
+              <button
+                type="button"
+                className="btn btn--sm btn--ghost"
+                style={{ flex: 1 }}
+                onClick={clearAoi}
+                disabled={!selectedBounds}
+              >
+                Clear Selection
+              </button>
+              <button
+                type="button"
+                className="btn btn--sm btn--primary"
+                style={{ flex: 1 }}
+                onClick={handleAnalyzeSelectedArea}
+                disabled={!selectedBounds || !isTemporalRangeValid || aoiAnalysisLoading || timelineLoading}
+              >
+                {aoiAnalysisLoading ? (
+                  <>
+                    <Loader size={12} style={{ animation: 'spin 1s linear infinite' }} />
+                    Analyzing…
+                  </>
+                ) : (
+                  'Analyze Selected Area'
+                )}
+              </button>
+            </div>
+            {aoiAnalysisError && (
+              <div className="note note--error" role="alert" style={{ marginTop: 8 }}>
+                <AlertTriangle size={11} />
+                <span>{aoiAnalysisError}</span>
+              </div>
+            )}
           </div>
+
+          {displayedAoiAnalysisResult && (
+            <div className="block" aria-label="AOI analysis results">
+              <div className="block__head">
+                <div className="block__title">
+                  <Activity size={14} color="var(--red-bright)" />
+                  {activeTimelineResult ? `Timeline · ${activeTimelineResult.year}` : 'AOI Analysis Results'}
+                </div>
+              </div>
+              <div className="stat-grid">
+                <div className="stat stat--red">
+                  <span className="stat__label">Deforested area</span>
+                  <div className="stat__value">
+                    {Number(displayedAoiAnalysisResult.area_hectares).toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 4,
+                    })}
+                    <span className="stat__unit">ha</span>
+                  </div>
+                </div>
+                <div className="stat stat--neutral">
+                  <span className="stat__label">Deforested pixels</span>
+                  <div className="stat__value">
+                    {Number(displayedAoiAnalysisResult.deforested_pixels).toLocaleString()}
+                    <span className="stat__unit">px</span>
+                  </div>
+                </div>
+              </div>
+              <div className="block__hint" style={{ marginTop: 8 }}>
+                T1 scene: {displayedAoiAnalysisResult.t1_scene_date} · T2 scene: {displayedAoiAnalysisResult.t2_scene_date}
+              </div>
+            </div>
+          )}
 
           {showAcquisitionWorkflow && <>
           {/* ── Sentinel-2 search ────────────────────────────── */}
@@ -2032,6 +2418,121 @@ export default function InteractiveMap({
           </div>
         </div>
       )}
+    </div>
+    {selectedBounds && (
+      <section className="temporal-scrubber" aria-label="Year-by-year deforestation timeline">
+        <div className="temporal-scrubber__head">
+          <div className="temporal-scrubber__intro">
+            <div className="temporal-scrubber__title">
+              <Calendar size={14} color="var(--cyan-bright)" />
+              <strong>Year-by-Year Timeline</strong>
+            </div>
+            <span className="temporal-scrubber__caption">
+              Cumulative change from {t1Date} through each target year
+            </span>
+          </div>
+          {activeTimelineResult && (
+            <div className="temporal-scrubber__metric" aria-live="polite">
+              <strong>
+                {Number(activeTimelineResult.area_hectares).toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 4,
+                })}
+              </strong>
+              <span>ha by {activeTimelineResult.year}</span>
+            </div>
+          )}
+          <div className="temporal-scrubber__actions">
+            <button
+              type="button"
+              className="btn btn--sm btn--ghost"
+              onClick={toggleTimelinePlayback}
+              disabled={timelineResults.length < 2 || timelineLoading}
+              aria-label={timelinePlaying ? 'Pause timeline playback' : 'Play timeline playback'}
+            >
+              {timelinePlaying ? <Pause size={12} /> : <Play size={12} />}
+              {timelinePlaying ? 'Pause' : 'Play'}
+            </button>
+            <button
+              type="button"
+              className="btn btn--sm btn--primary"
+              onClick={handleRunTimelineSeries}
+              disabled={
+                !selectedBounds ||
+                !isTemporalRangeValid ||
+                aoiAnalysisLoading ||
+                timelineLoading ||
+                timelineCheckpoints.length === 0
+              }
+            >
+              {timelineLoading ? (
+                <>
+                  <Loader size={12} style={{ animation: 'spin 1s linear infinite' }} />
+                  {`Fetching ${timelineResults.length + 1}/${timelineCheckpoints.length}…`}
+                </>
+              ) : (
+                'Run Timeline Series'
+              )}
+            </button>
+          </div>
+        </div>
+
+        {timelineError && (
+          <div className="note note--error" role="alert">
+            <AlertTriangle size={11} />
+            <span>{timelineError}</span>
+          </div>
+        )}
+
+        <div className="temporal-scrubber__slider">
+          <span>{t1Date}</span>
+          <input
+            type="range"
+            min="0"
+            max={Math.max(0, timelineResults.length - 1)}
+            step="1"
+            value={timelineResults.length ? timelineIndex : 0}
+            onChange={(event) => {
+              setTimelinePlaying(false);
+              setTimelineIndex(Number(event.target.value));
+            }}
+            disabled={!timelineResults.length || timelineLoading}
+            aria-label="Scrub deforestation timeline by year"
+            aria-valuetext={
+              activeTimelineResult
+                ? `${activeTimelineResult.year}, ${activeTimelineResult.area_hectares} hectares`
+                : 'No timeline results yet'
+            }
+          />
+          <span>{activeTimelineResult?.date || t2Date}</span>
+        </div>
+
+        {timelineResults.length > 0 ? (
+          <div className="temporal-scrubber__checkpoints" role="group" aria-label="Timeline checkpoints">
+            {timelineResults.map((step, index) => (
+              <button
+                key={`${step.date}-${index}`}
+                type="button"
+                className={`temporal-scrubber__checkpoint ${index === timelineIndex ? 'is-active' : ''}`}
+                onClick={() => {
+                  setTimelinePlaying(false);
+                  setTimelineIndex(index);
+                }}
+                aria-pressed={index === timelineIndex}
+              >
+                {step.year}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="temporal-scrubber__caption">
+            {selectedBounds
+              ? 'Run the series to cache yearly overlays and scrub through cumulative results.'
+              : 'Draw an area on the map to enable the timeline.'}
+          </div>
+        )}
+      </section>
+    )}
     </div>
   );
 }
